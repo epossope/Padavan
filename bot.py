@@ -47,6 +47,8 @@ from ingestion import (ActionBuilder, Attachment, IngestionInput, IngestionPipel
 
 from url_enricher import HttpUrlEnricher
 
+from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
+
 
 
 BASE = Path(__file__).resolve().parent
@@ -346,9 +348,47 @@ TOOLS = [
 
         "name":"send_stored_image",
 
-        "description":"Получить информацию о сохранённом изображении для отправки.",
+        "description":"ОТПРАВИТЬ пользователю сохранённое изображение/файл. Используй, когда просят показphoto/скрин/картинку из памяти: 'покажи Тошку', 'дай фото', 'покажи скрин Shoncho/Honcho'. Ищет по knowledge_id или query и ставит файл в очередь реальной отправки через Telegram.",
 
-        "parameters":{"type":"object","properties":{"file_id":{"type":"integer"},"kind":{"type":"string"},"limit":{"type":"integer"}}}
+        "parameters":{"type":"object","properties":{
+            "knowledge_id":{"type":"integer"},"query":{"type":"string"},"file_id":{"type":"integer"},"kind":{"type":"string"},"limit":{"type":"integer"}
+        }}
+
+    }},
+
+    {"type":"function","function":{
+
+        "name":"knowledge_search",
+
+        "description":"Искать ранее сохранённые пользователем знания/данные (сайты, URL, фото, скриншоты, заметки, чек). Вызывай ПЕРВЫМ, когда пользователь спрашивает о сохранённом: 'где я хранил...', 'что сохранял для проекта X', 'что ты знаешь про ...', 'какой сайт я кидал', 'покажи/найди ...'. Не говори 'у меня нет доступа', сначала сделай поиск.",
+
+        "parameters":{"type":"object","properties":{
+            "query":{"type":"string"},"project":{"type":"string"},"category":{"type":"string"},"entity":{"type":"string"},"limit":{"type":"integer"}
+        },"required":["query"]}
+
+    }},
+
+    {"type":"function","function":{
+
+        "name":"knowledge_get",
+
+        "description":"Получить компактную карточку конкретного знания по его id (из results от knowledge_search).",
+
+        "parameters":{"type":"object","properties":{
+            "knowledge_id":{"type":"integer"}
+        },"required":["knowledge_id"]}
+
+    }},
+
+    {"type":"function","function":{
+
+        "name":"knowledge_files",
+
+        "description":"Получить оригинальные файлы (фото/скрин/документ), привязанные к знанию по knowledge_id.",
+
+        "parameters":{"type":"object","properties":{
+            "knowledge_id":{"type":"integer"}
+        },"required":["knowledge_id"]}
 
     }},
 
@@ -365,9 +405,9 @@ STORAGE_ROOT = BASE / "storage"
 _pipeline = None
 
 
-def _bot_save_file(cid, name, mime, path, kind, summary):
+def _bot_save_file(cid, name, mime, path, kind, summary, source_file_id=None):
     try:
-        r = save_image_to_db(cid, name, mime, path, kind, summary)
+        r = save_image_to_db(cid, name, mime, path, kind, summary, telegram_file_id=source_file_id or "")
         return r.get("id")
     except Exception:
         return None
@@ -421,6 +461,122 @@ def build_inquiry_input(result):
         body += "\nURL: " + ", ".join(result.urls[:3])
     return ("[Сохранено в память]\n" + body) if body else None
 
+
+# ---------- AGENT RETRIEVAL TOOLS ----------
+
+#: chat_id -> list of queued media entries (drained by the async handler)
+_media_outbox = {}
+#: chat_id -> last retrieved compact item (for follow-up context)
+_LAST_RETRIEVAL = {}
+
+
+def _files_for_item(it):
+    try:
+        return list(get_pipeline().store.item_files(it["id"]))
+    except Exception:
+        return []
+
+
+def _remember_retrieval(chat_id, items):
+    if not items:
+        _LAST_RETRIEVAL.pop(chat_id, None)
+        return None
+    it = items[0]
+    top = compact_item(it, _files_for_item(it))
+    _LAST_RETRIEVAL[chat_id] = {"item": top}
+    return top
+
+
+def knowledge_search_tool(chat_id, query="", project=None, category=None, entity=None,
+                          limit=10, date_from=None, date_to=None):
+    """LLM-facing knowledge_search: compact, scoped to the current user."""
+    store = get_pipeline().store
+    try:
+        limit = max(1, min(int(limit or 10), 20))
+    except Exception:
+        limit = 10
+    try:
+        resolved = resolve_project(store, chat_id, project) if project else None
+    except Exception:
+        resolved = None
+    if project and not resolved:
+        # stated project does not exist in this user's knowledge -> honest empty
+        return {"ok": True, "tool": "knowledge_search", "query": query,
+                "project": project, "project_resolved": None, "count": 0, "results": []}
+    items = retrieve(store, chat_id, query, project=resolved, category=category,
+                     entity=entity, limit=limit, date_from=date_from, date_to=date_to)
+    results = [compact_item(it, _files_for_item(it)) for it in items]
+    top = _remember_retrieval(chat_id, items)
+    return {
+        "ok": True, "tool": "knowledge_search", "query": query,
+        "project": resolved, "count": len(results),
+        "results": results, "follow_up_key": (top or {}).get("id"),
+    }
+
+
+def knowledge_get_tool(chat_id, knowledge_id=None):
+    if not knowledge_id:
+        return {"ok": False, "tool": "knowledge_get", "error": "missing_knowledge_id"}
+    store = get_pipeline().store
+    try:
+        it = store.get_item(int(knowledge_id))
+    except Exception:
+        it = None
+    if not it or it.get("chat_id") != chat_id:
+        return {"ok": False, "tool": "knowledge_get", "error": "not_found"}
+    comp = compact_item(it, _files_for_item(it))
+    _LAST_RETRIEVAL[chat_id] = {"item": comp}
+    return {"ok": True, "tool": "knowledge_get", "item": comp}
+
+
+def knowledge_files_tool(chat_id, knowledge_id=None):
+    if not knowledge_id:
+        return {"ok": False, "tool": "knowledge_files", "error": "missing_knowledge_id"}
+    store = get_pipeline().store
+    try:
+        it = store.get_item(int(knowledge_id))
+    except Exception:
+        it = None
+    if not it or it.get("chat_id") != chat_id:
+        return {"ok": False, "tool": "knowledge_files", "error": "not_found"}
+    files = store.item_files(it["id"])
+    return {
+        "ok": True, "tool": "knowledge_files", "knowledge_id": it["id"], "count": len(files),
+        "files": [{
+            "file_id": f["id"], "telegram_file_id": f.get("telegram_file_id") or "",
+            "original_name": f.get("original_name"), "mime_type": f.get("mime_type"),
+            "local_path": f.get("local_path"), "kind": f.get("kind"),
+        } for f in files],
+    }
+
+
+async def drain_media_outbox(update, context):
+    """Send media queued by send_stored_image through the Telegram API."""
+    cid = update.effective_chat.id
+    entries = _media_outbox.pop(cid, [])
+    for e in entries:
+        caption = (e.get("caption") or "")[:200] or None
+        fid = e.get("telegram_file_id") or ""
+        is_image = (e.get("mime_type") or "").startswith("image/")
+        try:
+            if fid:
+                if is_image:
+                    await update.effective_message.reply_photo(photo=fid, caption=caption)
+                else:
+                    await update.effective_message.reply_document(
+                        document=fid, filename=e.get("original_name") or "file", caption=caption)
+            elif e.get("local_path") and Path(e["local_path"]).exists():
+                if is_image:
+                    with Path(e["local_path"]).open("rb") as fh:
+                        await update.effective_message.reply_photo(photo=fh, caption=caption)
+                else:
+                    with Path(e["local_path"]).open("rb") as fh:
+                        await update.effective_message.reply_document(
+                            document=fh, filename=e.get("original_name") or "file", caption=caption)
+            else:
+                await update.effective_message.reply_text("Файл недоступен для отправки.")
+        except Exception:
+            continue
 
 
 def conn():
@@ -593,7 +749,7 @@ def save_reminder(chat_id, text, remind_at):
 
 
 
-def save_image_to_db(chat_id, original_name, mime_type, local_path, kind, summary=None):
+def save_image_to_db(chat_id, original_name, mime_type, local_path, kind, summary=None, telegram_file_id=""):
 
     b64 = base64.b64encode(Path(local_path).read_bytes()).decode() if local_path else ""
 
@@ -601,7 +757,7 @@ def save_image_to_db(chat_id, original_name, mime_type, local_path, kind, summar
 
         cur = c.execute("INSERT INTO files (chat_id, telegram_file_id, original_name, mime_type, local_path, kind, summary, extracted_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 
-                        (chat_id, "", original_name, mime_type, local_path, kind, summary, "", datetime.now(timezone.utc).isoformat()))
+                        (chat_id, telegram_file_id or "", original_name, mime_type, local_path, kind, summary, "", datetime.now(timezone.utc).isoformat()))
 
     return {"ok":True,"tool":"save_image","id":cur.lastrowid,"original_name":original_name}
 
@@ -629,43 +785,58 @@ def get_file_from_telegram(chat_id=None,file_id=None):
 
 
 
-def send_stored_image(chat_id, file_id=None, kind=None, limit=5):
+def send_stored_image(chat_id, knowledge_id=None, query=None, file_id=None, kind=None, limit=1):
 
-    # Get the stored image from database
+    store = get_pipeline().store
 
-    get_result = get_files(chat_id=chat_id, kind=kind, limit=limit)
+    try:
+        limit = max(1, min(int(limit or 1), 5))
+    except Exception:
+        limit = 1
 
-    if not get_result.get("ok"):
-
-        return {"ok": False, "tool": "send_stored_image", "error": "could_not_retrieve_files"}
-
-    
-
-    files = get_result.get("files", [])
+    item, files = None, []
+    if knowledge_id:
+        try:
+            item = store.get_item(int(knowledge_id))
+        except Exception:
+            item = None
+        if not item or item.get("chat_id") != chat_id:
+            return {"ok": False, "tool": "send_stored_image", "error": "not_found"}
+        files = store.item_files(item["id"])
+    elif query:
+        items = retrieve(store, chat_id, query, limit=1)
+        if not items:
+            return {"ok": False, "tool": "send_stored_image", "error": "no_item_found", "query": query}
+        item = items[0]
+        files = store.item_files(item["id"])
+    else:
+        fb = get_files(chat_id=chat_id, kind=kind, limit=limit)
+        files = (fb or {}).get("files") or []
 
     if not files:
-
         return {"ok": False, "tool": "send_stored_image", "error": "no_files_found"}
 
-    
+    images = [f for f in files if (f.get("mime_type") or "").startswith("image/")]
+    chosen = (images or files)[:limit]
+    queued = []
+    for f in chosen:
+        entry = {
+            "file_row": f.get("id"),
+            "telegram_file_id": f.get("telegram_file_id") or "",
+            "local_path": f.get("local_path"),
+            "mime_type": f.get("mime_type") or "",
+            "original_name": f.get("original_name") or "файл",
+            "caption": (item or {}).get("summary") or (f.get("summary") or "") or "",
+        }
+        queued.append(entry)
+        _media_outbox.setdefault(chat_id, []).append(entry)
 
-    # If file_id is specified, find that specific file
+    if item:
+        _LAST_RETRIEVAL[chat_id] = {"item": compact_item(item, files)}
 
-    if file_id:
-
-        target_file = next((f for f in files if f.get("id") == file_id), None)
-
-        if not target_file:
-
-            return {"ok": False, "tool": "send_stored_image", "error": "file_not_found"}
-
-        files = [target_file]
-
-    
-
-    # Return file information for sending
-
-    return {"ok": True, "tool": "send_stored_image", "files_info": files}
+    return {"ok": True, "tool": "send_stored_image", "queued": len(queued),
+            "title": (item or {}).get("title") or (chosen[0].get("original_name") or "файл"),
+            "media": [{"type": "queued", "original_name": e["original_name"]} for e in queued]}
 
 
 
@@ -1024,7 +1195,13 @@ def execute_tool(chat_id,name,args):
 
         "get_file_from_telegram":get_file_from_telegram,
 
-        "send_stored_image":send_stored_image
+        "send_stored_image":send_stored_image,
+
+        "knowledge_search":knowledge_search_tool,
+
+        "knowledge_get":knowledge_get_tool,
+
+        "knowledge_files":knowledge_files_tool
 
     }
 
@@ -1393,6 +1570,16 @@ def system_prompt():
 
         "Текущие новости/погоду/курс/товары обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
+        "У тебя есть сохранённая память пользователя (knowledge): фото, скриншоты, сайты, URL, заметки, чек, сущности, проекты. "
+
+        "Если пользователь спрашивает о ранее сохранённом — например «где я храню базу», «что я сохранял для Noema», «какой сайт я кидал», «покажи/найди Тошку», «что ты знаешь про ...», «что сохранял вчера», «покажи тот фото/скрин» — СНАЧАЛА сделай knowledge_search с подходящими query/project/entity. Не говори «у меня нет доступа», не написав в search. "
+
+        "Если нужен конкретный элемент из results — можно knowledge_get по id или knowledge_files для файлов. "
+
+        "Если пользователь просит ПОКАЗАТЬ/ДАТЬ/отправить фото или скрин — после поиска вызови send_stored_image (id найденного knowledge или query) — бот реально отправит файл. "
+
+        "Если knowledge_search ничего не вернул — честно скажи «Я не нашла сохранённых данных по этому запросу», не выдумывай. "
+
         "Никогда не заявляй, что что-то сохранено, если tool не вернул ok=true. "
 
         "Не раскрывай внутренние модели, OpenRouter или провайдера. "
@@ -1499,7 +1686,21 @@ def ask(chat_id,text):
 
 
 
-    msgs=[{"role":"system","content":system_prompt()}]+history(chat_id)+[{"role":"user","content":text}]
+    msgs=[{"role":"system","content":system_prompt()}]
+
+    ctx=_LAST_RETRIEVAL.get(chat_id)
+    if ctx and ctx.get("item"):
+        top=ctx["item"]
+        note=("Контекст последнего поиска по твоей памяти: "
+              f"id={top.get('id')}, title='{top.get('title') or ''}', "
+              f"summary='{(top.get('summary') or '')[:300]}', "
+              f"urls='{', '.join(top.get('urls') or [])}', "
+              f"project='{top.get('project') or ''}', "
+              f"has_files={bool(top.get('has_files'))}. "
+              "Если пользователь спрашивает «его/её/то/про неё/его id», опирайся на этот элемент (можно knowledge_get/knowledge_files по id).")
+        msgs.append({"role":"system","content":note})
+
+    msgs+=history(chat_id)+[{"role":"user","content":text}]
 
     writes=[]
 
@@ -2019,6 +2220,8 @@ async def text_handler(update,context):
 
         a=await asyncio.to_thread(ask,cid,t); await send_answer(update,a,False,wants_voice(t))
 
+        await drain_media_outbox(update, context)
+
     except Exception as e: await safe_error(update,e)
 
 
@@ -2034,6 +2237,8 @@ async def voice_handler(update,context):
         txt=await asyncio.to_thread(transcribe,p); await update.effective_message.reply_text("🎤 "+txt)
 
         a=await asyncio.to_thread(ask,update.effective_chat.id,txt); await send_answer(update,a,True,wants_voice(txt))
+
+        await drain_media_outbox(update, context)
 
     except Exception as e: await safe_error(update,e)
 
@@ -2131,6 +2336,8 @@ async def image_handler(update,context):
                 except Exception as e: await safe_error(update,e)
 
         await status_msg.edit_text(final_text[:4000] or "Готово.")
+
+        await drain_media_outbox(update, context)
 
 
     except Exception as e: await safe_error(update,e)

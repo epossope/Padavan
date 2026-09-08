@@ -68,14 +68,14 @@ class SqlFileSaver:
     def __init__(self, store):
         self.store = store
 
-    def __call__(self, chat_id, original_name, mime_type, local_path, kind, summary):
+    def __call__(self, chat_id, original_name, mime_type, local_path, kind, summary, source_file_id=None):
         with self.store._connect() as c:
             cur = c.execute(
                 """INSERT INTO files
                    (chat_id, telegram_file_id, original_name, mime_type, local_path,
                     kind, summary, extracted_text, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                (chat_id, "", original_name or "", mime_type or "", local_path or None,
+                (chat_id, source_file_id or "", original_name or "", mime_type or "", local_path or None,
                  kind or "image", summary or "", "", datetime.now(timezone.utc).isoformat()),
             )
             return cur.lastrowid

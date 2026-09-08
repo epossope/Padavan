@@ -742,7 +742,8 @@ class IngestionPipeline:
             if self.file_saver is None:
                 continue
             fid = self.file_saver(chat_id, original, a.mime_type or "", file_path,
-                                  a.kind or "image", (ex.summary or "")[:200])
+                                  a.kind or "image", (ex.summary or "")[:200],
+                                  source_file_id=a.file_id)
             if fid:
                 fids.append(fid)
         return fids

@@ -275,6 +275,20 @@ class KnowledgeStore(KnowledgeSearch):
             row = c.execute("SELECT * FROM knowledge_items WHERE id=?", (item_id,)).fetchone()
         return self._row_to_item(row) if row else None
 
+    def latest(self, chat_id=None, limit: int = 20) -> list[dict]:
+        """Most recent knowledge items (score fallback when search is empty)."""
+        limit = max(1, min(int(limit or 20), 50))
+        q = "SELECT * FROM knowledge_items"
+        args = []
+        if chat_id is not None:
+            q += " WHERE chat_id=?"
+            args.append(chat_id)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._connect() as c:
+            rows = c.execute(q, args).fetchall()
+        return [self._row_to_item(r) for r in rows]
+
     def link_file(self, knowledge_id, file_id, role: str = "source"):
         with self._connect() as c:
             c.execute(
