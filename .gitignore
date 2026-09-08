@@ -1,0 +1,17 @@
+# Secrets
+.env
+*.env.local
+
+# Virtualenv / python
+.venv/
+__pycache__/
+*.pyc
+
+# Databases & user data
+*.sqlite3
+*.db
+storage/
+
+# Backups / temp artifacts
+*.backup
+*.partial_backup
