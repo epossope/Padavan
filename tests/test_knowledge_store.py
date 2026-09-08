@@ -68,8 +68,10 @@ class KnowledgeStoreTest(unittest.TestCase):
     def test_enrichment_update(self):
         item, _ = self.store.insert_item(make_item())
         updated = self.store.set_enrichment(
-            item["id"], [{"url": "https://x.io", "status": "ok"}], "enriched")
-        self.assertEqual(updated["status"], "enriched")
+            item["id"], [{"url": "https://x.io", "status": "ok"}], "completed")
+        # enrichment status is stored separately; ingestion status is untouched
+        self.assertEqual(updated["enrichment_status"], "completed")
+        self.assertEqual(updated["status"], "processing")
         self.assertEqual(updated["metadata"]["enrichments"][0]["url"], "https://x.io")
 
     def test_content_hash_stable(self):

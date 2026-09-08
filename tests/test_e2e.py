@@ -63,7 +63,7 @@ class E2EIngestionFlowTest(unittest.TestCase):
         # 1. Telegram-like input -> ingestion
         res = self.pipeline.ingest(self._input())
         self.assertTrue(res.ok)
-        self.assertEqual(res.status, "stored")
+        self.assertEqual(res.ingestion_status, "completed")
         item = res.item
         self.assertEqual(item["entities"][0]["name"], "Ричи")
 

@@ -129,7 +129,9 @@ def main():
     en8 = fakes.FakeEnricher(error="403 Forbidden")
     r8 = pipe(payload8, enricher=en8).ingest(inp(text="сохрани", attachments=["page.png"]))
     print("\n==== TEST 8: UrlEnricher failed ====")
-    print(" ingestion ok:", r8.ok, "| status:", r8.status, "| item status:", r8.item["status"],
+    print(" ingestion ok:", r8.ok, "| ingestion:", r8.ingestion_status,
+          "| enrichment:", r8.enrichment_status,
+          "| item ingestion:", r8.item["status"], "| item enrichment:", r8.item["enrichment_status"],
           "| файл сохранён:", len(store.item_files(r8.item["id"])) == 1)
 
     payload9 = {

@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS knowledge_items (
     category          TEXT NOT NULL DEFAULT '',
     metadata_json     TEXT NOT NULL DEFAULT '{}',
     content_hash      TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'stored',
+    status            TEXT NOT NULL DEFAULT 'processing',
+    enrichment_status TEXT NOT NULL DEFAULT 'not_required',
     source_message_id INTEGER,
     source_file_id    TEXT,
     created_at        TEXT NOT NULL,
@@ -132,7 +133,8 @@ class KnowledgeItem:
     project_id: Optional[str] = None
     source_message_id: Optional[int] = None
     source_file_id: Optional[str] = None
-    status: str = "stored"
+    status: str = "processing"
+    enrichment_status: str = "not_required"
 
 
 class KnowledgeStore(KnowledgeSearch):
@@ -157,6 +159,38 @@ class KnowledgeStore(KnowledgeSearch):
     def init_schema(self):
         with self._connect() as c:
             c.executescript(KNOWLEDGE_ITEMS_SCHEMA)
+            self._ensure_column(c, "knowledge_items", "enrichment_status",
+                                "TEXT NOT NULL DEFAULT 'not_required'")
+            self._migrate_legacy_statuses(c)
+
+    @staticmethod
+    def _ensure_column(c, table, column, sql_type):
+        cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+    @staticmethod
+    def _migrate_legacy_statuses(c):
+        """Migrate the pre-hardening single `status` column values.
+
+        Old values carried enrichment info inside `status`:
+          'enriched'            -> ingestion completed / enrichment completed
+          'enrichment_partial'  -> ingestion completed / enrichment partial
+          'enrichment_failed'   -> ingestion completed / enrichment failed
+          'stored'              -> ingestion completed / enrichment not_required
+        The `status` column now holds ONLY the ingestion status.
+        """
+        for old, ing, enr in (
+            ("enriched", "completed", "completed"),
+            ("enrichment_partial", "completed", "partial"),
+            ("enrichment_failed", "completed", "failed"),
+            ("stored", "completed", "not_required"),
+        ):
+            c.execute(
+                "UPDATE knowledge_items SET status=?, enrichment_status=? "
+                "WHERE status=? AND enrichment_status='not_required'",
+                (ing, enr, old),
+            )
 
     # -- helpers ------------------------------------------------------------
     @staticmethod
@@ -205,6 +239,7 @@ class KnowledgeStore(KnowledgeSearch):
             json.dumps(item.metadata, ensure_ascii=False),
             item.content_hash,
             item.status,
+            item.enrichment_status,
             item.source_message_id,
             item.source_file_id,
             now,
@@ -216,9 +251,9 @@ class KnowledgeStore(KnowledgeSearch):
                     """INSERT INTO knowledge_items
                        (chat_id, project_id, content_type, title, summary, visible_text,
                         searchable_text, urls_json, entities_json, tags_json, category,
-                        metadata_json, content_hash, status, source_message_id, source_file_id,
-                        created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        metadata_json, content_hash, status, enrichment_status,
+                        source_message_id, source_file_id, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     values,
                 )
                 row = c.execute("SELECT * FROM knowledge_items WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -266,20 +301,25 @@ class KnowledgeStore(KnowledgeSearch):
         with self._connect() as c:
             return c.execute(q, args).fetchone()[0]
 
-    def set_enrichment(self, item_id, enrichments: list, status: str) -> dict:
-        """Attach UrlEnricher results to an item and update its status."""
+    def set_enrichment(self, item_id, enrichments: list, enrichment_status: str) -> dict:
+        """Attach UrlEnricher results to an item under ``enrichment_status``.
+
+        The item's ingestion ``status`` is left untouched: enrichment success or
+        failure must never downgrade a completed ingestion.
+        """
         with self._connect() as c:
             row = c.execute("SELECT metadata_json FROM knowledge_items WHERE id=?", (item_id,)).fetchone()
         meta = self._parse_json(row["metadata_json"] if row else None, {})
         meta["enrichments"] = enrichments
         with self._connect() as c:
             c.execute(
-                "UPDATE knowledge_items SET metadata_json=?, status=?, updated_at=? WHERE id=?",
-                (json.dumps(meta, ensure_ascii=False), status, utcnow(), item_id),
+                "UPDATE knowledge_items SET metadata_json=?, enrichment_status=?, updated_at=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), enrichment_status, utcnow(), item_id),
             )
         return self.get_item(item_id)
 
     def update_status(self, item_id, status: str) -> dict:
+        """Update the ingestion status only."""
         with self._connect() as c:
             c.execute("UPDATE knowledge_items SET status=?, updated_at=? WHERE id=?",
                       (status, utcnow(), item_id))

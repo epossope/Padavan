@@ -65,7 +65,7 @@ class PipelineScenarioTest(unittest.TestCase):
         pipe = self._pipeline(payload=DOG_PAYLOAD)
         res = pipe.ingest(self._inp(text="Это моя собака Ричи", attachments=["richi.jpg"]))
         self.assertTrue(res.ok)
-        self.assertEqual(res.status, "stored")
+        self.assertEqual(res.ingestion_status, "completed")
         it = res.item
         self.assertEqual(it["entities"][0]["type"], "pet")
         self.assertEqual(it["entities"][0]["name"], "Ричи")
@@ -74,7 +74,8 @@ class PipelineScenarioTest(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertTrue(Path(files[0]["local_path"]).exists())  # persisted on disk
         tools = [a["tool"] for a in res.actions]
-        self.assertIn("person_upsert", tools)  # explicit "это моя ..." intent
+        self.assertNotIn("person_upsert", tools)  # pet is knowledge, not a person
+        self.assertEqual(res.actions, [])
         self.assertIn("📥 Сохранила", res.reply)
 
     # TEST 2: потом «покажи фото Ричи» -> находится original file
@@ -84,6 +85,7 @@ class PipelineScenarioTest(unittest.TestCase):
         original_bytes = Path(inp.attachments[0].local_path).read_bytes()
         res = pipe.ingest(inp)
         self.assertTrue(res.ok)
+        self.assertEqual(res.ingestion_status, "completed")
         # -> storage search by entity
         hits = self.store.search_by_entity("Ричи", chat_id=1)
         self.assertTrue(hits)
@@ -111,6 +113,8 @@ class PipelineScenarioTest(unittest.TestCase):
             text="сохрани для проекта Noema как ресурс по дизайну", attachments=["shot.png"]))
         self.assertTrue(res.ok)
         self.assertEqual(res.project_id, "Noema")
+        self.assertEqual(res.ingestion_status, "completed")
+        self.assertEqual(res.enrichment_status, "completed")
         self.assertEqual(res.urls, ["https://design.example.com/noema-ui"])
         self.assertEqual(len(self.store.item_files(res.item["id"])), 1)
         it = res.item
@@ -182,9 +186,12 @@ class PipelineScenarioTest(unittest.TestCase):
         pipe = self._pipeline(payload=payload, enricher=en)
         res = pipe.ingest(self._inp(text="сохрани", attachments=["page.png"]))
         self.assertTrue(res.ok)
-        self.assertEqual(res.status, "enrichment_failed")
+        # ingestion fully succeeded despite enrichment failure
+        self.assertEqual(res.ingestion_status, "completed")
+        self.assertEqual(res.enrichment_status, "failed")
         it = res.item
-        self.assertEqual(it["status"], "enrichment_failed")
+        self.assertEqual(it["status"], "completed")
+        self.assertEqual(it["enrichment_status"], "failed")
         self.assertEqual(it["metadata"]["enrichments"][0]["status"], "failed")
         self.assertEqual(len(self.store.item_files(it["id"])), 1)
         self.assertIn("https://example.com/page", res.item["visible_text"])
@@ -197,13 +204,13 @@ class PipelineScenarioTest(unittest.TestCase):
         pipe = self._pipeline(payload=payload)
         inp = self._inp(msg_id=700, text="сохрани", attachments=["d.png"])
         r1 = pipe.ingest(inp)
-        self.assertEqual(r1.status, "stored")
+        self.assertEqual(r1.status, "completed")
         r2 = pipe.ingest(inp)  # Telegram retry of the same update
         self.assertEqual(r2.status, "duplicate")
         self.assertTrue(r2.duplicate)
         self.assertEqual(self.store.count_items(chat_id=1), 1)
         r3 = pipe.ingest(self._inp(msg_id=701, text="сохрани", attachments=["d.png"]))
-        self.assertEqual(r3.status, "stored")  # new message -> new item
+        self.assertEqual(r3.status, "completed")  # new message -> new item
         self.assertEqual(self.store.count_items(chat_id=1), 2)
 
 

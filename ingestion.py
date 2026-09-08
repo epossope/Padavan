@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from knowledge_store import EmbeddingProvider, KnowledgeItem, KnowledgeStore, NullEmbeddingProvider
-from url_enricher import EnrichmentError, UrlEnricher
+from url_enricher import EnrichmentError, UrlEnricher, is_safe_url
 
 
 class ExtractionError(Exception):
@@ -76,10 +76,18 @@ class ExtractionResult:
     used_vision: bool = False
 
 
+#: ingestion lifecycle (status on knowledge item + IngestionResult)
+INGESTION_STATUSES = ("received", "processing", "completed", "partial", "failed", "duplicate")
+
+#: enrichment lifecycle (independent from ingestion; item is never "failed" by it)
+ENRICHMENT_STATUSES = ("not_required", "pending", "completed", "partial", "failed")
+
+
 @dataclass
 class IngestionResult:
     ok: bool
-    status: str  # stored | duplicate | partial | enrichment_failed | enrichment_partial | failed
+    ingestion_status: str = "processing"
+    enrichment_status: str = "not_required"
     item_id: Optional[int] = None
     duplicate: bool = False
     item: Optional[dict] = None
@@ -88,6 +96,11 @@ class IngestionResult:
     enrichment: list = field(default_factory=list)
     actions: list = field(default_factory=list)
     reply: str = ""
+
+    @property
+    def status(self) -> str:
+        """Backward-compatible alias for ``ingestion_status``."""
+        return self.ingestion_status
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +355,19 @@ INTENT_EXPENSE_RE = re.compile(
 )
 INTENT_TASK_RE = re.compile(r"(добавь|создай|поставь|запиши)\s+.*(задач)", re.I)
 INTENT_NOTE_RE = re.compile(r"сохрани\s+(в\s+замет|заметку|это)|запомни\s+(это|инфо|данные|факт|следующ)", re.I)
-INTENT_REMINDER_RE = re.compile(r"напомни\s+мне|напомни\s+$|сделай\s+напоминание", re.I)
-INTENT_PERSON_RE = re.compile(r"это\s+(мой|моя|мои|моё|наш|наша|наше)\s+", re.I)
+# a reminder needs an explicit verb; "напоминай/напоминание" alone is not enough
+INTENT_REMINDER_RE = re.compile(
+    r"\bнапомни\b|сделай\s+напоминание|поставь\s+напоминание",
+    re.I,
+)
+# a person save needs an explicit save/remember verb; "это мой/моя ..." alone is
+# NOT enough (could be a pet, a photo, a place, ...) -> knowledge only
+INTENT_PERSON_RE = re.compile(
+    r"запомни|"
+    r"(?:сохрани|добавь|внеси|занеси)\s+(?:(?:это|его|её|ее)\s+)?(?:контакт|человек|личность|профиль|человека)"
+    r"|(?:сохрани|добавь|внеси|занеси)\s+.{0,40}?\s+в\s+(?:контакты|люди|профиль)",
+    re.I,
+)
 
 
 def analyze_intents(user_text: str) -> list:
@@ -387,11 +411,15 @@ def extract_money(*texts: str):
     return None, hay[:160]
 
 
-def pick_entity_name(entities) -> Optional[str]:
-    for pref in ("person", "pet", "animal", "human"):
-        for e in entities:
-            if e.get("type") == pref:
-                return e.get("name")
+def pick_person_name(entities) -> Optional[str]:
+    """Return the FIRST person-entity name, and ONLY for type ``person``.
+
+    Pets/companies/products/places/websites are knowledge, not people: they must
+    never end up in the ``people`` table via ``person_upsert``.
+    """
+    for e in entities:
+        if e.get("type") == "person":
+            return e.get("name")
     return None
 
 
@@ -448,7 +476,7 @@ class ActionBuilder:
                     "remind_at": datetime.now(timezone.utc).isoformat(),
                 }
         if intent == "person":
-            name = pick_entity_name(ex.entities)
+            name = pick_person_name(ex.entities)
             if name:
                 notes = " | ".join(filter(None, [ex.title, ex.summary, ex.visible_text[:200]]))
                 return "person_upsert", {"name": name, "notes": notes[:400]}
@@ -580,7 +608,7 @@ class IngestionPipeline:
         try:
             return self._ingest(inp)
         except Exception as e:
-            return IngestionResult(ok=False, status="failed",
+            return IngestionResult(ok=False, ingestion_status="failed",
                                    reply=f"Не удалось сохранить: {e}")
 
     # -- core ---------------------------------------------------------------
@@ -593,13 +621,15 @@ class IngestionPipeline:
         dup = self.store.find_duplicate(chat_id, mid, hash_)
         if dup:
             return IngestionResult(
-                ok=True, status="duplicate", duplicate=True, item=dup, item_id=dup.get("id"),
-                project_id=dup.get("project_id"), urls=dup.get("urls") or [],
+                ok=True, ingestion_status="duplicate", duplicate=True, item=dup,
+                item_id=dup.get("id"), project_id=dup.get("project_id"),
+                urls=dup.get("urls") or [],
+                enrichment_status=dup.get("enrichment_status") or "not_required",
                 reply=f"Уже сохраняла это (запись #{dup.get('id')}). Новая запись не создана.",
             )
 
-        # extract
-        ex = self._extract(inp)
+        # extract (returns vision_ok=False when vision failed -> partial)
+        ex, vision_ok = self._extract(inp)
         # understand
         ex = self._understand(inp, ex)
         # resolve context
@@ -609,7 +639,7 @@ class IngestionPipeline:
         # persist original files (kept on disk + registered in `files`)
         file_rows = self._persist_attachments(chat_id, inp, ex)
 
-        # store
+        # store (status starts as "processing"; finalized below)
         item = KnowledgeItem(
             chat_id=chat_id, content_type=ex.content_type, title=ex.title, summary=ex.summary,
             visible_text=ex.visible_text, searchable_text=ex.searchable_text,
@@ -620,13 +650,14 @@ class IngestionPipeline:
                 "source": {"message_id": mid, "project_probe": project_id},
             },
             content_hash=hash_, project_id=project_id, source_message_id=mid,
-            source_file_id=file_ids[0] if file_ids else None, status="stored",
+            source_file_id=file_ids[0] if file_ids else None, status="processing",
         )
         created_item, is_dup = self.store.insert_item(item)
         if is_dup:
             return IngestionResult(
-                ok=True, status="duplicate", duplicate=True, item=created_item,
+                ok=True, ingestion_status="duplicate", duplicate=True, item=created_item,
                 item_id=created_item.get("id"), project_id=project_id, urls=ex.urls,
+                enrichment_status=created_item.get("enrichment_status") or "not_required",
                 reply=f"Уже сохраняла это (запись #{created_item.get('id')}). Дубликат не создан.",
             )
         item_id = created_item["id"]
@@ -637,11 +668,19 @@ class IngestionPipeline:
         # embed (clean interface; no-op for the SQLite/NULL provider)
         self._embed(item_id, created_item)
 
-        # enrichment — optional, only for real urls, never breaks ingestion
-        enrichment, enrich_status = [], "stored"
-        if self.url_enricher is not None and ex.urls:
-            enrichment, enrich_status = self._enrich(item_id, ex.urls)
-            created_item = self.store.set_enrichment(item_id, enrichment, enrich_status)
+        # enrichment — optional, only for real SAFE urls, never breaks ingestion
+        enrichment, enrich_status = [], "not_required"
+        if ex.urls:
+            if self.url_enricher is None:
+                enrich_status = "pending"
+            else:
+                enrichment, enrich_status = self._enrich(item_id, ex.urls)
+                created_item = self.store.set_enrichment(item_id, enrichment, enrich_status)
+
+        # ingestion_status is finalized AFTER storage (independent of enrichment)
+        ing_status = "completed" if vision_ok else "partial"
+        if ing_status != "processing":
+            created_item = self.store.update_status(item_id, ing_status)
 
         # actions — strictly AFTER storage, only on explicit user intent
         intents = analyze_intents(inp.user_text)
@@ -649,16 +688,18 @@ class IngestionPipeline:
 
         reply = self._compose_reply(created_item, enrichment, actions, project_id)
         return IngestionResult(
-            ok=True, status=enrich_status, item=created_item, item_id=item_id,
-            project_id=project_id, urls=ex.urls, enrichment=enrichment,
-            actions=actions, reply=reply,
+            ok=True, ingestion_status=ing_status, enrichment_status=enrich_status,
+            item=created_item, item_id=item_id, project_id=project_id, urls=ex.urls,
+            enrichment=enrichment, actions=actions, reply=reply,
         )
 
-    def _extract(self, inp: IngestionInput) -> ExtractionResult:
+    def _extract(self, inp: IngestionInput):
+        """Returns ``(ExractionResult, vision_ok)``."""
         images = [a for a in inp.attachments if a.local_path and Path(a.local_path).exists()]
         if images:
             a = images[0]
             caption = inp.user_text or ""
+            vision_ok = True
             try:
                 raw = self.vision_extractor.extract(str(a.local_path), a.mime_type or "image/jpeg", caption)
                 ex = normalize_extraction(raw, caption)
@@ -666,11 +707,12 @@ class IngestionPipeline:
             except Exception:
                 ex = normalize_extraction({}, caption)
                 ex.used_vision = False
+                vision_ok = False
                 ex.summary = "Не удалось проанализировать изображение; сохранено по подписи."
             # deterministic URL parse over everything that is part of the input
             ex.urls = parse_urls(ex.visible_text, caption, inp.reply_to_text, ex.title, ex.summary)
-            return ex
-        # text-only input
+            return ex, vision_ok
+        # text-only input (vision not required -> fully processed)
         ex = normalize_extraction({}, inp.user_text)
         ex.visible_text = inp.user_text
         ex.title = (inp.user_text or "")[:120]
@@ -678,7 +720,7 @@ class IngestionPipeline:
         ex.urls = parse_urls(inp.user_text, inp.reply_to_text)
         ex.content_type = "text" if not ex.urls else "web"
         ex.used_vision = False
-        return ex
+        return ex, True
 
     def _understand(self, inp: IngestionInput, ex: ExtractionResult) -> ExtractionResult:
         ex.category = infer_category(ex, inp.user_text)
@@ -726,8 +768,19 @@ class IngestionPipeline:
             pass  # embeddings are best-effort; they never fail ingestion
 
     def _enrich(self, item_id, urls) -> tuple:
+        """Attempt enrichment ONLY for safe URLs; returns (records, enrichment_status).
+
+        Unsafe targets (SSRF) are recorded as ``blocked`` and never fetched; the
+        ingested URL is kept untouched. `enrichment_status` follows:
+        completed / partial / failed.
+        """
+        allowed = getattr(self.url_enricher, "allowed_hosts", None)
         results, statuses = [], []
         for u in urls[:3]:
+            if not is_safe_url(u, allowed_hosts=allowed):
+                results.append({"url": u, "status": "blocked", "error": "unsafe_url:blocked_host"})
+                statuses.append(False)
+                continue
             try:
                 e = self.url_enricher.enrich(u)
                 results.append({
@@ -745,12 +798,12 @@ class IngestionPipeline:
                 results.append({"url": u, "status": "failed", "error": f"unexpected:{err}"})
                 statuses.append(False)
         if not statuses:
-            return results, "stored"
+            return results, "not_required"
         if all(statuses):
-            return results, "enriched"
+            return results, "completed"
         if any(statuses):
-            return results, "enrichment_partial"
-        return results, "enrichment_failed"
+            return results, "partial"
+        return results, "failed"
 
     def _compose_reply(self, item, enrichment, actions, project_id) -> str:
         lines = []
@@ -768,10 +821,13 @@ class IngestionPipeline:
             if n and n not in seen:
                 seen.append(n)
                 lines.append(f"👤 Записала: {n}")
-        if item.get("status") in ("enriched", "enrichment_partial"):
+        enrich_status = item.get("enrichment_status") or "not_required"
+        if enrich_status in ("completed", "partial"):
             ok_n = sum(1 for x in enrichment if x.get("status") == "ok")
-            lines.append(f"🔎 Обогатила {ok_n} URL")
-        elif item.get("status") == "enrichment_failed":
+            blocked_n = sum(1 for x in enrichment if x.get("status") == "blocked")
+            suffix = " (+безопасно пропустила внутренние ссылки)" if blocked_n else ""
+            lines.append(f"🔎 Обогатила {ok_n} URL{suffix}")
+        elif enrich_status == "failed":
             lines.append("🔎 Обогащение URL не удалось (данные сохранены).")
         for action in actions:
             res = action.get("result")

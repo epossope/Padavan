@@ -91,13 +91,32 @@ class ProjectResolverTest(unittest.TestCase):
 
 class IntentTest(unittest.TestCase):
     def test_expense_intent(self):
-        self.assertIn("expense", analyze_intents("добавь расход"))
+        self.assertIn("expense", analyze_intents("добавь это как расход"))
 
     def test_no_intent_for_question(self):
         self.assertEqual(analyze_intents("что тут написано?"), [])
 
-    def test_person_intent(self):
-        self.assertIn("person", analyze_intents("Это моя собака Ричи"))
+    def test_question_with_chek_word_no_expense(self):
+        self.assertEqual(analyze_intents("Что написано на чеке?"), [])
+
+    def test_task_intent(self):
+        self.assertIn("task", analyze_intents("Добавь это в задачи"))
+
+    def test_task_question_no_task(self):
+        self.assertEqual(analyze_intents("Что здесь за задача написана?"), [])
+
+    def test_reminder_intent(self):
+        self.assertIn("reminder", analyze_intents("Напомни завтра"))
+
+    def test_screenshot_mention_no_reminder(self):
+        self.assertEqual(analyze_intents("На скриншоте написано встреча завтра"), [])
+
+    def test_person_intent_explicit(self):
+        self.assertIn("person", analyze_intents("Запомни, это Алексей, дизайнер проекта"))
+
+    def test_person_no_intent_weak_mention(self):
+        self.assertEqual(analyze_intents("Это моя собака Ричи"), [])
+        self.assertEqual(analyze_intents("На фотографии Алексей"), [])
 
     def test_money_extraction(self):
         amt, _ = extract_money("Кофе 250 ₽ итого")
