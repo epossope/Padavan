@@ -40,6 +40,13 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from knowledge_store import KnowledgeItem, KnowledgeStore
+
+from ingestion import (ActionBuilder, Attachment, IngestionInput, IngestionPipeline,
+                       IngestionResult, VisionExtractor)
+
+from url_enricher import HttpUrlEnricher
+
 
 
 BASE = Path(__file__).resolve().parent
@@ -353,6 +360,69 @@ WRITE_TOOLS = {"set_reminder","save_note","add_task","person_upsert","person_int
 
 
 
+STORAGE_ROOT = BASE / "storage"
+
+_pipeline = None
+
+
+def _bot_save_file(cid, name, mime, path, kind, summary):
+    try:
+        r = save_image_to_db(cid, name, mime, path, kind, summary)
+        return r.get("id")
+    except Exception:
+        return None
+
+
+def get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = IngestionPipeline(
+            store=KnowledgeStore(DB),
+            vision_extractor=VisionExtractor(),
+            url_enricher=HttpUrlEnricher(),
+            file_saver=_bot_save_file,
+            action_builder=ActionBuilder(action_runner=lambda cid, name, args: execute_tool(cid, name, args)),
+            storage_dir=STORAGE_ROOT,
+        )
+    return _pipeline
+
+
+def knowledge_search(query, filters=None, limit=10):
+    """Public search interface (SQLite text search now; pgvector/hybrid later)."""
+    try:
+        return get_pipeline().store.search(query, filters=filters, limit=limit)
+    except Exception:
+        return []
+
+
+def find_photos(chat_id, name, limit=5):
+    """Find persisted knowledge items + original image files about `name`."""
+    try:
+        items = get_pipeline().store.search_by_entity(name, chat_id=chat_id, limit=limit)
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        for f in get_pipeline().store.item_files(it["id"]):
+            if (f.get("mime_type") or "").startswith("image/") and f.get("local_path"):
+                out.append({"item_id": it["id"], "local_path": f["local_path"],
+                            "summary": it.get("summary") or it.get("title") or "",
+                            "file_row": f.get("id")})
+    return out
+
+
+def build_inquiry_input(result):
+    if not result.ok or not result.item:
+        return None
+    it = result.item
+    parts = [p for p in (it.get("title"), it.get("summary"), it.get("visible_text")) if p]
+    body = "\n".join(parts)
+    if result.urls:
+        body += "\nURL: " + ", ".join(result.urls[:3])
+    return ("[Сохранено в память]\n" + body) if body else None
+
+
+
 def conn():
 
     c = sqlite3.connect(DB)
@@ -444,6 +514,8 @@ def init_db():
         ]:
 
             ensure_column(c, table, col, typ)
+
+    KnowledgeStore(DB).init_schema()
 
 
 
@@ -1915,6 +1987,34 @@ async def text_handler(update,context):
 
 
 
+    # knowledge photo retrieval: «покажи фото Ричи»
+
+    pm=re.match(r"(?:покажи|найди)\s+(?:фото|картинк\w*|изображен\w*)\s+(.+)$", t, re.I)
+
+    if pm:
+
+        name=pm.group(1).strip()
+
+        found=find_photos(cid,name)
+
+        if found:
+
+            first=found[0]
+
+            try:
+
+                with Path(first["local_path"]).open("rb") as fh:
+
+                    await update.effective_message.reply_photo(photo=fh, caption=(first.get("summary") or "")[:200])
+
+                return
+
+            except Exception:
+
+                return await update.effective_message.reply_text("Нашла запись, но файл недоступен локально.")
+
+
+
     try:
 
         a=await asyncio.to_thread(ask,cid,t); await send_answer(update,a,False,wants_voice(t))
@@ -1977,25 +2077,22 @@ async def image_handler(update,context):
 
         try:
 
-            description=describe_image(p,mime,caption)
+            original_name=(msg.document or msg.photo[-1]).file_name or f"image_{datetime.now().strftime("%Y%m%d%H%M%S")}.img"
 
-            # Save the image to database after successful analysis
+            reply_body=((getattr(msg.reply_to_message,"text",None) if msg.reply_to_message else None) or (getattr(msg.reply_to_message,"caption",None) if msg.reply_to_message else None) or "")
 
-            save_result=await asyncio.to_thread(execute_tool,cid,"save_image_to_db",{
+            inp=IngestionInput(
+                chat_id=cid,
+                message_id=msg.message_id,
+                user_text=caption,
+                attachments=[Attachment(file_id=(msg.document or msg.photo[-1]).file_id, local_path=str(p),
+                                         mime_type=mime, kind="image", original_name=original_name)],
+                timestamp=datetime.now(TZ),
+                conversation_context=" ".join(f'{m["role"]}: {m["content"]}' for m in history(cid,6)),
+                reply_to_text=reply_body,
+            )
 
-                "chat_id":cid,
-
-                "original_name":(msg.document or msg.photo[-1]).file_name or f"image_{datetime.now().strftime("%Y%m%d%H%M%S")}.img",
-
-                "mime_type":mime,
-
-                "local_path":str(p),
-
-                "kind":"user_image",
-
-                "summary":caption or description[:200]
-            })
-
+            result=await asyncio.to_thread(get_pipeline().ingest, inp)
 
         except Exception:
 
@@ -2003,11 +2100,36 @@ async def image_handler(update,context):
 
             return
 
-        combined=description+(f"\n\nПодпись: {caption}" if caption else "")
+        if not result.ok:
 
-        answer=await asyncio.to_thread(ask,cid,combined)
+            await status_msg.edit_text("Не удалось сохранить изображение. Попробуй другое.")
 
-        await status_msg.edit_text(answer or "Готово.")
+            return
+
+        pre=result.reply or "Готово."
+
+        final_text=pre
+
+        q=caption.strip().lower()
+
+        if q.endswith("?") or any(w in q for w in ("что","какой","какая","какие","какое","сколько","написано","опиши","расскажи","покажи")):
+
+            inquiry=build_inquiry_input(result)
+
+            if inquiry:
+
+                try:
+
+                    model_ans=await asyncio.to_thread(ask,cid,inquiry)
+
+                    if model_ans and model_ans not in (pre,"Готово."):
+
+                        final_text=pre+"\n\n"+model_ans
+
+                except Exception as e: await safe_error(update,e)
+
+        await status_msg.edit_text(final_text[:4000] or "Готово.")
+
 
     except Exception as e: await safe_error(update,e)
 
