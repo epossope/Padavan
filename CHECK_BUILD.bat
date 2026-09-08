@@ -8,7 +8,7 @@ echo ===== NOEMA BUILD CHECK =====
 echo.
 
 REM --- 1. required source files ---
-for %%F in (bot.py ingestion.py knowledge_store.py url_enricher.py) do (
+for %%F in (bot.py ingestion.py knowledge_store.py url_enricher.py retrieval.py) do (
     if not exist "%%~F" (
         echo [FAIL] missing source file: %%~F
         set /a FAILS+=1
@@ -56,12 +56,12 @@ echo.
 
 if exist ".venv\Scripts\python.exe" (
     REM --- 5. syntax check ---
-    ".venv\Scripts\python.exe" -m py_compile bot.py ingestion.py knowledge_store.py url_enricher.py
+    ".venv\Scripts\python.exe" -m py_compile bot.py ingestion.py knowledge_store.py url_enricher.py retrieval.py
     if errorlevel 1 (
         echo [FAIL] py_compile failed
         set /a FAILS+=1
     ) else (
-        echo [ OK ] py_compile: all four modules
+        echo [ OK ] py_compile: all five modules
     )
 
     REM --- 6. import check ---
@@ -70,7 +70,7 @@ if exist ".venv\Scripts\python.exe" (
         echo [FAIL] module import failed
         set /a FAILS+=1
     ) else (
-        echo [ OK ] imports: bot, ingestion, knowledge_store, url_enricher
+        echo [ OK ] imports: bot, retrieval, ingestion, knowledge_store, url_enricher
     )
 
     REM --- 7. full test suite (unit + integration + regression) ---
