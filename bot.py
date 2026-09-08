@@ -2077,7 +2077,9 @@ async def image_handler(update,context):
 
         try:
 
-            original_name=(msg.document or msg.photo[-1]).file_name or f"image_{datetime.now().strftime("%Y%m%d%H%M%S")}.img"
+            src_image=msg.document if (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")) else msg.photo[-1]
+
+            orig_name=(msg.document.file_name if msg.document else None) or f"image_{datetime.now().strftime("%Y%m%d%H%M%S")}.img"
 
             reply_body=((getattr(msg.reply_to_message,"text",None) if msg.reply_to_message else None) or (getattr(msg.reply_to_message,"caption",None) if msg.reply_to_message else None) or "")
 
@@ -2085,8 +2087,8 @@ async def image_handler(update,context):
                 chat_id=cid,
                 message_id=msg.message_id,
                 user_text=caption,
-                attachments=[Attachment(file_id=(msg.document or msg.photo[-1]).file_id, local_path=str(p),
-                                         mime_type=mime, kind="image", original_name=original_name)],
+                attachments=[Attachment(file_id=src_image.file_id, local_path=str(p),
+                                         mime_type=mime, kind="image", original_name=orig_name)],
                 timestamp=datetime.now(TZ),
                 conversation_context=" ".join(f'{m["role"]}: {m["content"]}' for m in history(cid,6)),
                 reply_to_text=reply_body,
