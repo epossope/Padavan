@@ -2460,15 +2460,16 @@ def transcribe(chat_id, path):
 
     b64=base64.b64encode(Path(path).read_bytes()).decode()
 
-    key, source = api_key_for_chat(chat_id)
-    r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+    # STT is a shared Noema service. A personal model key may not have
+    # transcription access, so it must never affect voice recognition.
+    r=requests.post(STT_URL,headers={"Authorization":f"Bearer {OR_KEY}","Content-Type":"application/json"},
 
                     json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
     data = r.json()
-    record_usage(chat_id, source, STT_MODEL, data)
+    record_usage(chat_id, "shared", STT_MODEL, data)
     text=data.get("text","").strip()
 
     if not text: raise RuntimeError("STT_EMPTY")
