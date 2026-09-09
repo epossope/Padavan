@@ -1,6 +1,8 @@
 
 
 import asyncio
+import concurrent.futures
+import contextlib
 
 import base64
 
@@ -102,7 +104,7 @@ STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 KB = ReplyKeyboardMarkup([
     ["📚 Знания", "📅 Сегодня", "➕ Создать"],
-    ["🔎 Поиск", "⚙️ Настройки", "☰ Ещё"],
+    ["⚙️ Настройки", "☰ Ещё"],
 ], resize_keyboard=True)
 
 AVAILABLE_MODELS = [x.strip() for x in os.getenv(
@@ -113,6 +115,17 @@ AVAILABLE_MODELS = [x.strip() for x in os.getenv(
 
 
 TOOLS = [
+    {"type":"function","function":{
+
+        "name":"internet_search",
+
+        "description":"Найти актуальную информацию в интернете: факты, рекомендации, статьи, сервисы, товары, сравнения и ссылки. Вызывай, когда пользователь просит найти, исследовать, проверить или подобрать что-то во внешнем интернете, а не в сохранённой памяти.",
+
+        "parameters":{"type":"object","properties":{
+            "query":{"type":"string"},"limit":{"type":"integer"},"news":{"type":"boolean"}
+        },"required":["query"]}
+
+    }},
     {"type":"function","function":{
 
         "name":"set_reminder",
@@ -401,7 +414,8 @@ WRITE_TOOLS = {"set_reminder","save_note","add_task","person_upsert","person_int
 
 
 
-STORAGE_ROOT = BASE / "storage"
+# Database and originals must live together in Amvera's persistent mount.
+STORAGE_ROOT = PERSISTENT_ROOT / "storage"
 
 _pipeline = None
 
@@ -1240,6 +1254,8 @@ def execute_tool(chat_id,name,args):
 
         "send_stored_image":send_stored_image,
 
+        "internet_search":internet_search,
+
         "knowledge_search":knowledge_search_tool,
 
         "knowledge_get":knowledge_get_tool,
@@ -1360,8 +1376,7 @@ def get_exchange_rate_live(base="USD",quote="RUB"):
 def web_search_live(query,n=6,news=False):
 
     try:
-
-        rows=list(DDGS().news(query,max_results=n)) if news else list(DDGS().text(query,max_results=n))
+        rows=list(DDGS(timeout=6).news(query,max_results=n)) if news else list(DDGS(timeout=6).text(query,max_results=n))
 
     except Exception:
 
@@ -1378,6 +1393,17 @@ def web_search_live(query,n=6,news=False):
     return {"ok":True,"results":out}
 
 
+def internet_search(chat_id, query="", limit=6, news=False):
+    """LLM tool for broad web research; it is not limited to shopping."""
+    try:
+        limit = max(1, min(int(limit or 6), 8))
+    except Exception:
+        limit = 6
+    result = web_search_live(str(query or ""), limit, bool(news))
+    return {"ok": bool(result.get("ok")), "tool": "internet_search", "query": query,
+            "results": result.get("results") or []}
+
+
 
 def clean_product_query(text):
 
@@ -1385,7 +1411,7 @@ def clean_product_query(text):
 
     q=re.sub(r"(?i)\b(найди|подбери|покажи|хочу купить|где купить|купить)\b"," ",q)
 
-    q=re.sub(r"(?i)\bдо\s*\d[\d\s]*\s*(?:₽|р|руб(?:лей)?)\b"," ",q)
+    q=re.sub(r"(?i)\b(?:до|за|не дороже)\s*\d[\d\s]*\s*(?:₽|р|руб(?:лей)?)\b"," ",q)
 
     return re.sub(r"\s+"," ",q).strip(" ,.?")
 
@@ -1423,8 +1449,8 @@ def search_products_live(text,max_price=None,city=""):
 
     items=[]
 
-    for label,domain in marketplaces:
-
+    def search_market(market):
+        label, domain = market
         q=f'site:{domain} "{product}" купить'
 
         if max_price is not None: q+=f" до {max_price:g} рублей"
@@ -1433,10 +1459,29 @@ def search_products_live(text,max_price=None,city=""):
 
         q+=neg
 
-        try: rows=list(DDGS().text(q,max_results=3))
+        try:
+            rows = list(DDGS(timeout=6).text(q, max_results=3))
+        except Exception:
+            rows = []
+        return label, domain, rows
 
-        except Exception: rows=[]
+    # Market searches are independent. Running them concurrently caps a bad
+    # provider/network delay at one timeout instead of five sequential waits.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(marketplaces))
+    futures = [pool.submit(search_market, market) for market in marketplaces]
+    done, pending = concurrent.futures.wait(futures, timeout=8)
+    results = []
+    for future in done:
+        try:
+            results.append(future.result())
+        except Exception:
+            pass
+    for future in pending:
+        future.cancel()
+    # Never make a Telegram reply wait for a stalled marketplace/provider.
+    pool.shutdown(wait=False, cancel_futures=True)
 
+    for label, domain, rows in results:
         for r in rows:
 
             title=(r.get("title") or "").strip(); url=(r.get("href") or r.get("url") or "").strip()
@@ -1559,11 +1604,12 @@ def direct_live_request(text):
 
         return format_links("🔎 Результаты поиска",web_search_live(text,6,False))
 
-    if any(x in t for x in ("хочу купить","где купить","найди товар","подбери","на озон","на wildberries","на вайлдберриз")):
+    if (any(x in t for x in ("хочу купить","где купить","найди товар","подбери","на озон","на wildberries","на вайлдберриз"))
+            or ("найди" in t and re.search(r"(?:до|за|не дороже)\s*\d[\d\s]*\s*(?:₽|р|руб)", t))):
 
         max_price=None
 
-        m=re.search(r"(?:до|не дороже)\s*(\d[\d\s]*)\s*(?:₽|р|руб)",t)
+        m=re.search(r"(?:до|за|не дороже)\s*(\d[\d\s]*)\s*(?:₽|р|руб)",t)
 
         if m:
 
@@ -1580,6 +1626,14 @@ def direct_live_request(text):
         return format_links("🛍 Нашла варианты",search_products_live(text,max_price,city))
 
     return None
+
+
+def asks_external_web(text):
+    """Conservative detector used only to encourage the web tool's first turn."""
+    low = (text or "").lower()
+    phrases = ("в интернете", "погугли", "ресерч", "исследуй", "найди информацию",
+               "проверь в сети", "найди сайт", "найди статью", "сравни ", "отзывы о")
+    return any(phrase in low for phrase in phrases)
 
 
 
@@ -1611,7 +1665,9 @@ def system_prompt():
 
         "Для чтения сохранённых данных используй get_notes, get_people, get_expenses, get_today_plan — не выдумывай. "
 
-        "Текущие новости/погоду/курс/товары обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+        "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+
+        "Когда пользователь просит найти, проверить, изучить, сравнить, подобрать или исследовать что-то во внешнем интернете, вызывай internet_search. Это относится не только к товарам: ищи статьи, сервисы, факты, рекомендации и ссылки. Сначала различай внешний интернет и сохранённую память пользователя. "
 
         "У тебя есть сохранённая память пользователя (knowledge): фото, скриншоты, сайты, URL, заметки, чек, сущности, проекты. "
 
@@ -1659,7 +1715,9 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
         for attempt in range(2):
 
+            started = time.perf_counter()
             r=request_chat(model,messages,tools,tool_choice)
+            print(f"LLM request chat_id={chat_id} model={model} seconds={time.perf_counter()-started:.2f} status={r.status_code}")
 
             if r.ok:
                 choice = r.json()["choices"][0]
@@ -1727,11 +1785,15 @@ def write_confirmation(results):
 
 def ask(chat_id,text):
 
+    started = time.perf_counter()
+
     live=direct_live_request(text)
 
     if live is not None:
 
-        add_message(chat_id,"user",text); add_message(chat_id,"assistant",live); return live
+        add_message(chat_id,"user",text); add_message(chat_id,"assistant",live)
+        print(f"Request complete chat_id={chat_id} route=live seconds={time.perf_counter()-started:.2f}")
+        return live
 
 
 
@@ -1755,7 +1817,10 @@ def ask(chat_id,text):
 
     for _ in range(5):
 
-        tc="required" if _==0 else "auto"
+        # `required` made every ordinary conversation take at least two model
+        # round trips. `auto` still exposes all tools, but allows a direct
+        # answer when no database action is needed.
+        tc="required" if _ == 0 and asks_external_web(text) else "auto"
 
         msg=call_or(chat_id,msgs,TOOLS,tc)
 
@@ -1765,7 +1830,9 @@ def ask(chat_id,text):
 
             ans=(msg.get("content") or "").strip() or write_confirmation(writes)
 
-            add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans); return ans
+            add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans)
+            print(f"Request complete chat_id={chat_id} route=llm seconds={time.perf_counter()-started:.2f}")
+            return ans
 
         msgs.append(msg)
 
@@ -1974,6 +2041,47 @@ async def safe_error(update,e):
     await update.effective_message.reply_text(msg)
 
 
+def activity_labels(text):
+    low = (text or "").lower()
+    if any(word in low for word in ("найди", "купи", "товар", "вазу", "интернет")):
+        return ["🔎 Ищу варианты…", "🔎 Проверяю источники…", "🧠 Собираю ответ…"]
+    if any(word in low for word in ("где", "помни", "сохранял", "фото", "картинк")):
+        return ["📚 Ищу в памяти…", "🧠 Проверяю данные…", "✍️ Готовлю ответ…"]
+    return ["🧠 Думаю…", "📚 Проверяю данные…", "✍️ Готовлю ответ…"]
+
+
+async def begin_activity(message, labels):
+    """One temporary, unobtrusive progress card for operations lasting seconds."""
+    card = await message.reply_text(labels[0])
+    stopped = asyncio.Event()
+
+    async def animate():
+        index = 1
+        while not stopped.is_set():
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=2.2)
+                break
+            except asyncio.TimeoutError:
+                try:
+                    await card.edit_text(labels[min(index, len(labels) - 1)])
+                except Exception:
+                    return
+                index += 1
+
+    return card, stopped, asyncio.create_task(animate())
+
+
+async def end_activity(card, stopped, task):
+    stopped.set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
+    # The status is intentionally temporary: the final answer remains the only
+    # persistent bot message in the chat.
+    with contextlib.suppress(Exception):
+        await card.delete()
+
+
 
 # ---------- UI ----------
 
@@ -2164,6 +2272,11 @@ async def callback(update,context):
         return await notes(update, context)
     if q.data == "settings:status":
         return await q.edit_message_text(status_text(q.message.chat_id))
+    if q.data == "settings:keys":
+        return await q.edit_message_text(
+            "🔐 API-ключи\nКлючи не сохраняются в переписке: сообщения Telegram не являются защищённым хранилищем. "
+            "Меняйте TELEGRAM_BOT_TOKEN и OPENROUTER_API_KEY в Secrets/Environment Vero, затем перезапускайте деплой.\n\n"
+            "Модели можно добавлять и удалять прямо в этом чате через «🧠 Модель».")
     if q.data == "settings:clear":
         clear_history(q.message.chat_id)
         return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
@@ -2180,6 +2293,8 @@ async def callback(update,context):
 def settings_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Модель", callback_data="settings:model")],
+        [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
+        [InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
         [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
         [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
     ])
@@ -2292,7 +2407,6 @@ async def text_handler(update,context):
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
                 [InlineKeyboardButton("👥 Люди", callback_data="menu:people")],
                 [InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
                 [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
@@ -2401,13 +2515,14 @@ async def text_handler(update,context):
 
 
 
+    activity = await begin_activity(update.effective_message, activity_labels(t))
     try:
-
         a=await asyncio.to_thread(ask,cid,t); await send_answer(update,a,False,wants_voice(t))
-
         await drain_media_outbox(update, context)
-
-    except Exception as e: await safe_error(update,e)
+    except Exception as e:
+        await safe_error(update,e)
+    finally:
+        await end_activity(*activity)
 
 
 
@@ -2463,7 +2578,7 @@ async def image_handler(update,context):
 
         caption=msg.caption or ""
 
-        status_msg=await msg.reply_text("🧠 Анализирую изображение...")
+        status_msg=await msg.reply_text("🧠 Расшифровываю изображение…")
 
         try:
 
@@ -2512,6 +2627,7 @@ async def image_handler(update,context):
 
                 try:
 
+                    await status_msg.edit_text("🧠 Изучаю материал и готовлю ответ…")
                     model_ans=await asyncio.to_thread(ask,cid,inquiry)
 
                     if model_ans and model_ans not in (pre,"Готово."):
