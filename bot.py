@@ -76,7 +76,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "prod-ui-2026-09-09.8"
+BUILD_ID = "prod-ui-2026-09-09.9"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -3047,9 +3047,8 @@ async def callback(update,context):
         token = quick_action_token(device_id, "action", secret)
         text = (
             "⚡ <b>Быстрая команда</b>\n\n"
-            "Это один ключ для голосовой команды. Его можно использовать и для Action Button, и для двойного/тройного касания — если везде должна быть одна логика Noema.\n\n"
-            "В команде iPhone: «Продиктовать текст» → отправить результат в Noema. Noema получит обычный текст, как будто вы написали его в Telegram, и сама поймёт: заметка это, расход, задача или вопрос.\n\n"
-            "<b>Ключ</b> — нажмите на строку, чтобы скопировать:\n"
+            "Скопируйте ключ и вставьте его в поле <b>token</b> готовой команды Noema на iPhone.\n\n"
+            "<b>Ключ</b>:\n"
             f"<code>{quick_action_token(device_id, 'action', secret)}</code>"
         )
         return await q.edit_message_text(text, parse_mode="HTML",
