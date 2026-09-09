@@ -414,7 +414,8 @@ WRITE_TOOLS = {"set_reminder","save_note","add_task","person_upsert","person_int
 
 
 
-STORAGE_ROOT = BASE / "storage"
+# Database and originals must live together in Amvera's persistent mount.
+STORAGE_ROOT = PERSISTENT_ROOT / "storage"
 
 _pipeline = None
 
