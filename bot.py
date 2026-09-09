@@ -76,7 +76,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "prod-ui-2026-09-09.7"
+BUILD_ID = "prod-ui-2026-09-09.8"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -3029,53 +3029,61 @@ async def callback(update,context):
                 reply_markup=InlineKeyboardMarkup(buttons))
     if q.data in ("iphone:add", "iphone:add:force"):
         device = create_quick_action_device(q.message.chat_id)
-        endpoint = f'{QUICK_ACTIONS_BASE_URL}/api/v1/quick-actions/run' if QUICK_ACTIONS_BASE_URL else "Адрес ещё не настроен администратором."
-        action_token = quick_action_token(device["id"], "action", device["secret"])
         text = (
             f'📱 <b>{html.escape(device["name"])} подключён</b>\n\n'
-            '<b>Адрес</b> — нажмите, чтобы скопировать:\n'
-            f'<code>{html.escape(endpoint)}</code>\n\n'
-            '<b>Ключ для Action Button</b> — нажмите, чтобы скопировать:\n'
-            f'<code>{action_token}</code>\n\n'
-            'Дальше на iPhone откройте <b>Команды (Shortcuts)</b>. Полная инструкция и эти параметры всегда доступны по кнопке ниже.'
+            'Выберите, что хотите подключить. Для обычной голосовой команды нужен один ключ — его можно назначить на любую кнопку iPhone.'
         )
         return await q.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Параметры Shortcut", callback_data=f'iphone:shortcut:{device["id"]}')],
-                                                [InlineKeyboardButton("⚙️ Настроить действия", callback_data=f'iphone:device:{device["id"]}')],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Быстрая команда", callback_data=f'iphone:quick:{device["id"]}'),
+                                                InlineKeyboardButton("📤 Поделиться в Noema", callback_data=f'iphone:share:{device["id"]}')],
+                                                [InlineKeyboardButton("⚙️ Разные действия для кнопок", callback_data=f'iphone:device:{device["id"]}')],
                                                 [InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]]))
+    if q.data.startswith("iphone:quick:"):
+        device_id = q.data.split(":", 2)[2]
+        device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
+        secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
+        if not secret:
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+        token = quick_action_token(device_id, "action", secret)
+        text = (
+            "⚡ <b>Быстрая команда</b>\n\n"
+            "Это один ключ для голосовой команды. Его можно использовать и для Action Button, и для двойного/тройного касания — если везде должна быть одна логика Noema.\n\n"
+            "В команде iPhone: «Продиктовать текст» → отправить результат в Noema. Noema получит обычный текст, как будто вы написали его в Telegram, и сама поймёт: заметка это, расход, задача или вопрос.\n\n"
+            "<b>Ключ</b> — нажмите на строку, чтобы скопировать:\n"
+            f"<code>{quick_action_token(device_id, 'action', secret)}</code>"
+        )
+        return await q.edit_message_text(text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Разные действия для кнопок", callback_data=f"iphone:device:{device_id}")],
+                                                [InlineKeyboardButton("‹ iPhone", callback_data=f"iphone:shortcut:{device_id}")]]))
+    if q.data.startswith("iphone:share:"):
+        device_id = q.data.split(":", 2)[2]
+        device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
+        secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
+        if not secret:
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+        text = (
+            "📤 <b>Поделиться в Noema</b>\n\n"
+            "Эта команда появляется в системном меню «Поделиться». Через неё можно отправить в Noema фото, скриншот, PDF, файл, ссылку или выделенный текст. Материал попадёт в тот же чат и обработается как обычное вложение Telegram.\n\n"
+            "<b>Ключ</b> — нажмите на строку, чтобы скопировать:\n"
+            f"<code>{quick_action_token(device_id, 'share', secret)}</code>"
+        )
+        return await q.edit_message_text(text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ iPhone", callback_data=f"iphone:shortcut:{device_id}")]]))
     if q.data.startswith("iphone:shortcut:"):
         device_id = q.data.split(":", 2)[2]
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         if not device:
             return await q.edit_message_text("Устройство не найдено или отключено.")
-        endpoint = f'{QUICK_ACTIONS_BASE_URL}/api/v1/quick-actions/run' if QUICK_ACTIONS_BASE_URL else "Адрес ещё не настроен администратором."
-        upload_endpoint = f'{QUICK_ACTIONS_BASE_URL}/api/v1/quick-actions/upload' if QUICK_ACTIONS_BASE_URL else "Адрес ещё не настроен администратором."
-        secret = device_quick_action_secret(q.message.chat_id, device_id)
-        if secret:
-            token_lines = "\n\n".join(
-                f'<b>{label}</b>\n<code>{quick_action_token(device_id, trigger, secret)}</code>'
-                for trigger, label in (("action", "Action Button"), ("double", "Double Back Tap"),
-                                       ("triple", "Triple Back Tap"), ("share", "Поделиться в Noema"),
-                                       ("screen", "Скрин в Noema"))
-            )
-        else:
-            token_lines = 'Нет сохранённого ключа у старого подключения. Выпустите новый ключ ниже.'
         text = (
-            '<b>Параметры Shortcut</b>\n\n'
-            '<b>Быстрые жесты и ссылки</b>\n'
-            'В «Команды» добавьте действие <b>URL</b>, затем «Получить содержимое URL» → «Показать больше» → <b>POST</b> → тело <b>JSON</b>.\n'
-            f'<code>{html.escape(endpoint)}</code>\n\n'
-            'В JSON добавьте поле <code>token</code> с нужным ключом ниже. Для голосовой заметки добавьте ещё <code>text</code> из «Продиктовать текст».\n\n'
-            f'{token_lines}\n\n'
-            '<b>Фото, PDF и файлы</b>\n'
-            'Для Shortcut «Поделиться в Noema» используйте «Получить содержимое URL» → <b>POST</b> → тело <b>Форма</b>.\n'
-            f'<code>{html.escape(upload_endpoint)}</code>\n'
-            'В форме: <code>token</code> — ключ «Поделиться в Noema»; <code>file</code> — вход команды как файл. '\
-            'Для URL и текста можно отправить JSON на первый адрес: <code>token</code> + <code>text</code>. '
-            'Скриншот сначала создаётся системно, затем отправляется через «Поделиться в Noema».'
+            '<b>iPhone и Noema</b>\n\n'
+            '1. Подключите одну голосовую команду к кнопке iPhone или Back Tap.\n'
+            '2. При необходимости добавьте «Поделиться в Noema» в системное меню.\n\n'
+            'Вам не нужно создавать отдельный ключ для каждой кнопки. Разные кнопки нужны только если вы хотите, чтобы они делали разное.'
         )
         return await q.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Действия iPhone", callback_data=f'iphone:device:{device_id}')],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Быстрая команда", callback_data=f'iphone:quick:{device_id}'),
+                                                InlineKeyboardButton("📤 Поделиться", callback_data=f'iphone:share:{device_id}')],
+                                                [InlineKeyboardButton("⚙️ Разные действия для кнопок", callback_data=f'iphone:device:{device_id}')],
                                                 [InlineKeyboardButton("🔑 Выпустить новый ключ", callback_data=f'iphone:rotateask:{device_id}')],
                                                 [InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]]))
     if q.data.startswith("iphone:device:"):
@@ -3105,9 +3113,8 @@ async def callback(update,context):
         secret = rotate_quick_action_secret(q.message.chat_id, device_id)
         if not secret:
             return await q.edit_message_text("Не удалось выпустить ключ. Проверьте USER_SECRETS_MASTER_KEY.")
-        token = quick_action_token(device_id, "action", secret)
-        return await q.edit_message_text(f"🔑 <b>Новый ключ для Action Button</b>\nНажмите на строку, чтобы скопировать:\n<code>{token}</code>\n\nДля Double и Triple Back Tap откройте «Параметры Shortcut» и замените их ключи тоже.",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Параметры Shortcut", callback_data=f"iphone:shortcut:{device_id}")],
+        return await q.edit_message_text("🔑 <b>Новый ключ выпущен</b>\nСтарые быстрые команды сразу отключены. Откройте нужную команду ниже и вставьте новый ключ в Shortcut.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 Открыть подключение", callback_data=f"iphone:shortcut:{device_id}")],
                                                                     [InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]]))
     if q.data.startswith("iphone:revokeask:"):
         device_id = q.data.split(":", 2)[2]
@@ -3209,7 +3216,7 @@ def settings_keyboard():
 
 def iphone_settings_page(chat_id):
     devices = quick_action_devices(chat_id)
-    lines = ["📱 <b>Быстрые действия iPhone</b>", "Action Button и Back Tap запускают команды Shortcuts. Каждое устройство привязано только к своему чату."]
+    lines = ["📱 <b>Быстрые действия iPhone</b>", "Одна голосовая команда — на любую кнопку iPhone. Отдельно можно добавить отправку файлов через «Поделиться». Каждое устройство привязано только к своему чату."]
     buttons = [[InlineKeyboardButton("➕ Подключить iPhone", callback_data="iphone:add")]]
     for device in devices:
         lines.append(f'\n• {html.escape(device["name"])} · {"подключён" if device["active"] else "отключён"}')
@@ -3224,13 +3231,14 @@ def iphone_device_page(chat_id, device_id):
         return "Устройство не найдено.", InlineKeyboardMarkup([[InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]])
     bindings = device["bindings"]
     labels = {"action": "Action Button", "double": "Double Back Tap", "triple": "Triple Back Tap"}
-    lines = [f'📱 <b>{html.escape(device["name"])}</b>', "Выберите строку, чтобы сменить действие:"]
+    lines = [f'📱 <b>{html.escape(device["name"])}</b>', "Разные действия необязательны. Если все кнопки должны просто передавать голос в Noema, используйте одну «Быструю команду» на любом числе кнопок.", "\n<b>Отдельные сценарии:</b>"]
     buttons = []
     for trigger in ("action", "double", "triple"):
         action = bindings.get(trigger, "note")
         lines.append(f'• {labels[trigger]}: {QUICK_ACTIONS[action]}')
         buttons.append([InlineKeyboardButton(f'{labels[trigger]}', callback_data=f'iphone:bind:{device_id}:{trigger}')])
-    buttons += [[InlineKeyboardButton("📋 Параметры Shortcut", callback_data=f'iphone:shortcut:{device_id}')],
+    buttons += [[InlineKeyboardButton("⚡ Быстрая команда", callback_data=f'iphone:quick:{device_id}'),
+                 InlineKeyboardButton("📤 Поделиться", callback_data=f'iphone:share:{device_id}')],
                 [InlineKeyboardButton("🔑 Выпустить новый ключ", callback_data=f'iphone:rotateask:{device_id}')],
                 [InlineKeyboardButton("🗑 Отключить iPhone", callback_data=f'iphone:revokeask:{device_id}')],
                 [InlineKeyboardButton("‹ Все устройства", callback_data="settings:iphone")]]
