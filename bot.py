@@ -104,7 +104,7 @@ STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 KB = ReplyKeyboardMarkup([
     ["📚 Знания", "📅 Сегодня", "➕ Создать"],
-    ["🔎 Поиск", "⚙️ Настройки", "☰ Ещё"],
+    ["⚙️ Настройки", "☰ Ещё"],
 ], resize_keyboard=True)
 
 AVAILABLE_MODELS = [x.strip() for x in os.getenv(
@@ -115,6 +115,17 @@ AVAILABLE_MODELS = [x.strip() for x in os.getenv(
 
 
 TOOLS = [
+    {"type":"function","function":{
+
+        "name":"internet_search",
+
+        "description":"Найти актуальную информацию в интернете: факты, рекомендации, статьи, сервисы, товары, сравнения и ссылки. Вызывай, когда пользователь просит найти, исследовать, проверить или подобрать что-то во внешнем интернете, а не в сохранённой памяти.",
+
+        "parameters":{"type":"object","properties":{
+            "query":{"type":"string"},"limit":{"type":"integer"},"news":{"type":"boolean"}
+        },"required":["query"]}
+
+    }},
     {"type":"function","function":{
 
         "name":"set_reminder",
@@ -1242,6 +1253,8 @@ def execute_tool(chat_id,name,args):
 
         "send_stored_image":send_stored_image,
 
+        "internet_search":internet_search,
+
         "knowledge_search":knowledge_search_tool,
 
         "knowledge_get":knowledge_get_tool,
@@ -1377,6 +1390,17 @@ def web_search_live(query,n=6,news=False):
                     "snippet":r.get("body") or r.get("description") or "","source":r.get("source","")})
 
     return {"ok":True,"results":out}
+
+
+def internet_search(chat_id, query="", limit=6, news=False):
+    """LLM tool for broad web research; it is not limited to shopping."""
+    try:
+        limit = max(1, min(int(limit or 6), 8))
+    except Exception:
+        limit = 6
+    result = web_search_live(str(query or ""), limit, bool(news))
+    return {"ok": bool(result.get("ok")), "tool": "internet_search", "query": query,
+            "results": result.get("results") or []}
 
 
 
@@ -1603,6 +1627,14 @@ def direct_live_request(text):
     return None
 
 
+def asks_external_web(text):
+    """Conservative detector used only to encourage the web tool's first turn."""
+    low = (text or "").lower()
+    phrases = ("в интернете", "погугли", "ресерч", "исследуй", "найди информацию",
+               "проверь в сети", "найди сайт", "найди статью", "сравни ", "отзывы о")
+    return any(phrase in low for phrase in phrases)
+
+
 
 # ---------- MODEL ----------
 
@@ -1632,7 +1664,9 @@ def system_prompt():
 
         "Для чтения сохранённых данных используй get_notes, get_people, get_expenses, get_today_plan — не выдумывай. "
 
-        "Текущие новости/погоду/курс/товары обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+        "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+
+        "Когда пользователь просит найти, проверить, изучить, сравнить, подобрать или исследовать что-то во внешнем интернете, вызывай internet_search. Это относится не только к товарам: ищи статьи, сервисы, факты, рекомендации и ссылки. Сначала различай внешний интернет и сохранённую память пользователя. "
 
         "У тебя есть сохранённая память пользователя (knowledge): фото, скриншоты, сайты, URL, заметки, чек, сущности, проекты. "
 
@@ -1785,7 +1819,7 @@ def ask(chat_id,text):
         # `required` made every ordinary conversation take at least two model
         # round trips. `auto` still exposes all tools, but allows a direct
         # answer when no database action is needed.
-        tc="auto"
+        tc="required" if _ == 0 and asks_external_web(text) else "auto"
 
         msg=call_or(chat_id,msgs,TOOLS,tc)
 
@@ -2237,9 +2271,6 @@ async def callback(update,context):
         return await notes(update, context)
     if q.data == "settings:status":
         return await q.edit_message_text(status_text(q.message.chat_id))
-    if q.data == "settings:products":
-        return await q.edit_message_text(
-            "🛍 Товары\nНапишите, например: «найди вазу за 400 ₽» или «подбери настольную лампу до 3 000 ₽».")
     if q.data == "settings:keys":
         return await q.edit_message_text(
             "🔐 API-ключи\nКлючи не сохраняются в переписке: сообщения Telegram не являются защищённым хранилищем. "
@@ -2261,7 +2292,7 @@ async def callback(update,context):
 def settings_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Модель", callback_data="settings:model")],
-        [InlineKeyboardButton("🛍 Товары", callback_data="settings:products")],
+        [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
         [InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
         [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
         [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
@@ -2375,7 +2406,6 @@ async def text_handler(update,context):
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
                 [InlineKeyboardButton("👥 Люди", callback_data="menu:people")],
                 [InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
                 [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
