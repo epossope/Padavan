@@ -2131,7 +2131,12 @@ def activity_labels(text):
 
 async def begin_activity(message, labels):
     """One temporary, unobtrusive progress card for operations lasting seconds."""
-    card = await message.reply_text(labels[0])
+    # Sending the current reply keyboard here also replaces any stale keyboard
+    # Telegram kept from an older bot version (for example, «Задание»).
+    try:
+        card = await message.reply_text(labels[0], reply_markup=KB)
+    except TypeError:  # lightweight test/message adapters without reply markup
+        card = await message.reply_text(labels[0])
     stopped = asyncio.Event()
 
     async def animate():
@@ -2300,15 +2305,19 @@ def plan_page(chat_id, day):
         status = task["status"]
         marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
         late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
-        lines.append(f'{marker} {task["text"]}{late}')
+        lines.append(f'{marker} #{task["id"]} — {task["text"]}{late}')
         if status == "open":
-            buttons.append([InlineKeyboardButton("✅ Выполнил", callback_data=f"taskdone:{task['id']}:{day}"),
-                            InlineKeyboardButton("❌ Не выполнил", callback_data=f"taskfail:{task['id']}:{day}")])
+            label = " ".join(task["text"].split())[:20]
+            buttons.append([
+                InlineKeyboardButton(f"✅ #{task['id']} · {label}", callback_data=f"taskdone:{task['id']}:{day}"),
+                InlineKeyboardButton(f"❌ #{task['id']} · {label}", callback_data=f"taskfail:{task['id']}:{day}"),
+            ])
     for reminder in d["reminders"]:
         marker = "✅" if reminder["acknowledged"] else "◻️"
-        lines.append(f'{marker} {reminder["time"]} — {reminder["text"]}')
+        lines.append(f'{marker} #{reminder["id"]} · {reminder["time"]} — {reminder["text"]}')
         if not reminder["acknowledged"]:
-            buttons.append([InlineKeyboardButton("✅ Выполнил", callback_data=f"remdone:{reminder['id']}:{day}")])
+            label = " ".join(reminder["text"].split())[:24]
+            buttons.append([InlineKeyboardButton(f"✅ #{reminder['id']} · {label}", callback_data=f"remdone:{reminder['id']}:{day}")])
     if len(lines) == 1:
         lines.append("Пока ничего нет.")
     previous = (selected - timedelta(days=1)).isoformat()
