@@ -103,7 +103,7 @@ STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 
 KB = ReplyKeyboardMarkup([
-    ["📚 Знания", "📅 Сегодня", "➕ Создать"],
+    ["📚 Знания", "📅 Сегодня", "🌅 Брифинг"],
     ["⚙️ Настройки", "☰ Ещё"],
 ], resize_keyboard=True)
 
@@ -115,6 +115,15 @@ AVAILABLE_MODELS = [x.strip() for x in os.getenv(
 
 
 TOOLS = [
+    {"type":"function","function":{
+
+        "name":"save_behavior_rule",
+
+        "description":"Сохранить правило поведения бота, явно заданное пользователем: стиль обращения, автоматизация напоминаний, предпочтения общения. Это НЕ личная заметка пользователя.",
+
+        "parameters":{"type":"object","properties":{"description":{"type":"string"}},"required":["description"]}
+
+    }},
     {"type":"function","function":{
 
         "name":"internet_search",
@@ -410,7 +419,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_reminder","save_note","add_task","person_upsert","person_interaction","add_expense","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder"}
+WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder"}
 
 
 
@@ -644,7 +653,15 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
 
-        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0,
+            acknowledged INTEGER NOT NULL DEFAULT 0, followup_count INTEGER NOT NULL DEFAULT 0,
+            next_followup_at TEXT NOT NULL DEFAULT '', last_sent_message_id INTEGER);
+
+        CREATE TABLE IF NOT EXISTS behavior_rules(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            rule_key TEXT NOT NULL, description TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(chat_id, rule_key)
+        );
 
         CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,title TEXT,text TEXT,created_at TEXT);
 
@@ -700,7 +717,9 @@ def init_db():
 
             ("people","age","INTEGER"),("people","home_city","TEXT"),("people","current_location","TEXT"),
 
-            ("people","projects","TEXT"),("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT")
+            ("people","projects","TEXT"),("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
+            ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
+            ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER")
 
         ]:
 
@@ -785,6 +804,36 @@ def clear_history(chat_id):
         c.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
 
 
+def ensure_behavior_rules(chat_id):
+    """Bot preferences are separate from the user's notes and memory."""
+    defaults = [
+        ("reminder_followup", "Повторять непрочитанные напоминания через 30 минут, максимум 3 раза."),
+    ]
+    with conn() as c:
+        for key, description in defaults:
+            c.execute("INSERT OR IGNORE INTO behavior_rules(chat_id,rule_key,description,enabled) VALUES(?,?,?,1)",
+                      (chat_id, key, description))
+
+
+def behavior_rules_for(chat_id):
+    ensure_behavior_rules(chat_id)
+    with conn() as c:
+        return [dict(row) for row in c.execute(
+            "SELECT id,description,enabled FROM behavior_rules WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()]
+
+
+def save_behavior_rule(chat_id, description=""):
+    description = str(description or "").strip()[:280]
+    if not description:
+        return {"ok": False, "tool": "save_behavior_rule", "error": "empty_rule"}
+    key = "custom:" + re.sub(r"\W+", "_", description.lower())[:120]
+    with conn() as c:
+        c.execute("INSERT INTO behavior_rules(chat_id,rule_key,description,enabled) VALUES(?,?,?,1) "
+                  "ON CONFLICT(chat_id,rule_key) DO UPDATE SET description=excluded.description,enabled=1",
+                  (chat_id, key, description))
+    return {"ok": True, "tool": "save_behavior_rule", "description": description}
+
+
 
 def save_reminder(chat_id, text, remind_at):
 
@@ -798,7 +847,7 @@ def save_reminder(chat_id, text, remind_at):
 
     with conn() as c:
 
-        cur = c.execute("INSERT INTO reminders(chat_id,text,remind_at_utc,sent) VALUES(?,?,?,0)",
+        cur = c.execute("INSERT INTO reminders(chat_id,text,remind_at_utc,sent,acknowledged,followup_count,next_followup_at) VALUES(?,?,?,0,0,0,'')",
 
                         (chat_id,text,dt.astimezone(timezone.utc).isoformat()))
 
@@ -1079,7 +1128,7 @@ def get_today_plan(chat_id):
 
         rem=[dict(r) for r in c.execute("""SELECT id,text,remind_at_utc FROM reminders
 
-        WHERE chat_id=? AND sent=0 ORDER BY remind_at_utc""",(chat_id,)).fetchall()]
+        WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc""",(chat_id,)).fetchall()]
 
     reminders=[]
 
@@ -1213,6 +1262,8 @@ def execute_tool(chat_id,name,args):
     funcs={
 
         "set_reminder":save_reminder,
+
+        "save_behavior_rule":save_behavior_rule,
 
         "save_note":save_note,
 
@@ -1665,6 +1716,8 @@ def system_prompt():
 
         "Для чтения сохранённых данных используй get_notes, get_people, get_expenses, get_today_plan — не выдумывай. "
 
+        "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
+
         "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
         "Когда пользователь просит найти, проверить, изучить, сравнить, подобрать или исследовать что-то во внешнем интернете, вызывай internet_search. Это относится не только к товарам: ищи статьи, сервисы, факты, рекомендации и ссылки. Сначала различай внешний интернет и сохранённую память пользователя. "
@@ -1772,6 +1825,8 @@ def write_confirmation(results):
         elif n=="add_task": parts.append(f'Задача добавлена: {r["text"]}.')
 
         elif n=="save_note": parts.append("Заметка сохранена.")
+
+        elif n=="save_behavior_rule": parts.append("Правило добавлено в настройки.")
 
     out=[]
 
@@ -2129,11 +2184,16 @@ async def list_expenses(update,context):
 
     d=get_expenses(update.effective_chat.id,start,today.isoformat(),"")
 
-    lines=[f'Расходы за месяц: {d["total"]:.2f} ₽, записей: {d["count"]}.']
+    lines=[f'💳 Расходы за месяц: {d["total"]:,.0f} ₽', 'Сумма | За что | Дата']
 
     for x in d["items"][:10]:
-
-        lines.append(f'• {str(x["spent_at"])[:10]}: {x["amount"]:g} ₽ — {x["description"]} [{x["category"]}]')
+        try:
+            parsed=datetime.fromisoformat(str(x["spent_at"]))
+            date_label=(parsed.astimezone(TZ) if parsed.tzinfo else parsed).strftime("%d.%m.%y")
+        except Exception:
+            date_label=str(x["spent_at"])[:10]
+        amount=f'{float(x["amount"]):,.0f}'.replace(',', ' ')
+        lines.append(f'{amount} ₽ | {x["description"][:36]} | {date_label}')
 
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -2143,7 +2203,7 @@ async def reminders(update,context):
 
     with conn() as c:
 
-        rs=c.execute("SELECT id,text,remind_at_utc FROM reminders WHERE chat_id=? AND sent=0 ORDER BY remind_at_utc",(update.effective_chat.id,)).fetchall()
+        rs=c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",(update.effective_chat.id,)).fetchall()
 
     if not rs: return await update.effective_message.reply_text("Активных напоминаний нет.")
 
@@ -2153,7 +2213,8 @@ async def reminders(update,context):
 
         dt=datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
 
-        lines.append(f'#{r["id"]} — {dt:%d.%m %H:%M} — {r["text"]}')
+        suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
+        lines.append(f'#{r["id"]} — {dt:%d.%m %H:%M} — {r["text"]}{suffix}')
 
         buttons.append([InlineKeyboardButton(f'Удалить #{r["id"]}',callback_data=f'delrem:{r["id"]}')])
 
@@ -2161,13 +2222,31 @@ async def reminders(update,context):
 
 
 
-async def notes(update,context):
+def notes_page(chat_id, page=0, page_size=6):
+    with conn() as c:
+        total = c.execute("SELECT COUNT(*) FROM notes WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, pages - 1))
+        rows = c.execute("SELECT id,title,text FROM notes WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                         (chat_id, page_size, page * page_size)).fetchall()
+    if not rows:
+        return "📝 Заметок пока нет.", InlineKeyboardMarkup([])
+    lines = [f"📝 Заметки · {page + 1}/{pages}"]
+    buttons = []
+    for row in rows:
+        title = row["title"] or row["text"][:45]
+        lines.append(f"• {row['text']}")
+        buttons.append([InlineKeyboardButton(f"🗑 {title[:28]}", callback_data=f"delnote:{row['id']}:{page}")])
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"notes:page:{page-1}"))
+    if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"notes:page:{page+1}"))
+    if nav: buttons.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
-    d=get_notes(update.effective_chat.id,20)
 
-    if not d["notes"]: return await update.effective_message.reply_text("Заметок пока нет.")
-
-    await update.effective_message.reply_text("\n".join(f'#{x["id"]} — {x["text"]}' for x in d["notes"]))
+async def notes(update,context, page=0):
+    text, markup = notes_page(update.effective_chat.id, page)
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 
@@ -2270,6 +2349,26 @@ async def callback(update,context):
         return await list_people(update, context)
     if q.data == "menu:notes":
         return await notes(update, context)
+    if q.data.startswith("notes:page:"):
+        page = int(q.data.rsplit(":", 1)[1])
+        text, markup = notes_page(q.message.chat_id, page)
+        return await q.edit_message_text(text, reply_markup=markup)
+    if q.data.startswith("delnote:"):
+        _, note_id, page = q.data.split(":")
+        delete_note(q.message.chat_id, int(note_id))
+        text, markup = notes_page(q.message.chat_id, int(page))
+        return await q.edit_message_text(text, reply_markup=markup)
+    if q.data == "settings:rules":
+        rules = behavior_rules_for(q.message.chat_id)
+        text = "📜 Правила бота\n\n" + "\n".join(
+            f"{'●' if r['enabled'] else '○'} {r['description']}" for r in rules)
+        return await q.edit_message_text(text)
+    if q.data.startswith("ackrem:"):
+        reminder_id = int(q.data.split(":", 1)[1])
+        with conn() as c:
+            c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
+                      (reminder_id, q.message.chat_id))
+        return await q.edit_message_text("✅ Отмечено как выполненное.")
     if q.data == "settings:status":
         return await q.edit_message_text(status_text(q.message.chat_id))
     if q.data == "settings:keys":
@@ -2292,11 +2391,9 @@ async def callback(update,context):
 
 def settings_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠 Модель", callback_data="settings:model")],
-        [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
-        [InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
-        [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
-        [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
+        [InlineKeyboardButton("🧠 Модель", callback_data="settings:model"), InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
+        [InlineKeyboardButton("📜 Правила", callback_data="settings:rules"), InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
+        [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status"), InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
     ])
 
 
@@ -2407,15 +2504,10 @@ async def text_handler(update,context):
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👥 Люди", callback_data="menu:people")],
-                [InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
-                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
-                [InlineKeyboardButton("💰 Расходы", callback_data="menu:expenses")],
+                [InlineKeyboardButton("👥 Люди", callback_data="menu:people"), InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
+                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders"), InlineKeyboardButton("💰 Расходы", callback_data="menu:expenses")],
                 [InlineKeyboardButton("🌅 Брифинг", callback_data="menu:briefing")],
             ]))
-
-    if t=="➕ Создать":
-        return await update.effective_message.reply_text("Напишите обычным сообщением: «создай задачу …», «напомни …» или «сохрани заметку …».")
 
     if t=="📚 Знания":
         return await update.effective_message.reply_text("📚 Знания\nНапишите, что найти: проект, человека, ресурс или тему. Например: «где Узел задеплоен?»")
@@ -2530,19 +2622,17 @@ async def voice_handler(update,context):
 
     fd,n=tempfile.mkstemp(suffix=".ogg"); os.close(fd); p=Path(n)
 
+    activity = await begin_activity(update.effective_message, ["🎙 Расшифровываю голос…", "🧠 Думаю…", "✍️ Готовлю ответ…"])
     try:
-
         f=await context.bot.get_file(update.effective_message.voice.file_id); await f.download_to_drive(custom_path=str(p))
-
         txt=await asyncio.to_thread(transcribe,p); await update.effective_message.reply_text("🎤 "+txt)
-
         a=await asyncio.to_thread(ask,update.effective_chat.id,txt); await send_answer(update,a,True,wants_voice(txt))
-
         await drain_media_outbox(update, context)
-
-    except Exception as e: await safe_error(update,e)
-
-    finally: p.unlink(missing_ok=True)
+    except Exception as e:
+        await safe_error(update,e)
+    finally:
+        await end_activity(*activity)
+        p.unlink(missing_ok=True)
 
 
 
@@ -2655,29 +2745,36 @@ async def image_handler(update,context):
 
 async def reminder_tick(context):
 
-    now=datetime.now(timezone.utc).isoformat()
-
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     with conn() as c:
+        initial = c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50", (now_iso,)).fetchall()
+        followups = c.execute("""SELECT id,chat_id,text,followup_count FROM reminders
+                               WHERE sent=1 AND acknowledged=0 AND followup_count<3
+                               AND next_followup_at<>'' AND next_followup_at<=?
+                               ORDER BY next_followup_at LIMIT 50""", (now_iso,)).fetchall()
 
-        rs=c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50",(now,)).fetchall()
+    async def deliver(row, is_followup=False):
+        prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
+        sent_message = await context.bot.send_message(
+            chat_id=row["chat_id"], text=prefix + row["text"],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Выполнено", callback_data=f"ackrem:{row['id']}")]]),
+        )
+        next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        with conn() as c:
+            c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
+                      (1 if is_followup else 0, next_at, sent_message.message_id, row["id"]))
 
-    for r in rs:
-
+    for row in initial:
         try:
-
-            await context.bot.send_message(chat_id=r["chat_id"],text="⏰ Напоминание: "+r["text"])
-
-            p=await make_voice("Напоминание. "+r["text"])
-
-            try:
-
-                with p.open("rb") as f: await context.bot.send_voice(chat_id=r["chat_id"],voice=f)
-
-            finally: p.unlink(missing_ok=True)
-
-            with conn() as c: c.execute("UPDATE reminders SET sent=1 WHERE id=?",(r["id"],))
-
-        except Exception: pass
+            await deliver(row)
+        except Exception:
+            pass
+    for row in followups:
+        try:
+            await deliver(row, is_followup=True)
+        except Exception:
+            pass
 
 
 
