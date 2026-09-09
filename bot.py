@@ -620,6 +620,14 @@ def init_db():
             vision_model TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS chat_models(
+            chat_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id, model)
+        );
+
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
 
         CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0);
@@ -690,6 +698,23 @@ def init_db():
 def model_router():
     """Construct cheaply so every request observes the latest SQLite setting."""
     return ModelRouter(conn, MODEL, FALLBACK_MODELS, VISION_MODEL)
+
+
+def available_models_for(chat_id):
+    """Default catalogue plus the chat owner's persistent custom choices."""
+    with conn() as c:
+        rows = c.execute("SELECT model, enabled FROM chat_models WHERE chat_id=?", (chat_id,)).fetchall()
+    overrides = {r["model"]: bool(r["enabled"]) for r in rows}
+    models = [model for model in AVAILABLE_MODELS if overrides.get(model, True)]
+    models += [model for model, enabled in overrides.items() if enabled and model not in models]
+    return models
+
+
+def set_chat_model(chat_id, model, enabled=True):
+    with conn() as c:
+        c.execute("INSERT INTO chat_models(chat_id,model,enabled,created_at) VALUES(?,?,?,?) "
+                  "ON CONFLICT(chat_id,model) DO UPDATE SET enabled=excluded.enabled",
+                  (chat_id, model, 1 if enabled else 0, datetime.now(timezone.utc).isoformat()))
 
 
 
@@ -2060,16 +2085,20 @@ async def callback(update,context):
         selected = model_router().resolve(q.message.chat_id, "chat")
         lines = ["<b>🧠 Текущая модель</b>", html.escape(selected["primary"]), "", "Выберите модель:"]
         buttons = []
-        for model in AVAILABLE_MODELS:
+        for model in available_models_for(q.message.chat_id):
             mark = "●" if model == selected["primary"] else "○"
             buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
-        buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+        buttons += [
+            [InlineKeyboardButton("➕ Добавить модель", callback_data="model:add")],
+            [InlineKeyboardButton("🗑 Удалить модель", callback_data="model:delete_menu")],
+            [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")],
+        ]
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
     if q.data.startswith("model:set:"):
         model = q.data.split(":", 2)[2]
-        if model not in AVAILABLE_MODELS:
+        if model not in available_models_for(q.message.chat_id):
             return await q.edit_message_text("Модель недоступна.")
         model_router().set_primary(q.message.chat_id, model)
         await q.edit_message_text(
@@ -2077,6 +2106,33 @@ async def callback(update,context):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Изменить", callback_data="settings:model")]]),
         )
+        return
+
+    if q.data == "model:add":
+        context.user_data["awaiting_model"] = True
+        await q.edit_message_text(
+            "Пришлите точный ID модели OpenRouter, например:\n<code>deepseek/deepseek-v4-flash-0731</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:model")]]),
+        )
+        return
+
+    if q.data == "model:delete_menu":
+        models = available_models_for(q.message.chat_id)
+        buttons = [[InlineKeyboardButton(f"🗑 {model}", callback_data=f"model:delete:{model}")] for model in models]
+        buttons.append([InlineKeyboardButton("‹ К моделям", callback_data="settings:model")])
+        await q.edit_message_text("Выберите модель для удаления из этого чата:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if q.data.startswith("model:delete:"):
+        model = q.data.split(":", 2)[2]
+        if model not in available_models_for(q.message.chat_id):
+            return await q.edit_message_text("Модель уже удалена.")
+        set_chat_model(q.message.chat_id, model, enabled=False)
+        if model_router().resolve(q.message.chat_id, "chat")["primary"] == model:
+            model_router().set_primary(q.message.chat_id, "")
+        await q.edit_message_text(f"Модель удалена из списка этого чата:\n{html.escape(model)}",
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К моделям", callback_data="settings:model")]]))
         return
 
     if q.data == "settings:back":
@@ -2219,6 +2275,16 @@ def build_briefing(chat_id):
 async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
+
+    if context.user_data.pop("awaiting_model", False):
+        model = t.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.:-]+", model):
+            return await update.effective_message.reply_text(
+                "Не похож на ID модели. Формат: <провайдер>/<модель>, например deepseek/deepseek-v4-flash-0731.")
+        set_chat_model(cid, model, enabled=True)
+        return await update.effective_message.reply_text(
+            f"Добавила модель: {model}\nОткройте «⚙️ Настройки → 🧠 Модель» и выберите её.",
+            reply_markup=settings_keyboard())
 
     if t=="⚙️ Настройки":
         return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard())
