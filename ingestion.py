@@ -567,7 +567,9 @@ class VisionExtractor:
     @staticmethod
     def _default_request_vision(model, messages):
         import bot
-        return bot.request_vision(model, messages)
+        # Generic/test callers have no chat identity.  Runtime image handling
+        # injects a chat-scoped requester from bot.get_ingestion_pipeline.
+        return bot.request_vision(None, model, messages)
 
     def _default_models(self):
         import bot
@@ -751,7 +753,12 @@ class IngestionPipeline:
 
     def _extract(self, inp: IngestionInput):
         """Returns ``(ExractionResult, vision_ok)``."""
-        images = [a for a in inp.attachments if a.local_path and Path(a.local_path).exists()]
+        # A PDF or another document is still persisted, but only real images
+        # go through a Vision model.  Text extracted by the caller stays
+        # searchable instead of being lost after an invalid vision attempt.
+        images = [a for a in inp.attachments
+                  if a.local_path and Path(a.local_path).exists()
+                  and (a.mime_type or "").lower().startswith("image/")]
         if images:
             a = images[0]
             caption = inp.user_text or ""

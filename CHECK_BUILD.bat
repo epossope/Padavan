@@ -18,8 +18,8 @@ for %%F in (bot.py ingestion.py knowledge_store.py url_enricher.py retrieval.py)
 )
 echo.
 
-REM --- 2. legacy build markers still in bot.py ---
-for %%M in ("v8-AMVERA-2026-09-09" "def search_products_live" "def get_weather_live" "Open-Meteo" "multi-market") do (
+REM --- 2. current build markers ---
+for %%M in ("BUILD_ID" "def get_weather_live" "def build_briefing" "def quick_actions_run") do (
     findstr /C:%%~M bot.py >nul 2>&1
     if errorlevel 1 (
         echo [FAIL] marker missing in bot.py: %%~M

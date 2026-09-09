@@ -87,8 +87,8 @@ def _stub_pipeline(result):
 
 
 def _run_handler(msg, file_bytes=b"\x89PNG\r\n" + b"0" * 64):
-    orig_pipeline, orig_history = bot.get_pipeline, bot.history
-    bot.get_pipeline = lambda: _stub_pipeline(
+    orig_pipeline, orig_history = bot.get_ingestion_pipeline, bot.history
+    bot.get_ingestion_pipeline = lambda chat_id: _stub_pipeline(
         IngestionResult(ok=True, ingestion_status="completed", enrichment_status="not_required",
                         item={"id": 1, "title": "тест"}, reply="📥 Сохранила: тест")
     )
@@ -98,7 +98,7 @@ def _run_handler(msg, file_bytes=b"\x89PNG\r\n" + b"0" * 64):
         ctx = _FakeContext(_FakeBot(file_bytes))
         asyncio.run(bot.image_handler(update, ctx))
     finally:
-        bot.get_pipeline = orig_pipeline
+        bot.get_ingestion_pipeline = orig_pipeline
         bot.history = orig_history
 
 

@@ -26,3 +26,14 @@ class ModelRouter:
         with self.connect() as c:
             c.execute("INSERT INTO user_settings(chat_id, primary_model) VALUES(?, ?) "
                       "ON CONFLICT(chat_id) DO UPDATE SET primary_model=excluded.primary_model", (chat_id, model))
+
+    def set_vision(self, chat_id, model):
+        """Store a user's preferred Vision model.
+
+        Authorization for using this preference is enforced by bot.py: a
+        personal API key must be active.  This keeps a leftover preference
+        harmless after a user removes their key.
+        """
+        with self.connect() as c:
+            c.execute("INSERT INTO user_settings(chat_id, vision_model) VALUES(?, ?) "
+                      "ON CONFLICT(chat_id) DO UPDATE SET vision_model=excluded.vision_model", (chat_id, model))
