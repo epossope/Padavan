@@ -253,6 +253,16 @@ TOOLS = [
 
     {"type":"function","function":{
 
+        "name":"set_briefing_preferences",
+
+        "description":"Изменить настройки брифинга по явному пожеланию пользователя: город, темы новостей или ежедневное время отправки. Не менять без явной просьбы.",
+
+        "parameters":{"type":"object","properties":{"city":{"type":"string"},"topics":{"type":"string"},"time":{"type":"string"},"enabled":{"type":"boolean"}}}
+
+    }},
+
+    {"type":"function","function":{
+
         "name":"get_notes",
 
         "description":"Получить недавние заметки.",
@@ -419,7 +429,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder"}
+WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -719,7 +729,8 @@ def init_db():
 
             ("people","projects","TEXT"),("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
-            ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER")
+            ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
+            ("tasks","completed_at","TEXT NOT NULL DEFAULT ''")
 
         ]:
 
@@ -1116,31 +1127,40 @@ def get_expenses(chat_id,date_from="",date_to="",category=""):
 
 
 
-def get_today_plan(chat_id):
-
-    today=datetime.now(TZ).date().isoformat()
-
+def get_plan_for_date(chat_id, day):
+    """Return a calendar day without silently completing anything overdue."""
+    selected = datetime.fromisoformat(day).date()
+    today = datetime.now(TZ).date()
     with conn() as c:
-
-        tasks=[dict(r) for r in c.execute("""SELECT id,text,due_date,priority,status FROM tasks
-
-        WHERE chat_id=? AND status='open' AND (due_date='' OR due_date<=?) ORDER BY id""",(chat_id,today)).fetchall()]
-
-        rem=[dict(r) for r in c.execute("""SELECT id,text,remind_at_utc FROM reminders
-
-        WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc""",(chat_id,)).fetchall()]
-
-    reminders=[]
-
+        # Tasks without a date are actionable today, but don't clutter every
+        # calendar day.  A passed task remains open until the user decides it.
+        where = "due_date=?" if selected != today else "(due_date='' OR due_date<=?)"
+        tasks = [dict(r) for r in c.execute(
+            f"SELECT id,text,due_date,priority,status FROM tasks WHERE chat_id=? AND {where} ORDER BY due_date,id",
+            (chat_id, day)).fetchall()]
+        rem = [dict(r) for r in c.execute(
+            "SELECT id,text,remind_at_utc,acknowledged FROM reminders WHERE chat_id=? ORDER BY remind_at_utc",
+            (chat_id,)).fetchall()]
+    reminders = []
     for r in rem:
+        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
+        if dt.date() == selected:
+            reminders.append({"id": r["id"], "text": r["text"], "time": dt.strftime("%H:%M"),
+                              "acknowledged": r["acknowledged"]})
+    return {"ok": True, "tool": "get_today_plan", "date": day, "tasks": tasks, "reminders": reminders}
 
-        dt=datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
 
-        if dt.date().isoformat()==today:
+def get_today_plan(chat_id):
+    return get_plan_for_date(chat_id, datetime.now(TZ).date().isoformat())
 
-            reminders.append({"id":r["id"],"text":r["text"],"time":dt.strftime("%H:%M")})
 
-    return {"ok":True,"tool":"get_today_plan","date":today,"tasks":tasks,"reminders":reminders}
+def set_task_status(chat_id, task_id, status):
+    if status not in ("done", "failed"):
+        return {"ok": False, "error": "invalid_status"}
+    with conn() as c:
+        cur = c.execute("UPDATE tasks SET status=?, completed_at=? WHERE id=? AND chat_id=?",
+                        (status, datetime.now(timezone.utc).isoformat(), task_id, chat_id))
+    return {"ok": True, "updated": cur.rowcount}
 
 
 
@@ -1280,6 +1300,8 @@ def execute_tool(chat_id,name,args):
         "get_expenses":get_expenses,
 
         "get_today_plan":get_today_plan,
+
+        "set_briefing_preferences":set_briefing_preferences,
 
         "get_notes":get_notes,
 
@@ -1717,6 +1739,8 @@ def system_prompt():
         "Для чтения сохранённых данных используй get_notes, get_people, get_expenses, get_today_plan — не выдумывай. "
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
+
+        "Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
         "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
@@ -2184,7 +2208,7 @@ async def list_expenses(update,context):
 
     d=get_expenses(update.effective_chat.id,start,today.isoformat(),"")
 
-    lines=[f'💳 Расходы за месяц: {d["total"]:,.0f} ₽', 'Сумма | За что | Дата']
+    rows=[]
 
     for x in d["items"][:10]:
         try:
@@ -2192,10 +2216,22 @@ async def list_expenses(update,context):
             date_label=(parsed.astimezone(TZ) if parsed.tzinfo else parsed).strftime("%d.%m.%y")
         except Exception:
             date_label=str(x["spent_at"])[:10]
-        amount=f'{float(x["amount"]):,.0f}'.replace(',', ' ')
-        lines.append(f'{amount} ₽ | {x["description"][:36]} | {date_label}')
+        amount=f'{float(x["amount"]):,.0f}'.replace(',', ' ') + " ₽"
+        label=(x["description"] or x["category"] or "—").replace("\n", " ")[:34]
+        rows.append((amount, label, date_label))
 
-    await update.effective_message.reply_text("\n".join(lines))
+    # Telegram's proportional font makes tables look ragged.  A <pre> block
+    # keeps three columns aligned while widths still adapt to the user's data.
+    amount_width=max([len("Сумма")] + [len(row[0]) for row in rows])
+    label_width=max([len("За что")] + [len(row[1]) for row in rows])
+    lines=[f'💳 Расходы за месяц: {d["total"]:,.0f} ₽', "<pre>",
+           f'{"Сумма":>{amount_width}}   {"За что":<{label_width}}   Дата']
+    lines.append("─" * (amount_width + label_width + 10))
+    for amount, label, date_label in rows:
+        lines.append(f'{amount:>{amount_width}}   {label:<{label_width}}   {date_label}')
+    lines.append("</pre>")
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 
@@ -2250,17 +2286,40 @@ async def notes(update,context, page=0):
 
 
 
-async def today_plan(update,context):
+def plan_page(chat_id, day):
+    d = get_plan_for_date(chat_id, day)
+    selected = datetime.fromisoformat(day).date()
+    today = datetime.now(TZ).date()
+    heading = "📅 Сегодня" if selected == today else f"📅 {selected:%d.%m.%Y}"
+    lines = [heading]
+    buttons = []
+    for task in d["tasks"]:
+        status = task["status"]
+        marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
+        late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
+        lines.append(f'{marker} {task["text"]}{late}')
+        if status == "open":
+            buttons.append([InlineKeyboardButton("✅ Выполнил", callback_data=f"taskdone:{task['id']}:{day}"),
+                            InlineKeyboardButton("❌ Не выполнил", callback_data=f"taskfail:{task['id']}:{day}")])
+    for reminder in d["reminders"]:
+        marker = "✅" if reminder["acknowledged"] else "◻️"
+        lines.append(f'{marker} {reminder["time"]} — {reminder["text"]}')
+        if not reminder["acknowledged"]:
+            buttons.append([InlineKeyboardButton("✅ Выполнил", callback_data=f"remdone:{reminder['id']}:{day}")])
+    if len(lines) == 1:
+        lines.append("Пока ничего нет.")
+    previous = (selected - timedelta(days=1)).isoformat()
+    following = (selected + timedelta(days=1)).isoformat()
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data=f"plan:{previous}"),
+                    InlineKeyboardButton("🔎 Дата", callback_data="plan:pick"),
+                    InlineKeyboardButton("Вперёд ›", callback_data=f"plan:{following}")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
-    d=get_today_plan(update.effective_chat.id); lines=["Сегодня:"]
 
-    for t in d["tasks"]: lines.append(f'• {t["text"]}')
-
-    for r in d["reminders"]: lines.append(f'• {r["time"]} — {r["text"]}')
-
-    if len(lines)==1: lines.append("Пока пусто.")
-
-    await update.effective_message.reply_text("\n".join(lines))
+async def today_plan(update,context, day=None):
+    day = day or datetime.now(TZ).date().isoformat()
+    text, markup = plan_page(update.effective_chat.id, day)
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 
@@ -2344,7 +2403,29 @@ async def callback(update,context):
     if q.data == "menu:expenses":
         return await list_expenses(update, context)
     if q.data == "menu:briefing":
-        return await q.edit_message_text(TelegramRenderer.render(build_briefing(q.message.chat_id)), parse_mode="HTML")
+        return await q.edit_message_text(build_briefing(q.message.chat_id), parse_mode="HTML")
+    if q.data.startswith("plan:"):
+        value = q.data.split(":", 1)[1]
+        if value == "pick":
+            context.user_data["awaiting_plan_date"] = True
+            return await q.message.reply_text("Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.")
+        try:
+            text, markup = plan_page(q.message.chat_id, value)
+        except ValueError:
+            return await q.answer("Не удалось прочитать дату.", show_alert=True)
+        return await q.edit_message_text(text, reply_markup=markup)
+    if q.data.startswith(("taskdone:", "taskfail:")):
+        action, task_id, day = q.data.split(":")
+        set_task_status(q.message.chat_id, int(task_id), "done" if action == "taskdone" else "failed")
+        text, markup = plan_page(q.message.chat_id, day)
+        return await q.edit_message_text(text, reply_markup=markup)
+    if q.data.startswith("remdone:"):
+        _, reminder_id, day = q.data.split(":")
+        with conn() as c:
+            c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
+                      (int(reminder_id), q.message.chat_id))
+        text, markup = plan_page(q.message.chat_id, day)
+        return await q.edit_message_text(text, reply_markup=markup)
     if q.data == "menu:people":
         return await list_people(update, context)
     if q.data == "menu:notes":
@@ -2435,6 +2516,19 @@ def set_briefing(chat_id,enabled,time_="08:00",city="",topics=""):
     return {"enabled":enabled,"time":time_,"city":use_city,"topics":use_topics}
 
 
+def set_briefing_preferences(chat_id, city="", topics="", time="", enabled=None):
+    """Persist only the supported, user-visible briefing choices."""
+    with conn() as c:
+        old = c.execute("SELECT * FROM briefings WHERE chat_id=?", (chat_id,)).fetchone()
+    old = dict(old) if old else {}
+    use_time = time or old.get("time") or "08:00"
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", use_time):
+        return {"ok": False, "tool": "set_briefing_preferences", "error": "time_format"}
+    result = set_briefing(chat_id, old.get("enabled", False) if enabled is None else bool(enabled),
+                          use_time, city or old.get("city", ""), topics or old.get("topics", ""))
+    return {"ok": True, "tool": "set_briefing_preferences", **result}
+
+
 
 def build_briefing(chat_id):
 
@@ -2444,6 +2538,7 @@ def build_briefing(chat_id):
 
     cfg=dict(cfg) if cfg else {"city":DEFAULT_CITY,"topics":"главные новости, ИИ, бизнес"}
 
+    now = datetime.now(TZ)
     plan=get_today_plan(chat_id); weather=get_weather_live(cfg.get("city") or DEFAULT_CITY)
 
     topics=[x.strip() for x in (cfg.get("topics") or "главные новости").split(",") if x.strip()]
@@ -2456,19 +2551,22 @@ def build_briefing(chat_id):
 
         if d.get("ok"): news += d["results"][:2]
 
-    lines=["🌅 Утренний брифинг"]
+    lines=[f"🌅 Брифинг · {now:%d.%m %H:%M}"]
 
     if plan["tasks"] or plan["reminders"]:
 
-        lines.append("\n📅 Сегодня")
+        lines.append("\n📅 Осталось на сегодня")
 
-        for t in plan["tasks"][:5]: lines.append("• "+t["text"])
+        for t in plan["tasks"][:5]:
+            if t["status"] == "open":
+                lines.append("• "+html.escape(t["text"]))
 
-        for r in plan["reminders"][:5]: lines.append(f'• {r["time"]} — {r["text"]}')
+        for r in plan["reminders"][:5]: lines.append(f'• {r["time"]} — {html.escape(r["text"])}')
 
     if weather.get("ok"):
 
-        c=weather["current"]; lines.append(f'\n🌤 {weather["city"]}: {c["temperature"]}°C, {c["condition"]}.')
+        c=weather["current"]
+        lines.append(f'\n🌤 {html.escape(str(weather["city"]))}: {c["temperature"]}°C, {html.escape(str(c["condition"]))}.')
 
     if news:
 
@@ -2476,9 +2574,16 @@ def build_briefing(chat_id):
 
         for n in news[:5]:
 
-            lines.append("• "+n.get("title",""))
-
-            if n.get("url"): lines.append(n["url"])
+            title = html.escape(n.get("title", "Главная новость"))
+            url = (n.get("url") or "").strip()
+            # The headline itself is the link, so the briefing remains compact.
+            if url.startswith(("https://", "http://")):
+                lines.append(f'• <a href="{html.escape(url, quote=True)}">{title}</a>')
+            else:
+                lines.append("• " + title)
+            summary = html.escape((n.get("snippet") or "").strip()[:210])
+            if summary:
+                lines.append("  " + summary)
 
     return "\n".join(lines)
 
@@ -2487,6 +2592,18 @@ def build_briefing(chat_id):
 async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
+
+    if context.user_data.pop("awaiting_plan_date", False):
+        parsed = None
+        for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(t, fmt).date()
+                break
+            except ValueError:
+                pass
+        if not parsed:
+            return await update.effective_message.reply_text("Не поняла дату. Пример: 15.09.2026.")
+        return await today_plan(update, context, parsed.isoformat())
 
     if context.user_data.pop("awaiting_model", False):
         model = t.strip()
@@ -2528,7 +2645,7 @@ async def text_handler(update,context):
 
     if t=="💰 Расходы": return await list_expenses(update,context)
 
-    if t=="🌅 Брифинг": return await update.effective_message.reply_text(build_briefing(cid))
+    if t=="🌅 Брифинг": return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
 
     if t=="🔎 Поиск": return await update.effective_message.reply_text("Напиши: «Найди в интернете ...»")
 
@@ -2568,11 +2685,11 @@ async def text_handler(update,context):
 
         cfg=set_briefing(cid,True,time_,city,topics)
 
-        return await update.effective_message.reply_text(f'Утренний брифинг включён на {cfg["time"]}. Город: {cfg["city"]}.')
+        return await update.effective_message.reply_text(f'Ежедневный брифинг включён на {cfg["time"]}. Город: {cfg["city"]}.')
 
     if "отключи" in low and "бриф" in low:
 
-        set_briefing(cid,False); return await update.effective_message.reply_text("Утренний брифинг отключён.")
+        set_briefing(cid,False); return await update.effective_message.reply_text("Ежедневный брифинг отключён.")
 
 
 
@@ -2796,7 +2913,7 @@ async def briefing_tick(context):
 
             text=await asyncio.to_thread(build_briefing,cfg["chat_id"])
 
-            await context.bot.send_message(chat_id=cfg["chat_id"],text=text)
+            await context.bot.send_message(chat_id=cfg["chat_id"], text=text, parse_mode="HTML")
 
             with conn() as c: c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?",(today,cfg["chat_id"]))
 
