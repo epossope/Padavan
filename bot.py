@@ -2235,26 +2235,29 @@ async def list_expenses(update,context):
 
 
 
-async def reminders(update,context):
+def button_rows(buttons, width=4):
+    return [buttons[index:index + width] for index in range(0, len(buttons), width)]
 
+
+def reminders_page(chat_id):
     with conn() as c:
-
-        rs=c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",(update.effective_chat.id,)).fetchall()
-
-    if not rs: return await update.effective_message.reply_text("Активных напоминаний нет.")
-
-    lines=[]; buttons=[]
-
+        rs = c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",
+                       (chat_id,)).fetchall()
+    if not rs:
+        return "⏰ Активных напоминаний нет.", InlineKeyboardMarkup([])
+    lines = ["⏰ Напоминания"]
+    buttons = []
     for r in rs[:20]:
-
-        dt=datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
-
+        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
         suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
         lines.append(f'#{r["id"]} — {dt:%d.%m %H:%M} — {r["text"]}{suffix}')
+        buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}'))
+    return "\n".join(lines), InlineKeyboardMarkup(button_rows(buttons))
 
-        buttons.append([InlineKeyboardButton(f'Удалить #{r["id"]}',callback_data=f'delrem:{r["id"]}')])
 
-    await update.effective_message.reply_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons))
+async def reminders(update,context):
+    text, markup = reminders_page(update.effective_chat.id)
+    await update.effective_message.reply_text(text, reply_markup=markup)
 
 
 
@@ -2268,11 +2271,11 @@ def notes_page(chat_id, page=0, page_size=6):
     if not rows:
         return "📝 Заметок пока нет.", InlineKeyboardMarkup([])
     lines = [f"📝 Заметки · {page + 1}/{pages}"]
-    buttons = []
+    delete_buttons = []
     for row in rows:
-        title = row["title"] or row["text"][:45]
-        lines.append(f"• {row['text']}")
-        buttons.append([InlineKeyboardButton(f"🗑 {title[:28]}", callback_data=f"delnote:{row['id']}:{page}")])
+        lines.append(f"#{row['id']} — {row['text']}")
+        delete_buttons.append(InlineKeyboardButton(f"🗑 #{row['id']}", callback_data=f"delnoteask:{row['id']}:{page}"))
+    buttons = button_rows(delete_buttons)
     nav = []
     if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"notes:page:{page-1}"))
     if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"notes:page:{page+1}"))
@@ -2434,6 +2437,12 @@ async def callback(update,context):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = notes_page(q.message.chat_id, page)
         return await q.edit_message_text(text, reply_markup=markup)
+    if q.data.startswith("delnoteask:"):
+        _, note_id, page = q.data.split(":")
+        return await q.edit_message_text(
+            f"Удалить заметку #{note_id}? Это действие нельзя отменить.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delnote:{note_id}:{page}"),
+                                                InlineKeyboardButton("Отмена", callback_data=f"notes:page:{page}")]]))
     if q.data.startswith("delnote:"):
         _, note_id, page = q.data.split(":")
         delete_note(q.message.chat_id, int(note_id))
@@ -2461,13 +2470,21 @@ async def callback(update,context):
         clear_history(q.message.chat_id)
         return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
 
+    if q.data.startswith("delremask:"):
+        rid = int(q.data.split(":")[1])
+        return await q.edit_message_text(
+            f"Удалить напоминание #{rid}? Это действие нельзя отменить.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delrem:{rid}"),
+                                                InlineKeyboardButton("Отмена", callback_data="reminders:show")]]))
+    if q.data == "reminders:show":
+        text, markup = reminders_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup)
     if q.data.startswith("delrem:"):
-
         rid=int(q.data.split(":")[1])
-
-        with conn() as c: c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
-
-        await q.edit_message_text(f"Напоминание #{rid} удалено.")
+        with conn() as c:
+            c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
+        text, markup = reminders_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup)
 
 
 def settings_keyboard():
