@@ -253,6 +253,22 @@ TOOLS = [
 
     {"type":"function","function":{
 
+        "name":"add_income",
+
+        "description":"Сразу сохранить поступление или пополнение бюджета.",
+
+        "parameters":{"type":"object","properties":{
+
+            "amount":{"type":"number"},"currency":{"type":"string"},"category":{"type":"string"},
+
+            "description":{"type":"string"},"merchant":{"type":"string"},"spent_at":{"type":"string"}
+
+        },"required":["amount","description"]}
+
+    }},
+
+    {"type":"function","function":{
+
         "name":"set_briefing_preferences",
 
         "description":"Изменить настройки брифинга по явному пожеланию пользователя: город, темы новостей или ежедневное время отправки. Не менять без явной просьбы.",
@@ -429,7 +445,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -699,7 +715,7 @@ def init_db():
 
             id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,amount REAL,currency TEXT,category TEXT,
 
-            description TEXT,merchant TEXT,spent_at TEXT,created_at TEXT
+            description TEXT,merchant TEXT,spent_at TEXT,created_at TEXT,kind TEXT NOT NULL DEFAULT 'expense'
 
         );
 
@@ -728,6 +744,7 @@ def init_db():
             ("people","age","INTEGER"),("people","home_city","TEXT"),("people","current_location","TEXT"),
 
             ("people","projects","TEXT"),("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
+            ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''")
@@ -1059,21 +1076,30 @@ def normalize_spent_at(x):
 
 
 
-def add_expense(chat_id,amount,description,currency="RUB",category="прочее",merchant="",spent_at=""):
+def add_transaction(chat_id, amount, description, kind="expense", currency="RUB", category="прочее", merchant="", spent_at=""):
 
     spent_at=normalize_spent_at(spent_at)
+    kind = "income" if kind == "income" else "expense"
 
     with conn() as c:
 
-        cur=c.execute("""INSERT INTO expenses(chat_id,amount,currency,category,description,merchant,spent_at,created_at)
+        cur=c.execute("""INSERT INTO expenses(chat_id,amount,currency,category,description,merchant,spent_at,created_at,kind)
 
-        VALUES(?,?,?,?,?,?,?,?)""",
+        VALUES(?,?,?,?,?,?,?,?,?)""",
 
-        (chat_id,float(amount),currency or "RUB",category or "прочее",description or "расход",merchant or "",spent_at,datetime.now(timezone.utc).isoformat()))
+        (chat_id,float(amount),currency or "RUB",category or "прочее",description or ("пополнение" if kind == "income" else "расход"),merchant or "",spent_at,datetime.now(timezone.utc).isoformat(),kind))
 
-    return {"ok":True,"tool":"add_expense","id":cur.lastrowid,"amount":float(amount),"currency":currency or "RUB",
+    return {"ok":True,"tool":"add_income" if kind == "income" else "add_expense","id":cur.lastrowid,"amount":float(amount),"currency":currency or "RUB",
 
-            "category":category or "прочее","description":description or "расход","merchant":merchant or "","spent_at":spent_at}
+            "category":category or "прочее","description":description or ("пополнение" if kind == "income" else "расход"),"merchant":merchant or "","spent_at":spent_at,"kind":kind}
+
+
+def add_expense(chat_id, amount, description, currency="RUB", category="прочее", merchant="", spent_at=""):
+    return add_transaction(chat_id, amount, description, "expense", currency, category, merchant, spent_at)
+
+
+def add_income(chat_id, amount, description, currency="RUB", category="пополнение", merchant="", spent_at=""):
+    return add_transaction(chat_id, amount, description, "income", currency, category, merchant, spent_at)
 
 
 
@@ -1302,6 +1328,8 @@ def execute_tool(chat_id,name,args):
         "person_interaction":person_interaction,
 
         "add_expense":add_expense,
+
+        "add_income":add_income,
 
         "update_last_expense":update_last_expense,
 
@@ -1736,7 +1764,7 @@ def system_prompt():
 
         "Если пользователь просит что-то запомнить или сохранить — сразу вызывай save_note. "
 
-        "Явную трату сохраняй сразу через add_expense. "
+        "Явную трату сохраняй сразу через add_expense, а поступление, зарплату или пополнение — через add_income. "
 
         "Если следующим сообщением уточняют предыдущую трату — используй update_last_expense. "
 
@@ -1844,7 +1872,9 @@ def write_confirmation(results):
 
         n=r.get("tool")
 
-        if n=="add_expense": parts.append(f'Записала {r["amount"]:g} {r["currency"]} — {r["description"]}.')
+        if n=="add_expense": parts.append(f'Записала расход: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
+
+        elif n=="add_income": parts.append(f'Записала поступление: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
 
         elif n=="update_last_expense": parts.append(f'Обновила расход: {r["amount"]:g} {r["currency"]} — {r["category"]}, {r["description"]}.')
 
@@ -2096,8 +2126,13 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
     eff="voice_and_text" if force_voice else (("voice_and_text" if voice_in else "text") if mode=="auto" else mode)
 
     if eff in ("text","voice_and_text"):
-        for chunk in TelegramRenderer.chunks(answer):
-            await update.effective_message.reply_text(chunk, parse_mode=TelegramRenderer.parse_mode)
+        for index, chunk in enumerate(TelegramRenderer.chunks(answer)):
+            # The reply keyboard belongs to a lasting answer, never to the
+            # temporary activity card which is deleted after processing.
+            kwargs = {"parse_mode": TelegramRenderer.parse_mode}
+            if index == 0:
+                kwargs["reply_markup"] = KB
+            await update.effective_message.reply_text(chunk, **kwargs)
 
     if eff in ("voice","voice_and_text"):
 
@@ -2139,12 +2174,7 @@ def activity_labels(text):
 
 async def begin_activity(message, labels):
     """One temporary, unobtrusive progress card for operations lasting seconds."""
-    # Sending the current reply keyboard here also replaces any stale keyboard
-    # Telegram kept from an older bot version (for example, «Задание»).
-    try:
-        card = await message.reply_text(labels[0], reply_markup=KB)
-    except TypeError:  # lightweight test/message adapters without reply markup
-        card = await message.reply_text(labels[0])
+    card = await message.reply_text(labels[0])
     stopped = asyncio.Event()
 
     async def animate():
@@ -2215,36 +2245,51 @@ async def list_people(update,context):
 
 
 
-async def list_expenses(update,context):
+def money(amount):
+    return f'{abs(float(amount)):,.0f}'.replace(',', ' ') + " ₽"
 
-    today=datetime.now(TZ).date(); start=today.replace(day=1).isoformat()
 
-    d=get_expenses(update.effective_chat.id,start,today.isoformat(),"")
-
-    rows=[]
-
-    for x in d["items"][:10]:
+def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
+    rows = get_expenses(chat_id, date_from, date_to, "")["items"]
+    income = sum(float(row["amount"]) for row in rows if row.get("kind") == "income")
+    expense = sum(float(row["amount"]) for row in rows if row.get("kind") != "income")
+    today = datetime.now(TZ).date().isoformat()
+    today_rows = get_expenses(chat_id, today, today, "")["items"]
+    today_income = sum(float(row["amount"]) for row in today_rows if row.get("kind") == "income")
+    today_expense = sum(float(row["amount"]) for row in today_rows if row.get("kind") != "income")
+    pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    shown = rows[page * page_size:(page + 1) * page_size]
+    lines = ["💳 <b>Бюджет</b>",
+             f'За период: <b>+{money(income)}</b> · <b>−{money(expense)}</b> · остаток <b>{money(income - expense)}</b>',
+             f'Сегодня: <b>+{money(today_income)}</b> · <b>−{money(today_expense)}</b>', ""]
+    if not shown:
+        lines.append("Операций за этот период нет.")
+    for row in shown:
+        icon = "➕" if row.get("kind") == "income" else "➖"
         try:
-            parsed=datetime.fromisoformat(str(x["spent_at"]))
-            date_label=(parsed.astimezone(TZ) if parsed.tzinfo else parsed).strftime("%d.%m.%y")
-        except Exception:
-            date_label=str(x["spent_at"])[:10]
-        amount=f'{float(x["amount"]):,.0f}'.replace(',', ' ') + " ₽"
-        label=(x["description"] or x["category"] or "—").replace("\n", " ")[:34]
-        rows.append((amount, label, date_label))
+            date_label = datetime.fromisoformat(str(row["spent_at"])).strftime("%d.%m.%y")
+        except ValueError:
+            date_label = str(row["spent_at"])[:10]
+        label = html.escape((row["description"] or row["category"] or "—").replace("\n", " ")[:40])
+        lines.append(f'{icon} <b>#{row["id"]} · {money(row["amount"])}</b> — {label} · {date_label}')
+    controls = [
+        [InlineKeyboardButton("Сегодня", callback_data="budget:today"), InlineKeyboardButton("Вчера", callback_data="budget:yesterday"), InlineKeyboardButton("7 дней", callback_data="budget:week")],
+        [InlineKeyboardButton("Месяц", callback_data="budget:month"), InlineKeyboardButton("📅 Период", callback_data="budget:pick")],
+    ]
+    if pages > 1:
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"budget:range:{date_from}:{date_to}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="budget:noop"))
+        if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"budget:range:{date_from}:{date_to}:{page+1}"))
+        controls.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(controls)
 
-    # Telegram's proportional font makes tables look ragged.  A <pre> block
-    # keeps three columns aligned while widths still adapt to the user's data.
-    amount_width=max([len("Сумма")] + [len(row[0]) for row in rows])
-    label_width=max([len("За что")] + [len(row[1]) for row in rows])
-    lines=[f'💳 Расходы за месяц: {d["total"]:,.0f} ₽', "<pre>",
-           f'{"Сумма":>{amount_width}}   {"За что":<{label_width}}   Дата']
-    lines.append("─" * (amount_width + label_width + 10))
-    for amount, label, date_label in rows:
-        lines.append(f'{amount:>{amount_width}}   {label:<{label_width}}   {date_label}')
-    lines.append("</pre>")
 
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+async def list_expenses(update,context):
+    today = datetime.now(TZ).date()
+    text, markup = budget_page(update.effective_chat.id, today.replace(day=1).isoformat(), today.isoformat())
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
 
 
@@ -2252,25 +2297,35 @@ def button_rows(buttons, width=4):
     return [buttons[index:index + width] for index in range(0, len(buttons), width)]
 
 
-def reminders_page(chat_id):
+def reminders_page(chat_id, page=0, page_size=6):
     with conn() as c:
         rs = c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",
                        (chat_id,)).fetchall()
     if not rs:
         return "⏰ Активных напоминаний нет.", InlineKeyboardMarkup([])
-    lines = ["⏰ Напоминания"]
+    pages = max(1, (len(rs) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rs = rs[page * page_size:(page + 1) * page_size]
+    lines = [f"⏰ Напоминания · {page + 1}/{pages}"]
     buttons = []
     for r in rs[:20]:
         dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
         suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
-        lines.append(f'#{r["id"]} — {dt:%d.%m %H:%M} — {r["text"]}{suffix}')
-        buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}'))
-    return "\n".join(lines), InlineKeyboardMarkup(button_rows(buttons))
+        lines.append(f'<b>#{r["id"]}</b> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
+        buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}:{page}'))
+    rows = button_rows(buttons)
+    if pages > 1:
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"reminders:page:{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="reminders:noop"))
+        if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"reminders:page:{page+1}"))
+        rows.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 async def reminders(update,context):
     text, markup = reminders_page(update.effective_chat.id)
-    await update.effective_message.reply_text(text, reply_markup=markup)
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
 
 
@@ -2286,7 +2341,7 @@ def notes_page(chat_id, page=0, page_size=6):
     lines = [f"📝 Заметки · {page + 1}/{pages}"]
     delete_buttons = []
     for row in rows:
-        lines.append(f"#{row['id']} — {row['text']}")
+        lines.append(f"<b>#{row['id']}</b> — {html.escape(row['text'])}")
         delete_buttons.append(InlineKeyboardButton(f"🗑 #{row['id']}", callback_data=f"delnoteask:{row['id']}:{page}"))
     buttons = button_rows(delete_buttons)
     nav = []
@@ -2298,49 +2353,64 @@ def notes_page(chat_id, page=0, page_size=6):
 
 async def notes(update,context, page=0):
     text, markup = notes_page(update.effective_chat.id, page)
-    await update.effective_message.reply_text(text, reply_markup=markup)
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
 
 
-def plan_page(chat_id, day):
+def plan_page(chat_id, day, page=0, page_size=6):
     d = get_plan_for_date(chat_id, day)
     selected = datetime.fromisoformat(day).date()
     today = datetime.now(TZ).date()
     heading = "📅 Сегодня" if selected == today else f"📅 {selected:%d.%m.%Y}"
-    lines = [heading]
+    entries = [("task", task) for task in d["tasks"]] + [("reminder", reminder) for reminder in d["reminders"]]
+    pages = max(1, (len(entries) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    entries = entries[page * page_size:(page + 1) * page_size]
+    lines = [f"{heading} · {page + 1}/{pages}"]
     buttons = []
     task_toggle_buttons = []
-    for task in d["tasks"]:
-        status = task["status"]
-        marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
-        late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
-        lines.append(f'{marker} #{task["id"]} — {task["text"]}{late}')
-        toggle_icon = "✅" if status == "done" else "◻️"
-        task_toggle_buttons.append(InlineKeyboardButton(
-            f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}"))
+    reminder_buttons = []
+    for entry_type, entry in entries:
+        if entry_type == "task":
+            task = entry
+            status = task["status"]
+            marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
+            late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
+            lines.append(f'{marker} <b>#{task["id"]}</b> — {html.escape(task["text"])}{late}')
+            toggle_icon = "✅" if status == "done" else "◻️"
+            task_toggle_buttons.append(InlineKeyboardButton(
+                f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
+        else:
+            reminder = entry
+            marker = "✅" if reminder["acknowledged"] else "◻️"
+            lines.append(f'{marker} <b>#{reminder["id"]}</b> · {reminder["time"]} — {html.escape(reminder["text"])}')
+            if not reminder["acknowledged"]:
+                reminder_buttons.append(InlineKeyboardButton(
+                    f"✅ #{reminder['id']}", callback_data=f"remdone:{reminder['id']}:{day}:{page}"))
     if task_toggle_buttons:
         lines.append("\nНажмите на квадратик, чтобы отметить или вернуть задачу.")
         buttons.extend(button_rows(task_toggle_buttons, 3))
-    for reminder in d["reminders"]:
-        marker = "✅" if reminder["acknowledged"] else "◻️"
-        lines.append(f'{marker} #{reminder["id"]} · {reminder["time"]} — {reminder["text"]}')
-        if not reminder["acknowledged"]:
-            label = " ".join(reminder["text"].split())[:24]
-            buttons.append([InlineKeyboardButton(f"✅ #{reminder['id']} · {label}", callback_data=f"remdone:{reminder['id']}:{day}")])
+    buttons.extend(button_rows(reminder_buttons, 3))
     if len(lines) == 1:
         lines.append("Пока ничего нет.")
     previous = (selected - timedelta(days=1)).isoformat()
     following = (selected + timedelta(days=1)).isoformat()
-    buttons.append([InlineKeyboardButton("‹ Назад", callback_data=f"plan:{previous}"),
+    if pages > 1:
+        page_nav = []
+        if page > 0: page_nav.append(InlineKeyboardButton("‹", callback_data=f"plan:{day}:{page-1}"))
+        page_nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="plan:noop"))
+        if page + 1 < pages: page_nav.append(InlineKeyboardButton("›", callback_data=f"plan:{day}:{page+1}"))
+        buttons.append(page_nav)
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data=f"plan:{previous}:0"),
                     InlineKeyboardButton("🔎 Дата", callback_data="plan:pick"),
-                    InlineKeyboardButton("Вперёд ›", callback_data=f"plan:{following}")])
+                    InlineKeyboardButton("Вперёд ›", callback_data=f"plan:{following}:0")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 async def today_plan(update,context, day=None):
     day = day or datetime.now(TZ).date().isoformat()
     text, markup = plan_page(update.effective_chat.id, day)
-    await update.effective_message.reply_text(text, reply_markup=markup)
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
 
 
@@ -2421,37 +2491,63 @@ async def callback(update,context):
 
     if q.data == "menu:reminders":
         return await reminders(update, context)
-    if q.data == "menu:expenses":
+    if q.data in ("menu:expenses", "menu:budget"):
         return await list_expenses(update, context)
+    if q.data.startswith("budget:"):
+        action = q.data.split(":", 1)[1]
+        today = datetime.now(TZ).date()
+        if action == "noop":
+            return
+        if action == "pick":
+            context.user_data["awaiting_budget_range"] = True
+            return await q.message.reply_text("Напишите период: 01.09.2026–07.09.2026. Можно указать и одну дату.")
+        if action == "today":
+            date_from = date_to = today.isoformat(); page = 0
+        elif action == "yesterday":
+            date_from = date_to = (today - timedelta(days=1)).isoformat(); page = 0
+        elif action == "week":
+            date_from = (today - timedelta(days=6)).isoformat(); date_to = today.isoformat(); page = 0
+        elif action == "month":
+            date_from = today.replace(day=1).isoformat(); date_to = today.isoformat(); page = 0
+        elif action.startswith("range:"):
+            _, date_from, date_to, page = action.split(":")
+            page = int(page)
+        else:
+            return
+        text, markup = budget_page(q.message.chat_id, date_from, date_to, page)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:briefing":
         return await q.edit_message_text(build_briefing(q.message.chat_id), parse_mode="HTML")
     if q.data.startswith("plan:"):
         value = q.data.split(":", 1)[1]
+        if value == "noop":
+            return
         if value == "pick":
             context.user_data["awaiting_plan_date"] = True
             return await q.message.reply_text("Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.")
         try:
-            text, markup = plan_page(q.message.chat_id, value)
+            day, page = value.split(":") if ":" in value else (value, "0")
+            text, markup = plan_page(q.message.chat_id, day, int(page))
         except ValueError:
             return await q.answer("Не удалось прочитать дату.", show_alert=True)
-        return await q.edit_message_text(text, reply_markup=markup)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith(("taskdone:", "taskfail:")):
         action, task_id, day = q.data.split(":")
         set_task_status(q.message.chat_id, int(task_id), "done" if action == "taskdone" else "failed")
         text, markup = plan_page(q.message.chat_id, day)
         return await q.edit_message_text(text, reply_markup=markup)
     if q.data.startswith("tasktoggle:"):
-        _, task_id, day = q.data.split(":")
+        _, task_id, day, page = q.data.split(":")
         toggle_task_status(q.message.chat_id, int(task_id))
-        text, markup = plan_page(q.message.chat_id, day)
-        return await q.edit_message_text(text, reply_markup=markup)
+        text, markup = plan_page(q.message.chat_id, day, int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("remdone:"):
-        _, reminder_id, day = q.data.split(":")
+        _, reminder_id, day, page = q.data.split(":")
         with conn() as c:
             c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
                       (int(reminder_id), q.message.chat_id))
-        text, markup = plan_page(q.message.chat_id, day)
-        return await q.edit_message_text(text, reply_markup=markup)
+        text, markup = plan_page(q.message.chat_id, day, int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:people":
         return await list_people(update, context)
     if q.data == "menu:notes":
@@ -2459,7 +2555,7 @@ async def callback(update,context):
     if q.data.startswith("notes:page:"):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = notes_page(q.message.chat_id, page)
-        return await q.edit_message_text(text, reply_markup=markup)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("delnoteask:"):
         _, note_id, page = q.data.split(":")
         return await q.edit_message_text(
@@ -2470,7 +2566,7 @@ async def callback(update,context):
         _, note_id, page = q.data.split(":")
         delete_note(q.message.chat_id, int(note_id))
         text, markup = notes_page(q.message.chat_id, int(page))
-        return await q.edit_message_text(text, reply_markup=markup)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "settings:rules":
         rules = behavior_rules_for(q.message.chat_id)
         text = "📜 Правила бота\n\n" + "\n".join(
@@ -2494,20 +2590,26 @@ async def callback(update,context):
         return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
 
     if q.data.startswith("delremask:"):
-        rid = int(q.data.split(":")[1])
+        _, rid, page = q.data.split(":")
         return await q.edit_message_text(
             f"Удалить напоминание #{rid}? Это действие нельзя отменить.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delrem:{rid}"),
-                                                InlineKeyboardButton("Отмена", callback_data="reminders:show")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delrem:{rid}:{page}"),
+                                                InlineKeyboardButton("Отмена", callback_data=f"reminders:page:{page}")]]))
+    if q.data == "reminders:noop":
+        return
+    if q.data.startswith("reminders:page:"):
+        page = int(q.data.rsplit(":", 1)[1])
+        text, markup = reminders_page(q.message.chat_id, page)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "reminders:show":
         text, markup = reminders_page(q.message.chat_id)
-        return await q.edit_message_text(text, reply_markup=markup)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("delrem:"):
-        rid=int(q.data.split(":")[1])
+        _, rid, page = q.data.split(":")
         with conn() as c:
             c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
-        text, markup = reminders_page(q.message.chat_id)
-        return await q.edit_message_text(text, reply_markup=markup)
+        text, markup = reminders_page(q.message.chat_id, int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
 
 def settings_keyboard():
@@ -2663,6 +2765,18 @@ async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
 
+    if context.user_data.pop("awaiting_budget_range", False):
+        dates = re.findall(r"\d{1,2}\.\d{1,2}\.\d{2,4}", t)
+        if not dates:
+            return await update.effective_message.reply_text("Не поняла период. Пример: 01.09.2026–07.09.2026.")
+        try:
+            parsed = [datetime.strptime(value, "%d.%m.%Y" if len(value) == 10 else "%d.%m.%y").date() for value in dates[:2]]
+        except ValueError:
+            return await update.effective_message.reply_text("Не поняла дату. Пример: 01.09.2026–07.09.2026.")
+        date_from = min(parsed).isoformat(); date_to = max(parsed).isoformat()
+        text, markup = budget_page(cid, date_from, date_to)
+        return await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
     if context.user_data.pop("awaiting_plan_date", False):
         parsed = None
         for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
@@ -2692,7 +2806,7 @@ async def text_handler(update,context):
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 Люди", callback_data="menu:people"), InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
-                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders"), InlineKeyboardButton("💰 Расходы", callback_data="menu:expenses")],
+                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders"), InlineKeyboardButton("💳 Бюджет", callback_data="menu:budget")],
                 [InlineKeyboardButton("🌅 Брифинг", callback_data="menu:briefing")],
             ]))
 
@@ -2713,7 +2827,7 @@ async def text_handler(update,context):
 
     if t=="👥 Люди": return await list_people(update,context)
 
-    if t=="💰 Расходы": return await list_expenses(update,context)
+    if t in ("💰 Расходы", "💳 Бюджет"): return await list_expenses(update,context)
 
     if t=="🌅 Брифинг": return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
 
