@@ -48,6 +48,8 @@ from ingestion import (ActionBuilder, Attachment, IngestionInput, IngestionPipel
 from url_enricher import HttpUrlEnricher
 
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
+from model_router import ModelRouter
+from telegram_renderer import TelegramRenderer
 
 
 
@@ -57,7 +59,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "v8-CLEAN-2026-09-03"
+BUILD_ID = "v8-AMVERA-2026-09-09"
 
 TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -87,7 +89,10 @@ TZ = ZoneInfo(TZ_NAME)
 
 
 
-DB = BASE / "noema_test.sqlite3"
+_configured_data_dir = os.getenv("DATA_DIR", "").strip()
+PERSISTENT_ROOT = Path(_configured_data_dir) if _configured_data_dir else (Path("/data") if Path("/data").is_dir() else BASE)
+PERSISTENT_ROOT.mkdir(parents=True, exist_ok=True)
+DB = PERSISTENT_ROOT / "noema_test.sqlite3"
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -96,18 +101,14 @@ STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 
 KB = ReplyKeyboardMarkup([
-
-    ["🎙 Голос", "💬 Текст", "🔊 Голос+текст"],
-
-    ["📅 Сегодня", "⏰ Напоминания", "📝 Заметки"],
-
-    ["👥 Люди", "💰 Расходы", "🌅 Брифинг"],
-
-    ["🔎 Поиск", "🛍 Товары", "⚙️ Статус"],
-
-    ["🧹 Очистить диалог"],
-
+    ["📚 Знания", "📅 Сегодня", "➕ Создать"],
+    ["🔎 Поиск", "⚙️ Настройки", "☰ Ещё"],
 ], resize_keyboard=True)
+
+AVAILABLE_MODELS = [x.strip() for x in os.getenv(
+    "AVAILABLE_MODELS",
+    "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-sonnet-4,openai/gpt-4.1"
+).split(",") if x.strip()]
 
 
 
@@ -506,11 +507,15 @@ def knowledge_search_tool(chat_id, query="", project=None, category=None, entity
     items = retrieve(store, chat_id, query, project=resolved, category=category,
                      entity=entity, limit=limit, date_from=date_from, date_to=date_to)
     results = [compact_item(it, _files_for_item(it)) for it in items]
+    # Relationship lookup is source-grounded by entity_relations. It supplements
+    # ordinary retrieval, never replaces it or manufactures a fact.
+    relation_name = entity or (normalize_token(query).split()[0] if normalize_token(query) else "")
+    relations = store.relations_for(chat_id, relation_name) if relation_name else []
     top = _remember_retrieval(chat_id, items)
     return {
         "ok": True, "tool": "knowledge_search", "query": query,
         "project": resolved, "count": len(results),
-        "results": results, "follow_up_key": (top or {}).get("id"),
+        "results": results, "relations": relations[:20], "follow_up_key": (top or {}).get("id"),
     }
 
 
@@ -607,6 +612,13 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER PRIMARY KEY,response_mode TEXT NOT NULL DEFAULT 'auto');
 
+        CREATE TABLE IF NOT EXISTS user_settings(
+            chat_id INTEGER PRIMARY KEY,
+            primary_model TEXT NOT NULL DEFAULT '',
+            fallback_model TEXT NOT NULL DEFAULT '',
+            vision_model TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
 
         CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0);
@@ -672,6 +684,11 @@ def init_db():
             ensure_column(c, table, col, typ)
 
     KnowledgeStore(DB).init_schema()
+
+
+def model_router():
+    """Construct cheaply so every request observes the latest SQLite setting."""
+    return ModelRouter(conn, MODEL, FALLBACK_MODELS, VISION_MODEL)
 
 
 
@@ -1594,7 +1611,7 @@ def system_prompt():
 
 def request_chat(model,messages,tools=None,tool_choice="auto"):
 
-    payload={"model":model,"messages":messages,"temperature":0.25}
+    payload={"model":model,"messages":messages,"temperature":0.25,"max_tokens":int(os.getenv("CHAT_MAX_TOKENS", "1800"))}
 
     if tools: payload["tools"]=tools; payload["tool_choice"]=tool_choice
 
@@ -1604,9 +1621,11 @@ def request_chat(model,messages,tools=None,tool_choice="auto"):
 
 
 
-def call_or(messages,tools=None,tool_choice="auto"):
+def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
-    models=[MODEL]+[m for m in FALLBACK_MODELS if m!=MODEL]
+    selected=model_router().resolve(chat_id, "chat")
+    primary, fallback = selected["primary"], selected["fallback"]
+    models=[primary]+[m for m in ([fallback] + FALLBACK_MODELS) if m and m!=primary]
 
     last=None
 
@@ -1616,7 +1635,11 @@ def call_or(messages,tools=None,tool_choice="auto"):
 
             r=request_chat(model,messages,tools,tool_choice)
 
-            if r.ok: return r.json()["choices"][0]["message"]
+            if r.ok:
+                choice = r.json()["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    print(f"LLM truncation chat_id={chat_id} model={model}")
+                return choice["message"]
 
             last=(r.status_code,r.text)
 
@@ -1708,7 +1731,7 @@ def ask(chat_id,text):
 
         tc="required" if _==0 else "auto"
 
-        msg=call_or(msgs,TOOLS,tc)
+        msg=call_or(chat_id,msgs,TOOLS,tc)
 
         calls=msg.get("tool_calls") or []
 
@@ -1892,7 +1915,9 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
 
     eff="voice_and_text" if force_voice else (("voice_and_text" if voice_in else "text") if mode=="auto" else mode)
 
-    if eff in ("text","voice_and_text"): await update.effective_message.reply_text(answer)
+    if eff in ("text","voice_and_text"):
+        for chunk in TelegramRenderer.chunks(answer):
+            await update.effective_message.reply_text(chunk, parse_mode=TelegramRenderer.parse_mode)
 
     if eff in ("voice","voice_and_text"):
 
@@ -2030,6 +2055,44 @@ async def callback(update,context):
 
     q=update.callback_query; await q.answer()
 
+    if q.data == "settings:model":
+        selected = model_router().resolve(q.message.chat_id, "chat")
+        lines = ["<b>🧠 Текущая модель</b>", html.escape(selected["primary"]), "", "Выберите модель:"]
+        buttons = []
+        for model in AVAILABLE_MODELS:
+            mark = "●" if model == selected["primary"] else "○"
+            buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
+        buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+        await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if q.data.startswith("model:set:"):
+        model = q.data.split(":", 2)[2]
+        if model not in AVAILABLE_MODELS:
+            return await q.edit_message_text("Модель недоступна.")
+        model_router().set_primary(q.message.chat_id, model)
+        await q.edit_message_text(
+            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n\nСледующее сообщение сразу будет обработано этой моделью.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Изменить", callback_data="settings:model")]]),
+        )
+        return
+
+    if q.data == "settings:back":
+        await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard())
+        return
+
+    if q.data == "settings:mode":
+        await q.edit_message_text("Режим ответа меняется в меню «☰ Ещё».")
+        return
+
+    if q.data == "menu:reminders":
+        return await reminders(update, context)
+    if q.data == "menu:expenses":
+        return await list_expenses(update, context)
+    if q.data == "menu:briefing":
+        return await q.edit_message_text(TelegramRenderer.render(build_briefing(q.message.chat_id)), parse_mode="HTML")
+
     if q.data.startswith("delrem:"):
 
         rid=int(q.data.split(":")[1])
@@ -2037,6 +2100,13 @@ async def callback(update,context):
         with conn() as c: c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
 
         await q.edit_message_text(f"Напоминание #{rid} удалено.")
+
+
+def settings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧠 Модель", callback_data="settings:model")],
+        [InlineKeyboardButton("🔊 Режим ответа", callback_data="settings:mode")],
+    ])
 
 
 
@@ -2111,6 +2181,24 @@ def build_briefing(chat_id):
 async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
+
+    if t=="⚙️ Настройки":
+        return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard())
+
+    if t=="☰ Ещё":
+        return await update.effective_message.reply_text(
+            "Дополнительно:", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎙 Режим: голос", callback_data="settings:mode")],
+                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
+                [InlineKeyboardButton("💰 Расходы", callback_data="menu:expenses")],
+                [InlineKeyboardButton("🌅 Брифинг", callback_data="menu:briefing")],
+            ]))
+
+    if t=="➕ Создать":
+        return await update.effective_message.reply_text("Напишите обычным сообщением: «создай задачу …», «напомни …» или «сохрани заметку …».")
+
+    if t=="📚 Знания":
+        return await update.effective_message.reply_text("📚 Знания\nНапишите, что найти: проект, человека, ресурс или тему. Например: «где Узел задеплоен?»")
 
     if t=="🎙 Голос": set_mode(cid,"voice"); return await update.effective_message.reply_text("Режим: голос.")
 
@@ -2335,7 +2423,13 @@ async def image_handler(update,context):
 
                 except Exception as e: await safe_error(update,e)
 
-        await status_msg.edit_text(final_text[:4000] or "Готово.")
+        chunks = TelegramRenderer.chunks(final_text or "Готово.")
+        try:
+            await status_msg.edit_text(chunks[0], parse_mode=TelegramRenderer.parse_mode)
+        except TypeError:  # lightweight test/message adapters without kwargs
+            await status_msg.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await msg.reply_text(chunk, parse_mode=TelegramRenderer.parse_mode)
 
         await drain_media_outbox(update, context)
 

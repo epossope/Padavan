@@ -62,6 +62,46 @@ CREATE TABLE IF NOT EXISTS knowledge_files (
 );
 CREATE INDEX IF NOT EXISTS ix_knowledge_files_k ON knowledge_files(knowledge_id);
 CREATE INDEX IF NOT EXISTS ix_knowledge_files_f ON knowledge_files(file_id);
+
+-- Generic graph layer. Entity and relation labels are plain text by design:
+-- new real-world object types never require a schema migration.
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT 'other',
+    normalized_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(chat_id, normalized_name, entity_type)
+);
+CREATE TABLE IF NOT EXISTS knowledge_entities (
+    knowledge_item_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    PRIMARY KEY (knowledge_item_id, entity_id)
+);
+CREATE TABLE IF NOT EXISTS entity_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    target_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    knowledge_item_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    UNIQUE(source_entity_id, relation_type, target_entity_id, knowledge_item_id)
+);
+CREATE INDEX IF NOT EXISTS ix_entity_relations_source ON entity_relations(source_entity_id);
+CREATE INDEX IF NOT EXISTS ix_entity_relations_target ON entity_relations(target_entity_id);
+CREATE TABLE IF NOT EXISTS facets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL, normalized_name TEXT NOT NULL,
+    UNIQUE(chat_id, normalized_name)
+);
+CREATE TABLE IF NOT EXISTS knowledge_facets (
+    knowledge_item_id INTEGER NOT NULL REFERENCES knowledge_items(id) ON DELETE CASCADE,
+    facet_id INTEGER NOT NULL REFERENCES facets(id) ON DELETE CASCADE,
+    PRIMARY KEY (knowledge_item_id, facet_id)
+);
 """
 
 
@@ -295,6 +335,57 @@ class KnowledgeStore(KnowledgeSearch):
                 "INSERT OR IGNORE INTO knowledge_files(knowledge_id, file_id, role) VALUES (?,?,?)",
                 (knowledge_id, file_id, role),
             )
+
+    @staticmethod
+    def _normalized_name(value):
+        return " ".join(str(value or "").lower().replace("ё", "е").split())[:160]
+
+    def upsert_entity(self, chat_id, name, entity_type="other") -> Optional[dict]:
+        name = str(name or "").strip()[:120]
+        kind = str(entity_type or "other").strip()[:80]
+        normalized = self._normalized_name(name)
+        if not normalized:
+            return None
+        now = utcnow()
+        with self._connect() as c:
+            c.execute("INSERT INTO entities(chat_id,name,entity_type,normalized_name,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+                      "ON CONFLICT(chat_id,normalized_name,entity_type) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at",
+                      (chat_id, name, kind, normalized, now, now))
+            row = c.execute("SELECT * FROM entities WHERE chat_id=? AND normalized_name=? AND entity_type=?", (chat_id, normalized, kind)).fetchone()
+        return dict(row)
+
+    def link_entity(self, knowledge_item_id, entity_id, confidence=0.5):
+        with self._connect() as c:
+            c.execute("INSERT OR REPLACE INTO knowledge_entities(knowledge_item_id,entity_id,confidence) VALUES(?,?,?)",
+                      (knowledge_item_id, entity_id, float(confidence)))
+
+    def add_relation(self, source_entity_id, relation_type, target_entity_id, knowledge_item_id, confidence=0.5):
+        with self._connect() as c:
+            c.execute("INSERT OR IGNORE INTO entity_relations(source_entity_id,relation_type,target_entity_id,knowledge_item_id,confidence) VALUES(?,?,?,?,?)",
+                      (source_entity_id, str(relation_type or "related_to")[:80], target_entity_id, knowledge_item_id, float(confidence)))
+
+    def sync_item_entities(self, item_id, chat_id, extracted_entities, confidence=0.5):
+        """Mirror extracted entities into the normalized, source-grounded graph."""
+        entities = []
+        for extracted in extracted_entities or []:
+            if not isinstance(extracted, dict):
+                continue
+            entity = self.upsert_entity(chat_id, extracted.get("name"), extracted.get("type", "other"))
+            if entity:
+                self.link_entity(item_id, entity["id"], confidence)
+                entities.append(entity)
+        return entities
+
+    def relations_for(self, chat_id, name):
+        normalized = self._normalized_name(name)
+        with self._connect() as c:
+            rows = c.execute("""SELECT r.relation_type, t.name AS target, s.name AS source,
+                                      r.knowledge_item_id, r.confidence
+                               FROM entity_relations r JOIN entities s ON s.id=r.source_entity_id
+                               JOIN entities t ON t.id=r.target_entity_id
+                               WHERE s.chat_id=? AND s.normalized_name=? OR t.chat_id=? AND t.normalized_name=?""",
+                             (chat_id, normalized, chat_id, normalized)).fetchall()
+        return [dict(r) for r in rows]
 
     def item_files(self, knowledge_id) -> list[dict]:
         with self._connect() as c:

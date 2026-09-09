@@ -178,6 +178,27 @@ CONTENT_TYPES = {
     "recording", "receipt", "invoice", "mixed",
 }
 
+_PERSON_JUNK_RE = re.compile(
+    r"(?:\b(?:сегодня|завтра|вчера|pdf|png|jpg|jpeg|q[1-4])\b|\d|[₽$€£]|\b\w{1,12}\.(?:pdf|png|jpg|jpeg|docx?|xlsx?)\b)",
+    re.I,
+)
+
+
+def _valid_entity(entity: dict, confidence: float) -> bool:
+    """Reject OCR/UI noise before it can become a durable entity/person."""
+    name = str(entity.get("name") or "").strip()
+    kind = str(entity.get("type") or "other").strip().lower()
+    if not name or len(name) > 120:
+        return False
+    if kind == "person":
+        # A person requires a plausible alphabetic identifier and reliable
+        # extraction. Dates, money, labels and filenames are never people.
+        if confidence < 0.70 or _PERSON_JUNK_RE.search(name):
+            return False
+        if not re.fullmatch(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё'’\- ]{1,100}", name):
+            return False
+    return True
+
 
 def build_searchable(title, summary, visible_text, tags, entities, user_text="") -> str:
     parts = [title or "", summary or "", visible_text or "", user_text or ""]
@@ -192,13 +213,20 @@ def normalize_extraction(raw: Any, caption: str = "") -> ExtractionResult:
     if ct not in CONTENT_TYPES:
         ct = "mixed" if (raw.get("visible_text") or raw.get("urls") or caption) else "text"
 
-    entities = []
+    entities, seen_entities = [], set()
     for e in (raw.get("entities") or []):
         if isinstance(e, dict) and str(e.get("name") or "").strip():
-            entities.append({
+            candidate = {
                 "type": str(e.get("type") or "other").strip() or "other",
                 "name": str(e["name"]).strip()[:120],
-            })
+            }
+            # Global confidence is intentionally applied here: extractor dumps
+            # must not create people merely because OCR guessed a label.
+            raw_confidence = float(raw.get("confidence") or 0.5)
+            key = (candidate["type"].lower(), candidate["name"].lower().replace("ё", "е"))
+            if _valid_entity(candidate, raw_confidence) and key not in seen_entities:
+                entities.append(candidate)
+                seen_entities.add(key)
 
     visible_text = str(raw.get("visible_text") or "").strip()
     title = str(raw.get("title") or "").strip()
@@ -261,6 +289,24 @@ def derive_tags(ex: ExtractionResult, user_text: str) -> list:
         if w not in _STOPWORDS and w not in tags:
             tags.append(w)
     return list(dict.fromkeys(tags))[:12]
+
+
+def derive_generic_relations(text: str) -> list[dict]:
+    """Extract only explicit, domain-neutral statements into sourced links."""
+    patterns = [
+        (r"(.+?)\s+(?:находятся|размещены|задеплоены|расположены)\s+(?:на|в)\s+(.+?)(?:[.!?]|$)", "hosted_on"),
+        (r"(.+?)\s+(?:использую|используется)\s+(?:для|в)\s+(.+?)(?:[.!?]|$)", "uses"),
+        (r"(.+?)\s+(?:содержит|включает)\s+(.+?)(?:[.!?]|$)", "contains"),
+    ]
+    for pattern, relation in patterns:
+        match = re.search(pattern, text or "", re.I)
+        if not match:
+            continue
+        left, right = (x.strip(" ,:;«»\"'") for x in match.groups())
+        left = re.sub(r"^(?:сайт|проект|приложение)\s+", "", left, flags=re.I)
+        return [{"source": source.strip()[:120], "relation_type": relation, "target": right[:120]}
+                for source in re.split(r"\s*,\s*|\s+и\s+", left) if source.strip() and right]
+    return []
 
 # ---------------------------------------------------------------------------
 # project / context resolution — projects are NEVER auto-created
@@ -661,6 +707,16 @@ class IngestionPipeline:
                 reply=f"Уже сохраняла это (запись #{created_item.get('id')}). Дубликат не создан.",
             )
         item_id = created_item["id"]
+        # Store the same entities in the generic graph. The legacy JSON column
+        # remains for backwards-compatible search; no parallel "people" store
+        # is introduced.
+        graph_entities = self.store.sync_item_entities(item_id, chat_id, ex.entities, ex.confidence)
+        by_name = {e["name"].lower(): e for e in graph_entities}
+        for relation in ex.raw.get("relations", []):
+            source = by_name.get(relation["source"].lower())
+            target = by_name.get(relation["target"].lower())
+            if source and target:
+                self.store.add_relation(source["id"], relation["relation_type"], target["id"], item_id, ex.confidence)
         for fid in file_rows:
             if fid:
                 self.store.link_file(item_id, fid, role="source")
@@ -725,6 +781,11 @@ class IngestionPipeline:
     def _understand(self, inp: IngestionInput, ex: ExtractionResult) -> ExtractionResult:
         ex.category = infer_category(ex, inp.user_text)
         ex.tags = derive_tags(ex, inp.user_text)
+        ex.raw["relations"] = derive_generic_relations(inp.user_text)
+        for relation in ex.raw["relations"]:
+            for name in (relation["source"], relation["target"]):
+                if not any(e.get("name", "").lower() == name.lower() for e in ex.entities):
+                    ex.entities.append({"type": "other", "name": name})
         ex.searchable_text = build_searchable(
             ex.title, ex.summary, ex.visible_text, ex.tags, ex.entities, inp.user_text)
         return ex
@@ -810,18 +871,15 @@ class IngestionPipeline:
         lines = []
         title = item.get("title") or item.get("summary") or "изображение"
         lines.append(f"📥 Сохранила: {title[:120]}")
-        if item.get("category"):
-            lines.append(f"Категория: {item.get('category')}")
         for u in (item.get("urls") or [])[:2]:
             lines.append(f"🔗 {u}")
         if project_id:
             lines.append(f"🗂 Проект: {project_id}")
-        seen = []
-        for e in item.get("entities") or []:
-            n = e.get("name")
-            if n and n not in seen:
-                seen.append(n)
-                lines.append(f"👤 Записала: {n}")
+        # Extractor internals (entities, confidence, hashes) stay searchable in
+        # storage but are deliberately not shown to the user.
+        summary = (item.get("summary") or "").strip()
+        if summary:
+            lines.extend(["", "Заметила:", "• " + summary[:280]])
         enrich_status = item.get("enrichment_status") or "not_required"
         if enrich_status in ("completed", "partial"):
             ok_n = sum(1 for x in enrichment if x.get("status") == "ok")
