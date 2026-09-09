@@ -61,7 +61,7 @@ load_dotenv(BASE / ".env")
 
 BUILD_ID = "v8-AMVERA-2026-09-09"
 
-TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
@@ -445,10 +445,11 @@ def find_photos(chat_id, name, limit=5):
     out = []
     for it in items:
         for f in get_pipeline().store.item_files(it["id"]):
-            if (f.get("mime_type") or "").startswith("image/") and f.get("local_path"):
+            if (f.get("mime_type") or "").startswith("image/") and (f.get("local_path") or f.get("telegram_file_id")):
                 out.append({"item_id": it["id"], "local_path": f["local_path"],
                             "summary": it.get("summary") or it.get("title") or "",
-                            "file_row": f.get("id")})
+                            "file_row": f.get("id"),
+                            "telegram_file_id": f.get("telegram_file_id") or ""})
     return out
 
 
@@ -2082,8 +2083,17 @@ async def callback(update,context):
         await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard())
         return
 
-    if q.data == "settings:mode":
-        await q.edit_message_text("Режим ответа меняется в меню «☰ Ещё».")
+    if q.data in ("menu:mode", "settings:mode"):
+        await q.edit_message_text("🔊 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
+        return
+
+    if q.data.startswith("mode:set:"):
+        mode = q.data.split(":", 2)[2]
+        if mode not in ("text", "voice", "voice_and_text"):
+            return await q.edit_message_text("Неизвестный режим.")
+        set_mode(q.message.chat_id, mode)
+        labels = {"text": "💬 Текст", "voice": "🎙 Голос", "voice_and_text": "🔊 Голос + текст"}
+        await q.edit_message_text(f"Режим: {labels[mode]}.", reply_markup=mode_keyboard(q.message.chat_id))
         return
 
     if q.data == "menu:reminders":
@@ -2092,6 +2102,15 @@ async def callback(update,context):
         return await list_expenses(update, context)
     if q.data == "menu:briefing":
         return await q.edit_message_text(TelegramRenderer.render(build_briefing(q.message.chat_id)), parse_mode="HTML")
+    if q.data == "menu:people":
+        return await list_people(update, context)
+    if q.data == "menu:notes":
+        return await notes(update, context)
+    if q.data == "settings:status":
+        return await q.edit_message_text(status_text(q.message.chat_id))
+    if q.data == "settings:clear":
+        clear_history(q.message.chat_id)
+        return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
 
     if q.data.startswith("delrem:"):
 
@@ -2105,8 +2124,27 @@ async def callback(update,context):
 def settings_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 Модель", callback_data="settings:model")],
-        [InlineKeyboardButton("🔊 Режим ответа", callback_data="settings:mode")],
+        [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
+        [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
     ])
+
+
+def mode_keyboard(chat_id):
+    current = get_mode(chat_id)
+    choices = [("text", "💬 Текст"), ("voice", "🎙 Голос"), ("voice_and_text", "🔊 Голос + текст")]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("● " if current == value else "○ ") + label,
+                              callback_data=f"mode:set:{value}")]
+        for value, label in choices
+    ])
+
+
+def status_text(chat_id):
+    selected = model_router().resolve(chat_id, "chat")
+    return (f"Build: {BUILD_ID}\n"
+            f"Model: {selected['primary']}\nVision: {model_router().resolve(chat_id, 'vision')}\n"
+            f"Mode: {get_mode(chat_id)}\nTimezone: {TZ_NAME}\n"
+            f"Storage: {PERSISTENT_ROOT}")
 
 
 
@@ -2188,7 +2226,9 @@ async def text_handler(update,context):
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎙 Режим: голос", callback_data="settings:mode")],
+                [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode")],
+                [InlineKeyboardButton("👥 Люди", callback_data="menu:people")],
+                [InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
                 [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
                 [InlineKeyboardButton("💰 Расходы", callback_data="menu:expenses")],
                 [InlineKeyboardButton("🌅 Брифинг", callback_data="menu:briefing")],
@@ -2225,19 +2265,7 @@ async def text_handler(update,context):
     if t=="⚙️ Статус":
 
         return await update.effective_message.reply_text(
-
-            f"Build: {BUILD_ID}\nPID: {os.getpid()}\nPath: {BASE}\n"
-
-            f"Model: {MODEL} (Noema Model v1)\n"
-
-            f"Vision: {VISION_MODEL}\n"
-
-            f"STT: {STT_MODEL}\n"
-
-            f"Weather: Open-Meteo\n"
-
-            f"Shopping: multi-market\nDefault city: {DEFAULT_CITY}\nMode: {get_mode(cid)}"
-
+            status_text(cid)
         )
 
     if t=="🧹 Очистить диалог":
@@ -2278,7 +2306,7 @@ async def text_handler(update,context):
 
     # knowledge photo retrieval: «покажи фото Ричи»
 
-    pm=re.match(r"(?:покажи|найди)\s+(?:фото|картинк\w*|изображен\w*)\s+(.+)$", t, re.I)
+    pm=re.match(r"(?:покажи|пришли|отправь|дай|найди)\s+(?:(?:мне|пожалуйста)\s+)?(?:(?:фото|фотку|картинк\w*|изображен\w*|снимок)\s+)?(.+)$", t, re.I)
 
     if pm:
 
@@ -2292,9 +2320,12 @@ async def text_handler(update,context):
 
             try:
 
-                with Path(first["local_path"]).open("rb") as fh:
-
-                    await update.effective_message.reply_photo(photo=fh, caption=(first.get("summary") or "")[:200])
+                caption = (first.get("summary") or "")[:200]
+                if first.get("telegram_file_id"):
+                    await update.effective_message.reply_photo(photo=first["telegram_file_id"], caption=caption)
+                else:
+                    with Path(first["local_path"]).open("rb") as fh:
+                        await update.effective_message.reply_photo(photo=fh, caption=caption)
 
                 return
 
@@ -2496,9 +2527,11 @@ async def briefing_tick(context):
 
 def main():
 
-    if not TG or "PASTE_" in TG: raise RuntimeError("Вставь TELEGRAM_BOT_TOKEN в .env")
+    if not TG or "PASTE_" in TG:
+        raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN (или BOT_TOKEN). Добавь её в Secrets/Environment хостинга и перезапусти деплой.")
 
-    if not OR_KEY or "PASTE_" in OR_KEY: raise RuntimeError("Вставь OPENROUTER_API_KEY в .env")
+    if not OR_KEY or "PASTE_" in OR_KEY:
+        raise RuntimeError("Не задана переменная окружения OPENROUTER_API_KEY. Добавь её в Secrets/Environment хостинга и перезапусти деплой.")
 
     init_db()
 
@@ -2511,6 +2544,8 @@ def main():
     print("PID:", os.getpid())
 
     print("PATH:", BASE)
+
+    print("DATA:", PERSISTENT_ROOT)
 
     print("="*60)
 
