@@ -8,6 +8,8 @@ import base64
 
 import hashlib
 
+import hmac
+
 import html
 
 import json
@@ -29,6 +31,7 @@ import tempfile
 import time
 
 import shutil
+from urllib.parse import parse_qsl
 
 from datetime import datetime, timezone, timedelta
 
@@ -48,7 +51,7 @@ from ddgs import DDGS
 
 from dotenv import load_dotenv
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.error import BadRequest
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -76,7 +79,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "prod-ui-2026-09-09.13"
+BUILD_ID = "0.3"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -135,6 +138,11 @@ AVAILABLE_MODELS = [x.strip() for x in os.getenv(
 
 
 TOOLS = [
+    {"type":"function","function":{
+        "name":"set_timezone",
+        "description":"Установить личный часовой пояс пользователя по IANA ID, например Asia/Shanghai. Используй, когда пользователь говорит, что он переехал, находится в другой стране или просит сменить время.",
+        "parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}
+    }},
     {"type":"function","function":{
 
         "name":"save_behavior_rule",
@@ -465,7 +473,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -799,6 +807,10 @@ def init_db():
             first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS user_timezones(
+            chat_id INTEGER PRIMARY KEY, timezone_name TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS files(
             id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,telegram_file_id TEXT,
             original_name TEXT,mime_type TEXT,local_path TEXT,kind TEXT,summary TEXT,
@@ -920,6 +932,32 @@ QUICK_ACTIONS = {
     "today": "📅 Что осталось сегодня",
     "break": "🧘 Начать перерыв",
 }
+
+
+def timezone_for(chat_id):
+    """A user's local clock; fall back to the hosting default for new chats."""
+    with conn() as c:
+        row = c.execute("SELECT timezone_name FROM user_timezones WHERE chat_id=?", (chat_id,)).fetchone()
+    try:
+        return ZoneInfo(row["timezone_name"] if row else TZ_NAME)
+    except Exception:
+        return TZ
+
+
+def timezone_name_for(chat_id):
+    return timezone_for(chat_id).key
+
+
+def set_user_timezone(chat_id, timezone_name):
+    try:
+        zone = ZoneInfo(str(timezone_name or "").strip())
+    except Exception:
+        return {"ok": False, "tool": "set_timezone", "error": "unknown_timezone"}
+    with conn() as c:
+        c.execute("INSERT INTO user_timezones(chat_id,timezone_name,updated_at) VALUES(?,?,?) "
+                  "ON CONFLICT(chat_id) DO UPDATE SET timezone_name=excluded.timezone_name,updated_at=excluded.updated_at",
+                  (chat_id, zone.key, datetime.now(timezone.utc).isoformat()))
+    return {"ok": True, "tool": "set_timezone", "timezone": zone.key}
 
 
 def encrypt_device_secret(secret):
@@ -1201,12 +1239,13 @@ def save_behavior_rule(chat_id, description=""):
 def save_reminder(chat_id, text, remind_at):
 
     dt = datetime.fromisoformat(remind_at)
+    chat_tz = timezone_for(chat_id)
 
     if dt.tzinfo is None:
 
-        dt = dt.replace(tzinfo=TZ)
+        dt = dt.replace(tzinfo=chat_tz)
 
-    dt = dt.astimezone(TZ)
+    dt = dt.astimezone(chat_tz)
 
     with conn() as c:
 
@@ -1491,7 +1530,8 @@ def get_expenses(chat_id,date_from="",date_to="",category=""):
 def get_plan_for_date(chat_id, day):
     """Return a calendar day without silently completing anything overdue."""
     selected = datetime.fromisoformat(day).date()
-    today = datetime.now(TZ).date()
+    chat_tz = timezone_for(chat_id)
+    today = datetime.now(chat_tz).date()
     with conn() as c:
         # Tasks without a date are actionable today, but don't clutter every
         # calendar day.  A passed task remains open until the user decides it.
@@ -1504,7 +1544,7 @@ def get_plan_for_date(chat_id, day):
             (chat_id,)).fetchall()]
     reminders = []
     for r in rem:
-        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
+        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(chat_tz)
         if dt.date() == selected:
             reminders.append({"id": r["id"], "text": r["text"], "time": dt.strftime("%H:%M"),
                               "acknowledged": r["acknowledged"]})
@@ -1512,7 +1552,7 @@ def get_plan_for_date(chat_id, day):
 
 
 def get_today_plan(chat_id):
-    return get_plan_for_date(chat_id, datetime.now(TZ).date().isoformat())
+    return get_plan_for_date(chat_id, datetime.now(timezone_for(chat_id)).date().isoformat())
 
 
 def set_task_status(chat_id, task_id, status):
@@ -1649,6 +1689,8 @@ def get_files(chat_id,kind=None,limit=5):
 def execute_tool(chat_id,name,args):
 
     funcs={
+
+        "set_timezone":set_user_timezone,
 
         "set_reminder":save_reminder,
 
@@ -2083,9 +2125,10 @@ def asks_external_web(text):
 
 # ---------- MODEL ----------
 
-def system_prompt():
+def system_prompt(chat_id):
 
-    now=datetime.now(TZ)
+    chat_tz = timezone_for(chat_id)
+    now=datetime.now(chat_tz)
 
     return (
 
@@ -2111,7 +2154,7 @@ def system_prompt():
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
-        "Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
+        "Если пользователь говорит, что находится, переехал или путешествует в другой стране/часовом поясе — используй set_timezone с подходящим IANA ID (например Китай — Asia/Shanghai). Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
         "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
@@ -2133,7 +2176,7 @@ def system_prompt():
 
         "Отвечай коротко, естественно и персонально. "
 
-        f"Сейчас {now.isoformat()}, timezone {TZ_NAME}."
+        f"Сейчас {now.isoformat()}, timezone {chat_tz.key}."
 
     )
 
@@ -2213,7 +2256,9 @@ def write_confirmation(results):
 
         n=r.get("tool")
 
-        if n=="add_expense": parts.append(f'Записала расход: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
+        if n=="set_timezone": parts.append(f'Часовой пояс изменён: {r["timezone"]}.')
+
+        elif n=="add_expense": parts.append(f'Записала расход: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
 
         elif n=="add_income": parts.append(f'Записала поступление: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
 
@@ -2255,7 +2300,7 @@ def ask(chat_id,text):
 
 
 
-    msgs=[{"role":"system","content":system_prompt()}]
+    msgs=[{"role":"system","content":system_prompt(chat_id)}]
 
     ctx=_LAST_RETRIEVAL.get(chat_id)
     if ctx and ctx.get("item"):
@@ -2556,11 +2601,9 @@ async def end_activity(card, stopped, task):
 
 async def start(update,context):
     register_bot_user(update.effective_chat.id, getattr(update, "effective_user", None))
-    # Some Telegram clients retain a previous reply keyboard even after a
-    # bot deploy. Explicitly remove it before sending the single source of
-    # truth, so obsolete buttons (such as «Задание») cannot be merged in.
-    await update.effective_message.reply_text("⌨️ Обновляю меню…", reply_markup=ReplyKeyboardRemove())
-    await update.effective_message.reply_text(f"Noema Model v1 готова.\nBuild: {BUILD_ID}", reply_markup=KB)
+    await update.effective_message.reply_text(
+        f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
+        reply_markup=KB, parse_mode="HTML")
 
 
 
@@ -2600,8 +2643,8 @@ def money(amount):
     return f'{abs(float(amount)):,.0f}'.replace(',', ' ') + " ₽"
 
 
-def budget_period_label(date_from, date_to):
-    today = datetime.now(TZ).date()
+def budget_period_label(chat_id, date_from, date_to):
+    today = datetime.now(timezone_for(chat_id)).date()
     if date_from == date_to == today.isoformat():
         return "Сегодня"
     if date_from == date_to == (today - timedelta(days=1)).isoformat():
@@ -2617,7 +2660,7 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
     rows = get_expenses(chat_id, date_from, date_to, "")["items"]
     income = sum(float(row["amount"]) for row in rows if row.get("kind") == "income")
     expense = sum(float(row["amount"]) for row in rows if row.get("kind") != "income")
-    today = datetime.now(TZ).date().isoformat()
+    today = datetime.now(timezone_for(chat_id)).date().isoformat()
     today_rows = get_expenses(chat_id, today, today, "")["items"]
     today_income = sum(float(row["amount"]) for row in today_rows if row.get("kind") == "income")
     today_expense = sum(float(row["amount"]) for row in today_rows if row.get("kind") != "income")
@@ -2626,7 +2669,7 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
     shown = rows[page * page_size:(page + 1) * page_size]
     balance = income - expense
     today_balance = today_income - today_expense
-    lines = [f'💳 <b>{budget_period_label(date_from, date_to)}: {"+" if balance >= 0 else "−"}{money(balance)}</b>',
+    lines = [f'💳 <b>{budget_period_label(chat_id, date_from, date_to)}: {"+" if balance >= 0 else "−"}{money(balance)}</b>',
              f'Приход: +{money(income)}    Расход: −{money(expense)}',
              f'<b>Сегодня: {"+" if today_balance >= 0 else "−"}{money(today_balance)}</b>', ""]
     if not shown:
@@ -2648,7 +2691,7 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
         for sign, amount, label, date_label in shown_rows:
             lines.append(f'{sign:<1}  {amount:>{amount_width}}  {html.escape(label):<{label_width}}  {date_label}')
         lines.append("</pre>")
-    selected = budget_period_label(date_from, date_to)
+    selected = budget_period_label(chat_id, date_from, date_to)
     def period_button(label, action):
         return InlineKeyboardButton(("● " if selected == label else "") + label, callback_data=action)
     controls = [
@@ -2665,7 +2708,7 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
 
 
 async def list_expenses(update,context):
-    today = datetime.now(TZ).date()
+    today = datetime.now(timezone_for(update.effective_chat.id)).date()
     text, markup = budget_page(update.effective_chat.id, today.replace(day=1).isoformat(), today.isoformat())
     await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -2676,6 +2719,7 @@ def button_rows(buttons, width=4):
 
 
 def reminders_page(chat_id, page=0, page_size=6):
+    chat_tz = timezone_for(chat_id)
     with conn() as c:
         rs = c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",
                        (chat_id,)).fetchall()
@@ -2687,7 +2731,7 @@ def reminders_page(chat_id, page=0, page_size=6):
     lines = [f"⏰ Напоминания · {page + 1}/{pages}"]
     buttons = []
     for r in rs[:20]:
-        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(TZ)
+        dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(chat_tz)
         suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
         lines.append(f'<code>#{r["id"]}</code> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
         buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}:{page}'))
@@ -2771,7 +2815,7 @@ async def notes(update,context, page=0):
 def plan_page(chat_id, day, page=0, page_size=12):
     d = get_plan_for_date(chat_id, day)
     selected = datetime.fromisoformat(day).date()
-    today = datetime.now(TZ).date()
+    today = datetime.now(timezone_for(chat_id)).date()
     heading = "📅 Сегодня" if selected == today else f"📅 {selected:%d.%m.%Y}"
     entries = [("task", task) for task in d["tasks"]] + [("reminder", reminder) for reminder in d["reminders"]]
     def entry_sort_key(item):
@@ -2786,7 +2830,6 @@ def plan_page(chat_id, day, page=0, page_size=12):
     lines = [f"{heading} · {page + 1}/{pages}"]
     buttons = []
     task_toggle_buttons = []
-    reminder_buttons = []
     active_heading_added = False
     completed_heading_added = False
     for entry_type, entry in entries:
@@ -2816,14 +2859,9 @@ def plan_page(chat_id, day, page=0, page_size=12):
                 lines.append("\n<b>Предстоящие</b>")
                 active_heading_added = True
             marker = "✅" if reminder["acknowledged"] else "◻️"
-            lines.append(f'{marker} <code>#{reminder["id"]}</code> · {reminder["time"]} · напом. — {html.escape(reminder["text"])}')
-            toggle_icon = "✅" if reminder["acknowledged"] else "◻️"
-            reminder_buttons.append(InlineKeyboardButton(
-                f"{toggle_icon} #{reminder['id']}", callback_data=f"remtoggle:{reminder['id']}:{day}:{page}"))
+            lines.append(f'{marker} {reminder["time"]} — {html.escape(reminder["text"])}')
     if task_toggle_buttons:
-        lines.append("\nНажмите на кнопку задачи: ◻️ → ✅ → ◻️.")
         buttons.extend(button_rows(task_toggle_buttons, 4))
-    buttons.extend(button_rows(reminder_buttons, 4))
     if len(lines) == 1:
         lines.append("Пока ничего нет.")
     previous = (selected - timedelta(days=1)).isoformat()
@@ -2841,7 +2879,7 @@ def plan_page(chat_id, day, page=0, page_size=12):
 
 
 async def today_plan(update,context, day=None):
-    day = day or datetime.now(TZ).date().isoformat()
+    day = day or datetime.now(timezone_for(update.effective_chat.id)).date().isoformat()
     text, markup = plan_page(update.effective_chat.id, day)
     await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -2995,7 +3033,7 @@ async def callback(update,context):
         return await list_expenses(update, context)
     if q.data.startswith("budget:"):
         action = q.data.split(":", 1)[1]
-        today = datetime.now(TZ).date()
+        today = datetime.now(timezone_for(q.message.chat_id)).date()
         if action == "noop":
             return
         if action == "pick":
@@ -3210,7 +3248,7 @@ async def callback(update,context):
                       (reminder_id, q.message.chat_id))
         return await q.edit_message_text("✅ Отмечено как выполненное.")
     if q.data == "settings:status":
-        return await q.edit_message_text(status_text(q.message.chat_id))
+        return await q.edit_message_text(status_text(q.message.chat_id), parse_mode="HTML")
     if q.data == "settings:keys":
         text, markup = api_keys_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -3283,12 +3321,15 @@ async def callback(update,context):
 
 
 def settings_keyboard():
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🧠 Модель", callback_data="settings:model"), InlineKeyboardButton("👁 Vision", callback_data="settings:vision")],
         [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
         [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
         [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status"), InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
-    ])
+    ]
+    if QUICK_ACTIONS_BASE_URL:
+        rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
+    return InlineKeyboardMarkup(rows)
 
 
 def iphone_settings_page(chat_id):
@@ -3413,11 +3454,12 @@ def mode_keyboard(chat_id):
 def status_text(chat_id):
     selected = model_router().resolve(chat_id, "chat")
     key_source = "личный" if has_personal_api_key(chat_id) else "общий"
-    return (f"Build: {BUILD_ID}\n"
-            f"Model: {selected['primary']}\nVision: {vision_models_for(chat_id)[0]}\n"
+    return ("<b>Noema активна</b>\n"
+            f"Model: <code>{html.escape(selected['primary'])}</code>\n"
+            f"Vision: <code>{html.escape(vision_models_for(chat_id)[0])}</code>\n"
             f"Ключ для AI: {key_source}\n"
-            f"Mode: {get_mode(chat_id)}\nTimezone: {TZ_NAME}\n"
-            f"Storage: {PERSISTENT_ROOT}")
+            f"Mode: {html.escape(get_mode(chat_id))}\n"
+            f"Timezone: {html.escape(timezone_name_for(chat_id))}")
 
 
 
@@ -3462,7 +3504,8 @@ def build_briefing(chat_id):
 
     cfg=dict(cfg) if cfg else {"city":DEFAULT_CITY,"topics":"главные новости, ИИ, бизнес"}
 
-    now = datetime.now(TZ)
+    chat_tz = timezone_for(chat_id)
+    now = datetime.now(chat_tz)
     plan=get_today_plan(chat_id); weather=get_weather_live(cfg.get("city") or DEFAULT_CITY)
 
     topics=[x.strip() for x in (cfg.get("topics") or "главные новости").split(",") if x.strip()]
@@ -3490,12 +3533,12 @@ def build_briefing(chat_id):
                 try:
                     due_dt = datetime.fromisoformat(due.replace("Z", "+00:00")) if timed else None
                     if due_dt and due_dt.tzinfo is None:
-                        due_dt = due_dt.replace(tzinfo=TZ)
+                        due_dt = due_dt.replace(tzinfo=chat_tz)
                 except ValueError:
                     due_dt = None
                 is_old_date = bool(due) and due[:10] < now.date().isoformat()
-                if (not due_dt or due_dt.astimezone(TZ) >= now) and not is_old_date:
-                    time_label = f' · {due_dt.astimezone(TZ):%H:%M}' if due_dt else ""
+                if (not due_dt or due_dt.astimezone(chat_tz) >= now) and not is_old_date:
+                    time_label = f' · {due_dt.astimezone(chat_tz):%H:%M}' if due_dt else ""
                     lines.append("• "+html.escape(t["text"]) + time_label)
 
         for r in plan["reminders"][:5]: lines.append(f'• {r["time"]} — {html.escape(r["text"])}')
@@ -3507,8 +3550,8 @@ def build_briefing(chat_id):
             try:
                 due_dt = datetime.fromisoformat(str(t["due_date"]).replace("Z", "+00:00"))
                 if due_dt.tzinfo is None:
-                    due_dt = due_dt.replace(tzinfo=TZ)
-                if due_dt.astimezone(TZ) < now:
+                    due_dt = due_dt.replace(tzinfo=chat_tz)
+                if due_dt.astimezone(chat_tz) < now:
                     overdue.append(t)
             except ValueError:
                 pass
@@ -3550,13 +3593,14 @@ async def text_handler(update,context):
 
     if context.user_data.pop("awaiting_task_text", False):
         raw = t.strip()
-        due_date = datetime.now(TZ).date().isoformat()
+        chat_tz = timezone_for(cid)
+        due_date = datetime.now(chat_tz).date().isoformat()
         match = re.match(r"^(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)\s*[—–-]\s*(.+)$", raw)
         if match:
             date_text, raw = match.groups()
             try:
                 if len(date_text) == 5:
-                    due_date = datetime.strptime(date_text + f".{datetime.now(TZ).year}", "%d.%m.%Y").date().isoformat()
+                    due_date = datetime.strptime(date_text + f".{datetime.now(chat_tz).year}", "%d.%m.%Y").date().isoformat()
                 else:
                     due_date = datetime.strptime(date_text, "%d.%m.%Y" if len(date_text) == 10 else "%d.%m.%y").date().isoformat()
             except ValueError:
@@ -3668,7 +3712,7 @@ async def text_handler(update,context):
     if t=="⚙️ Статус":
 
         return await update.effective_message.reply_text(
-            status_text(cid)
+            status_text(cid), parse_mode="HTML"
         )
 
     if t=="🧹 Очистить диалог":
@@ -3913,14 +3957,12 @@ async def reminder_tick(context):
 
 
 async def briefing_tick(context):
-
-    now=datetime.now(TZ); today=now.date().isoformat()
-
     with conn() as c: rows=c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()
 
     for row in rows:
 
         cfg=dict(row)
+        now = datetime.now(timezone_for(cfg["chat_id"])); today = now.date().isoformat()
 
         if cfg.get("last_sent_date")==today: continue
 
@@ -3960,7 +4002,7 @@ def quick_action_result(chat_id, action, payload):
         open_reminders = sum(1 for item in plan["reminders"] if not item["acknowledged"])
         return True, f"📅 На сегодня: задач — {open_tasks}, напоминаний — {open_reminders}."
     if action == "break":
-        save_reminder(chat_id, "Вернуться к делам после перерыва", (datetime.now(TZ) + timedelta(minutes=10)).isoformat())
+        save_reminder(chat_id, "Вернуться к делам после перерыва", (datetime.now(timezone_for(chat_id)) + timedelta(minutes=10)).isoformat())
         return True, "🧘 Перерыв отмечен. Напомню вернуться к делам через 10 минут."
     return False, "Неизвестное быстрое действие."
 
@@ -4079,6 +4121,40 @@ async def health_check(request):
     return web.json_response({"ok": True, "build": BUILD_ID})
 
 
+def valid_webapp_user(init_data):
+    """Return the Telegram Web App user only when Telegram signed the payload."""
+    try:
+        pairs = dict(parse_qsl(str(init_data or ""), keep_blank_values=True))
+        received_hash = pairs.pop("hash")
+        check = "\n".join(f"{key}={pairs[key]}" for key in sorted(pairs))
+        secret = hmac.new(b"WebAppData", TG.encode(), hashlib.sha256).digest()
+        expected = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(received_hash, expected):
+            return None
+        auth_date = int(pairs.get("auth_date") or 0)
+        if auth_date < int(time.time()) - 86400:
+            return None
+        return json.loads(pairs.get("user") or "{}")
+    except Exception:
+        return None
+
+
+async def timezone_page(request):
+    return web.Response(text="""<!doctype html><html lang=\"ru\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><script src=\"https://telegram.org/js/telegram-web-app.js\"></script><style>body{font:17px -apple-system,BlinkMacSystemFont,sans-serif;background:#17212b;color:#fff;padding:32px;text-align:center}p{opacity:.8}</style><body><h3>Определяю часовой пояс…</h3><p>Это займёт секунду.</p><script>(async()=>{const app=window.Telegram&&Telegram.WebApp;const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;try{const r=await fetch('/api/v1/timezone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:app&&app.initData,timezone:tz})});const d=await r.json();document.body.innerHTML=d.ok?'<h3>✓ Часовой пояс сохранён</h3><p>'+d.timezone+'</p>':'<h3>Не удалось определить пояс</h3><p>Закройте окно и попробуйте ещё раз.</p>'}catch(e){document.body.innerHTML='<h3>Нет соединения</h3><p>Попробуйте ещё раз.</p>'}finally{app&&app.ready()}})()</script></body></html>""", content_type="text/html")
+
+
+async def save_webapp_timezone(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_request"}, status=400)
+    user = valid_webapp_user(payload.get("init_data"))
+    if not user or not user.get("id"):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    result = set_user_timezone(int(user["id"]), payload.get("timezone"))
+    return web.json_response({"ok": bool(result.get("ok")), "timezone": result.get("timezone", "")}, status=200 if result.get("ok") else 400)
+
+
 async def telegram_error_handler(update, context):
     """Keep unexpected callback errors visible in the operator log."""
     LOGGER.exception("Unhandled Telegram update", exc_info=context.error)
@@ -4088,6 +4164,8 @@ async def start_quick_actions_server(telegram_app):
     server = web.Application(client_max_size=MAX_FILE_MB * 1024 * 1024)
     server["telegram_app"] = telegram_app
     server.router.add_get("/healthz", health_check)
+    server.router.add_get("/timezone", timezone_page)
+    server.router.add_post("/api/v1/timezone", save_webapp_timezone)
     server.router.add_post("/api/v1/quick-actions/run", quick_actions_run)
     server.router.add_post("/api/v1/quick-actions/upload", quick_actions_upload)
     runner = web.AppRunner(server)
