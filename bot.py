@@ -1155,12 +1155,20 @@ def get_today_plan(chat_id):
 
 
 def set_task_status(chat_id, task_id, status):
-    if status not in ("done", "failed"):
+    if status not in ("open", "done", "failed"):
         return {"ok": False, "error": "invalid_status"}
     with conn() as c:
         cur = c.execute("UPDATE tasks SET status=?, completed_at=? WHERE id=? AND chat_id=?",
-                        (status, datetime.now(timezone.utc).isoformat(), task_id, chat_id))
+                        (status, "" if status == "open" else datetime.now(timezone.utc).isoformat(), task_id, chat_id))
     return {"ok": True, "updated": cur.rowcount}
+
+
+def toggle_task_status(chat_id, task_id):
+    with conn() as c:
+        row = c.execute("SELECT status FROM tasks WHERE id=? AND chat_id=?", (task_id, chat_id)).fetchone()
+    if not row:
+        return {"ok": False, "error": "not_found"}
+    return set_task_status(chat_id, task_id, "open" if row["status"] == "done" else "done")
 
 
 
@@ -2301,17 +2309,18 @@ def plan_page(chat_id, day):
     heading = "📅 Сегодня" if selected == today else f"📅 {selected:%d.%m.%Y}"
     lines = [heading]
     buttons = []
+    task_toggle_buttons = []
     for task in d["tasks"]:
         status = task["status"]
         marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
         late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
         lines.append(f'{marker} #{task["id"]} — {task["text"]}{late}')
-        if status == "open":
-            label = " ".join(task["text"].split())[:20]
-            buttons.append([
-                InlineKeyboardButton(f"✅ #{task['id']} · {label}", callback_data=f"taskdone:{task['id']}:{day}"),
-                InlineKeyboardButton(f"❌ #{task['id']} · {label}", callback_data=f"taskfail:{task['id']}:{day}"),
-            ])
+        toggle_icon = "✅" if status == "done" else "◻️"
+        task_toggle_buttons.append(InlineKeyboardButton(
+            f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}"))
+    if task_toggle_buttons:
+        lines.append("\nНажмите на квадратик, чтобы отметить или вернуть задачу.")
+        buttons.extend(button_rows(task_toggle_buttons, 3))
     for reminder in d["reminders"]:
         marker = "✅" if reminder["acknowledged"] else "◻️"
         lines.append(f'{marker} #{reminder["id"]} · {reminder["time"]} — {reminder["text"]}')
@@ -2429,6 +2438,11 @@ async def callback(update,context):
     if q.data.startswith(("taskdone:", "taskfail:")):
         action, task_id, day = q.data.split(":")
         set_task_status(q.message.chat_id, int(task_id), "done" if action == "taskdone" else "failed")
+        text, markup = plan_page(q.message.chat_id, day)
+        return await q.edit_message_text(text, reply_markup=markup)
+    if q.data.startswith("tasktoggle:"):
+        _, task_id, day = q.data.split(":")
+        toggle_task_status(q.message.chat_id, int(task_id))
         text, markup = plan_page(q.message.chat_id, day)
         return await q.edit_message_text(text, reply_markup=markup)
     if q.data.startswith("remdone:"):
