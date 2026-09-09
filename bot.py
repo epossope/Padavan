@@ -76,7 +76,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "prod-ui-2026-09-09.9"
+BUILD_ID = "prod-ui-2026-09-09.10"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -2762,7 +2762,7 @@ def plan_page(chat_id, day, page=0, page_size=8):
             lines.append(f'{marker} <code>#{task["id"]}</code> — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
             task_toggle_buttons.append(InlineKeyboardButton(
-                f"{toggle_icon} Задача #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
+                f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
         else:
             reminder = entry
             if not reminder_heading_added:
