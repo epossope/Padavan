@@ -3168,7 +3168,8 @@ async def callback(update,context):
             f"<code>{quick_action_token(device_id, 'action', secret)}</code>"
         )
         return await q.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Разные действия для кнопок", callback_data=f"iphone:device:{device_id}")],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Установить голосовую команду", url="https://www.icloud.com/shortcuts/a5175e667221475685ca604ef11a7a4e")],
+                                                [InlineKeyboardButton("⚙️ Разные действия для кнопок", callback_data=f"iphone:device:{device_id}")],
                                                 [InlineKeyboardButton("‹ iPhone", callback_data=f"iphone:shortcut:{device_id}")]]))
     if q.data.startswith("iphone:share:"):
         device_id = q.data.split(":", 2)[2]
@@ -3183,7 +3184,8 @@ async def callback(update,context):
             f"<code>{quick_action_token(device_id, 'share', secret)}</code>"
         )
         return await q.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ iPhone", callback_data=f"iphone:shortcut:{device_id}")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ Установить «Поделиться в Noema»", url="https://www.icloud.com/shortcuts/b06c60cf744b43f6a766b5ff0395ca07")],
+                                                [InlineKeyboardButton("‹ iPhone", callback_data=f"iphone:shortcut:{device_id}")]]))
     if q.data.startswith("iphone:shortcut:"):
         device_id = q.data.split(":", 2)[2]
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
