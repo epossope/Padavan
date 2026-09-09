@@ -76,7 +76,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "prod-ui-2026-09-09.10"
+BUILD_ID = "prod-ui-2026-09-09.13"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -159,7 +159,7 @@ TOOLS = [
 
         "name":"set_reminder",
 
-        "description":"Создать реальное напоминание. Если время можно разумно определить, не спрашивать подтверждение.",
+        "description":"Создать реальное напоминание с уведомлением в точное время. Используй, когда пользователь указал время или просит, чтобы бот сам напомнил. Если время можно разумно определить, не спрашивать подтверждение.",
 
         "parameters":{"type":"object","properties":{"text":{"type":"string"},"remind_at":{"type":"string"}},"required":["text","remind_at"]}
 
@@ -179,7 +179,7 @@ TOOLS = [
 
         "name":"add_task",
 
-        "description":"Создать задачу.",
+        "description":"Создать задачу (дело на день без самостоятельного уведомления). Если пользователь указал точное время и ждёт сигнал от бота, используй set_reminder вместо add_task.",
 
         "parameters":{"type":"object","properties":{"text":{"type":"string"},"due_date":{"type":"string"},"priority":{"type":"string"}},"required":["text"]}
 
@@ -915,7 +915,7 @@ def ensure_behavior_rules(chat_id):
 
 
 QUICK_ACTIONS = {
-    "note": "📝 Голосовая заметка",
+    "note": "💬 Сообщение Noema",
     "complete_next": "✅ Выполнить ближайшую задачу",
     "today": "📅 Что осталось сегодня",
     "break": "🧘 Начать перерыв",
@@ -2707,6 +2707,39 @@ async def reminders(update,context):
 
 
 
+def tasks_page(chat_id, page=0, page_size=8):
+    with conn() as c:
+        total = c.execute("SELECT COUNT(*) FROM tasks WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, pages - 1))
+        rows = c.execute("""SELECT id,text,due_date,status FROM tasks WHERE chat_id=?
+                         ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END, due_date, id DESC
+                         LIMIT ? OFFSET ?""", (chat_id, page_size, page * page_size)).fetchall()
+    if not rows:
+        return "✅ Задач пока нет.", InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")]])
+    lines = [f"✅ Задачи · {page + 1}/{pages}"]
+    delete_buttons = []
+    for row in rows:
+        icon = "◻️" if row["status"] == "open" else "✅"
+        date = f" · {row['due_date'][8:10]}.{row['due_date'][5:7]}" if len(row["due_date"] or "") >= 10 else ""
+        lines.append(f"{icon} <code>#{row['id']}</code> — {html.escape(row['text'])}{date}")
+        delete_buttons.append(InlineKeyboardButton(f"🗑 #{row['id']}", callback_data=f"deltaskask:{row['id']}:{page}"))
+    buttons = button_rows(delete_buttons)
+    if pages > 1:
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"tasks:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="tasks:noop"))
+        if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"tasks:page:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def tasks(update, context, page=0):
+    text, markup = tasks_page(update.effective_chat.id, page)
+    await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
 def notes_page(chat_id, page=0, page_size=6):
     with conn() as c:
         total = c.execute("SELECT COUNT(*) FROM notes WHERE chat_id=?", (chat_id,)).fetchone()[0]
@@ -2735,12 +2768,18 @@ async def notes(update,context, page=0):
 
 
 
-def plan_page(chat_id, day, page=0, page_size=8):
+def plan_page(chat_id, day, page=0, page_size=12):
     d = get_plan_for_date(chat_id, day)
     selected = datetime.fromisoformat(day).date()
     today = datetime.now(TZ).date()
     heading = "📅 Сегодня" if selected == today else f"📅 {selected:%d.%m.%Y}"
     entries = [("task", task) for task in d["tasks"]] + [("reminder", reminder) for reminder in d["reminders"]]
+    def entry_sort_key(item):
+        kind, value = item
+        completed = value.get("status") != "open" if kind == "task" else bool(value.get("acknowledged"))
+        when = (value.get("due_date") or "") if kind == "task" else value.get("time") or ""
+        return (1 if completed else 0, when, value.get("id", 0))
+    entries.sort(key=entry_sort_key)
     pages = max(1, (len(entries) + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
     entries = entries[page * page_size:(page + 1) * page_size]
@@ -2748,31 +2787,39 @@ def plan_page(chat_id, day, page=0, page_size=8):
     buttons = []
     task_toggle_buttons = []
     reminder_buttons = []
-    task_heading_added = False
-    reminder_heading_added = False
+    active_heading_added = False
+    completed_heading_added = False
     for entry_type, entry in entries:
         if entry_type == "task":
             task = entry
-            if not task_heading_added:
-                lines.append("\n<b>Задачи</b>")
-                task_heading_added = True
             status = task["status"]
+            is_completed = status != "open"
+            if is_completed and not completed_heading_added:
+                lines.append("\n<b>Выполнено</b>")
+                completed_heading_added = True
+            elif not is_completed and not active_heading_added:
+                lines.append("\n<b>Предстоящие</b>")
+                active_heading_added = True
             marker = {"open": "◻️", "done": "✅", "failed": "❌"}.get(status, "◻️")
             late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
-            lines.append(f'{marker} <code>#{task["id"]}</code> — {html.escape(task["text"])}{late}')
+            lines.append(f'{marker} <code>#{task["id"]}</code> · задача — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
             task_toggle_buttons.append(InlineKeyboardButton(
                 f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
         else:
             reminder = entry
-            if not reminder_heading_added:
-                lines.append("\n<b>Напоминания</b>")
-                reminder_heading_added = True
+            is_completed = bool(reminder["acknowledged"])
+            if is_completed and not completed_heading_added:
+                lines.append("\n<b>Выполнено</b>")
+                completed_heading_added = True
+            elif not is_completed and not active_heading_added:
+                lines.append("\n<b>Предстоящие</b>")
+                active_heading_added = True
             marker = "✅" if reminder["acknowledged"] else "◻️"
-            lines.append(f'{marker} <code>#{reminder["id"]}</code> · {reminder["time"]} — {html.escape(reminder["text"])}')
-            if not reminder["acknowledged"]:
-                reminder_buttons.append(InlineKeyboardButton(
-                    f"✅ Напом. #{reminder['id']}", callback_data=f"remdone:{reminder['id']}:{day}:{page}"))
+            lines.append(f'{marker} <code>#{reminder["id"]}</code> · {reminder["time"]} · напом. — {html.escape(reminder["text"])}')
+            toggle_icon = "✅" if reminder["acknowledged"] else "◻️"
+            reminder_buttons.append(InlineKeyboardButton(
+                f"{toggle_icon} #{reminder['id']}", callback_data=f"remtoggle:{reminder['id']}:{day}:{page}"))
     if task_toggle_buttons:
         lines.append("\nНажмите на кнопку задачи: ◻️ → ✅ → ◻️.")
         buttons.extend(button_rows(task_toggle_buttons, 4))
@@ -2924,6 +2971,26 @@ async def callback(update,context):
 
     if q.data == "menu:reminders":
         return await reminders(update, context)
+    if q.data == "menu:tasks":
+        return await tasks(update, context)
+    if q.data == "tasks:add":
+        context.user_data["awaiting_task_text"] = True
+        return await q.message.reply_text("Напишите задачу. Можно добавить дату: <code>12.09 — позвонить врачу</code>. Без даты поставлю на сегодня.", parse_mode="HTML")
+    if q.data.startswith("tasks:page:"):
+        page = int(q.data.rsplit(":", 1)[1])
+        text, markup = tasks_page(q.message.chat_id, page)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data.startswith("deltaskask:"):
+        _, task_id, page = q.data.split(":")
+        return await q.edit_message_text(f"Удалить задачу #{task_id}?", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"deltask:{task_id}:{page}"),
+             InlineKeyboardButton("Отмена", callback_data=f"tasks:page:{page}")],
+        ]))
+    if q.data.startswith("deltask:"):
+        _, task_id, page = q.data.split(":")
+        delete_task(q.message.chat_id, int(task_id))
+        text, markup = tasks_page(q.message.chat_id, int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data in ("menu:expenses", "menu:budget"):
         return await list_expenses(update, context)
     if q.data.startswith("budget:"):
@@ -2981,6 +3048,17 @@ async def callback(update,context):
     if q.data.startswith("tasktoggle:"):
         _, task_id, day, page = q.data.split(":")
         toggle_task_status(q.message.chat_id, int(task_id))
+        text, markup = plan_page(q.message.chat_id, day, int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data.startswith("remtoggle:"):
+        _, reminder_id, day, page = q.data.split(":")
+        with conn() as c:
+            row = c.execute("SELECT acknowledged,sent FROM reminders WHERE id=? AND chat_id=?", (int(reminder_id), q.message.chat_id)).fetchone()
+            if row:
+                acknowledged = 0 if row["acknowledged"] else 1
+                next_followup = "" if acknowledged else ((datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat() if row["sent"] else "")
+                c.execute("UPDATE reminders SET acknowledged=?, next_followup_at=? WHERE id=? AND chat_id=?",
+                          (acknowledged, next_followup, int(reminder_id), q.message.chat_id))
         text, markup = plan_page(q.message.chat_id, day, int(page))
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("remdone:"):
@@ -3470,6 +3548,24 @@ async def text_handler(update,context):
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
     register_bot_user(cid, getattr(update, "effective_user", None))
 
+    if context.user_data.pop("awaiting_task_text", False):
+        raw = t.strip()
+        due_date = datetime.now(TZ).date().isoformat()
+        match = re.match(r"^(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)\s*[—–-]\s*(.+)$", raw)
+        if match:
+            date_text, raw = match.groups()
+            try:
+                if len(date_text) == 5:
+                    due_date = datetime.strptime(date_text + f".{datetime.now(TZ).year}", "%d.%m.%Y").date().isoformat()
+                else:
+                    due_date = datetime.strptime(date_text, "%d.%m.%Y" if len(date_text) == 10 else "%d.%m.%y").date().isoformat()
+            except ValueError:
+                return await update.effective_message.reply_text("Не поняла дату. Пример: <code>12.09 — позвонить врачу</code>.", parse_mode="HTML")
+        if not raw:
+            return await update.effective_message.reply_text("Напишите текст задачи.")
+        result = add_task(cid, raw, due_date)
+        return await update.effective_message.reply_text(f"✅ Задача <code>#{result['id']}</code> добавлена на {due_date[8:10]}.{due_date[5:7]}.", parse_mode="HTML")
+
     if context.user_data.pop("awaiting_personal_api_key", False):
         if not t.startswith("sk-or-") or len(t) < 24:
             return await update.effective_message.reply_text("Это не похоже на ключ OpenRouter. Попробуйте ещё раз или откройте «Настройки → API-ключи».")
@@ -3539,8 +3635,9 @@ async def text_handler(update,context):
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Задачи", callback_data="menu:tasks"), InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
                 [InlineKeyboardButton("👥 Люди", callback_data="menu:people"), InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
-                [InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders"), InlineKeyboardButton("💳 Бюджет", callback_data="menu:budget")],
+                [InlineKeyboardButton("💳 Бюджет", callback_data="menu:budget")],
             ]))
 
     if t=="📚 Знания":
@@ -3845,9 +3942,11 @@ def quick_action_result(chat_id, action, payload):
     if action == "note":
         text = str(payload.get("text") or "").strip()
         if not text:
-            return False, "Для заметки нужен текст."
-        save_note(chat_id, text, "Быстрая заметка")
-        return True, "📝 Быстрая заметка сохранена."
+            return False, "Не получила текст с iPhone."
+        # A voice shortcut is a normal Noema message, not an automatic note.
+        # The assistant decides from the spoken phrase whether to answer, save a
+        # note, create a task, reminder, budget item, and so on.
+        return True, ask(chat_id, text)
     if action == "complete_next":
         plan = get_today_plan(chat_id)
         task = next((item for item in plan["tasks"] if item["status"] == "open"), None)
@@ -3935,7 +4034,7 @@ async def quick_actions_run(request):
         if not binding:
             return web.json_response({"ok": False, "error": "not_configured"}, status=409)
         c.execute("UPDATE quick_action_devices SET last_used_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), device_id))
-    ok, message = quick_action_result(device["chat_id"], binding["action"], payload)
+    ok, message = await asyncio.to_thread(quick_action_result, device["chat_id"], binding["action"], payload)
     return await send_quick_action_feedback(request, device["chat_id"], ok, message)
 
 
