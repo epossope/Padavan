@@ -445,10 +445,11 @@ def find_photos(chat_id, name, limit=5):
     out = []
     for it in items:
         for f in get_pipeline().store.item_files(it["id"]):
-            if (f.get("mime_type") or "").startswith("image/") and f.get("local_path"):
+            if (f.get("mime_type") or "").startswith("image/") and (f.get("local_path") or f.get("telegram_file_id")):
                 out.append({"item_id": it["id"], "local_path": f["local_path"],
                             "summary": it.get("summary") or it.get("title") or "",
-                            "file_row": f.get("id")})
+                            "file_row": f.get("id"),
+                            "telegram_file_id": f.get("telegram_file_id") or ""})
     return out
 
 
@@ -2305,7 +2306,7 @@ async def text_handler(update,context):
 
     # knowledge photo retrieval: «покажи фото Ричи»
 
-    pm=re.match(r"(?:покажи|найди)\s+(?:фото|картинк\w*|изображен\w*)\s+(.+)$", t, re.I)
+    pm=re.match(r"(?:покажи|пришли|отправь|дай|найди)\s+(?:(?:мне|пожалуйста)\s+)?(?:(?:фото|фотку|картинк\w*|изображен\w*|снимок)\s+)?(.+)$", t, re.I)
 
     if pm:
 
@@ -2319,9 +2320,12 @@ async def text_handler(update,context):
 
             try:
 
-                with Path(first["local_path"]).open("rb") as fh:
-
-                    await update.effective_message.reply_photo(photo=fh, caption=(first.get("summary") or "")[:200])
+                caption = (first.get("summary") or "")[:200]
+                if first.get("telegram_file_id"):
+                    await update.effective_message.reply_photo(photo=first["telegram_file_id"], caption=caption)
+                else:
+                    with Path(first["local_path"]).open("rb") as fh:
+                        await update.effective_message.reply_photo(photo=fh, caption=caption)
 
                 return
 

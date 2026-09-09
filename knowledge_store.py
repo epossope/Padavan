@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -487,13 +488,26 @@ class KnowledgeStore(KnowledgeSearch):
         q += " ORDER BY id DESC LIMIT 200"
         with self._connect() as c:
             rows = c.execute(q, args).fetchall()
-        needle = name.lower()
+        needle = name.lower().replace("ё", "е")
+        query_words = [w for w in re.findall(r"[a-zа-яё]{3,}", needle, re.I)
+                       if w not in {"фото", "фотку", "картинку", "изображение", "попугая", "собаку", "кошку"}]
+
+        def close_word(a, b):
+            if a == b or a in b or b in a:
+                return True
+            # Russian name cases: "Кеша" / "Кешу", "Ричи" stays exact.
+            return len(a) >= 4 and len(b) >= 4 and a[:-1] == b[:-1]
+
         out = []
         for r in rows:
             d = self._row_to_item(r)
-            blob = (d.get("searchable_text") or "") + " " + \
-                json.dumps(d.get("entities") or [], ensure_ascii=False)
-            if needle in blob.lower():
+            names = [str(e.get("name") or "").lower().replace("ё", "е")
+                     for e in d.get("entities") or [] if isinstance(e, dict)]
+            direct = any(needle in entity_name for entity_name in names)
+            token_match = any(close_word(word, entity_word)
+                              for word in query_words for entity_name in names
+                              for entity_word in re.findall(r"[a-zа-яё]{3,}", entity_name, re.I))
+            if direct or token_match:
                 out.append(d)
                 if len(out) >= limit:
                     break
