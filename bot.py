@@ -1134,7 +1134,7 @@ def get_plan_for_date(chat_id, day):
     with conn() as c:
         # Tasks without a date are actionable today, but don't clutter every
         # calendar day.  A passed task remains open until the user decides it.
-        where = "due_date=?" if selected != today else "(due_date='' OR due_date<=?)"
+        where = "substr(due_date,1,10)=?" if selected != today else "(due_date='' OR substr(due_date,1,10)<=?)"
         tasks = [dict(r) for r in c.execute(
             f"SELECT id,text,due_date,priority,status FROM tasks WHERE chat_id=? AND {where} ORDER BY due_date,id",
             (chat_id, day)).fetchall()]
@@ -2559,9 +2559,39 @@ def build_briefing(chat_id):
 
         for t in plan["tasks"][:5]:
             if t["status"] == "open":
-                lines.append("• "+html.escape(t["text"]))
+                due = str(t.get("due_date") or "")
+                # A date-only task remains relevant for the whole day.  A task
+                # with an exact time moves to the separate overdue section.
+                timed = len(due) > 10
+                try:
+                    due_dt = datetime.fromisoformat(due.replace("Z", "+00:00")) if timed else None
+                    if due_dt and due_dt.tzinfo is None:
+                        due_dt = due_dt.replace(tzinfo=TZ)
+                except ValueError:
+                    due_dt = None
+                is_old_date = bool(due) and due[:10] < now.date().isoformat()
+                if (not due_dt or due_dt.astimezone(TZ) >= now) and not is_old_date:
+                    time_label = f' · {due_dt.astimezone(TZ):%H:%M}' if due_dt else ""
+                    lines.append("• "+html.escape(t["text"]) + time_label)
 
         for r in plan["reminders"][:5]: lines.append(f'• {r["time"]} — {html.escape(r["text"])}')
+
+        overdue = []
+        for t in plan["tasks"]:
+            if t["status"] != "open" or not str(t.get("due_date") or ""):
+                continue
+            try:
+                due_dt = datetime.fromisoformat(str(t["due_date"]).replace("Z", "+00:00"))
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=TZ)
+                if due_dt.astimezone(TZ) < now:
+                    overdue.append(t)
+            except ValueError:
+                pass
+        if overdue:
+            lines.append("\n⚠️ Не закрыто")
+            for t in overdue[:3]:
+                lines.append("• " + html.escape(t["text"]))
 
     if weather.get("ok"):
 
