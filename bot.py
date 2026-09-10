@@ -52,7 +52,7 @@ from ddgs import DDGS
 
 from dotenv import load_dotenv
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, WebAppInfo
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.error import BadRequest
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -131,11 +131,6 @@ STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 MANAGED_KEY_LOCK = threading.Lock()
 
 
-
-KB = ReplyKeyboardMarkup([
-    ["🌅 Брифинг", "📅 Сегодня"],
-    ["⚙️ Настройки", "☰ Ещё"],
-], resize_keyboard=True, is_persistent=True)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -729,6 +724,30 @@ def conn():
     c.row_factory = sqlite3.Row
 
     return c
+
+
+def app_setting(key, default=""):
+    with conn() as c:
+        row = c.execute("SELECT setting_value FROM app_settings WHERE setting_key=?", (key,)).fetchone()
+    return row["setting_value"] if row else default
+
+
+def set_app_setting(key, value):
+    with conn() as c:
+        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) "
+                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
+                  (key, value, datetime.now(timezone.utc).isoformat()))
+
+
+def main_keyboard():
+    """Build the persistent keyboard with an optional Telegram custom-emoji icon."""
+    calendar_id = app_setting("today_button_custom_emoji_id")
+    today = (KeyboardButton("Сегодня", icon_custom_emoji_id=calendar_id)
+             if calendar_id else KeyboardButton("📅 Сегодня"))
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("🌅 Брифинг"), today],
+        [KeyboardButton("⚙️ Настройки"), KeyboardButton("☰ Ещё")],
+    ], resize_keyboard=True, is_persistent=True)
 
 
 
@@ -2763,7 +2782,7 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
             # temporary activity card which is deleted after processing.
             kwargs = {"parse_mode": TelegramRenderer.parse_mode}
             if index == 0:
-                kwargs["reply_markup"] = KB
+                kwargs["reply_markup"] = main_keyboard()
             await update.effective_message.reply_text(chunk, **kwargs)
 
     if eff in ("voice","voice_and_text"):
@@ -2849,7 +2868,24 @@ async def start(update,context):
         asyncio.create_task(asyncio.to_thread(provision_managed_api_key, chat_id))
     await update.effective_message.reply_text(
         f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
-        reply_markup=KB, parse_mode="HTML")
+        reply_markup=main_keyboard(), parse_mode="HTML")
+
+
+async def set_today_emoji(update, context):
+    """Save a custom emoji supplied by the bot owner as the Today button icon."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    entity = next((item for item in (update.effective_message.entities or [])
+                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+    if not entity:
+        return await update.effective_message.reply_text(
+            "Пришли команду и живой эмодзи в одном сообщении:\n<code>/todayemoji 📆</code>\n\n"
+            "Важно: выбери именно анимированный премиум-эмодзи из панели Telegram, а не обычный символ.",
+            parse_mode="HTML")
+    set_app_setting("today_button_custom_emoji_id", entity.custom_emoji_id)
+    return await update.effective_message.reply_text(
+        "Готово — живой календарь установлен на кнопку «Сегодня».", reply_markup=main_keyboard())
 
 
 
@@ -4015,7 +4051,7 @@ async def text_handler(update,context):
 
     if t=="🔊 Голос+текст": set_mode(cid,"voice_and_text"); return await update.effective_message.reply_text("Режим: голос + текст.")
 
-    if t=="📅 Сегодня": return await today_plan(update,context)
+    if t in ("📅 Сегодня", "Сегодня"): return await today_plan(update,context)
 
     if t=="⏰ Напоминания": return await reminders(update,context)
 
@@ -4559,6 +4595,8 @@ async def main_async():
     app.add_error_handler(telegram_error_handler)
 
     app.add_handler(CommandHandler("start",start))
+
+    app.add_handler(CommandHandler("todayemoji", set_today_emoji))
 
     app.add_handler(CallbackQueryHandler(callback))
 
