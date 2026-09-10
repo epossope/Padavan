@@ -1205,7 +1205,11 @@ def provision_managed_api_key(chat_id):
             return existing
         with conn() as c:
             user = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
-        label = f"Noema user #{int(user['user_number']) if user else chat_id}"
+        number = int(user["user_number"]) if user else int(chat_id)
+        # This visible name is the bridge between the OpenRouter dashboard and
+        # the numbered people list in Noema. The provider's internal hash is
+        # deliberately not used as a user-facing number.
+        label = f"Noema · #{number:03d}"
         try:
             response = requests.post(
                 OPENROUTER_KEYS_URL,
@@ -1237,6 +1241,45 @@ def provision_managed_api_key(chat_id):
                       "ON CONFLICT(chat_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,key_hash=excluded.key_hash,key_hint=excluded.key_hint,limit_usd=excluded.limit_usd,active=1,updated_at=excluded.updated_at",
                       (chat_id, encrypted, key_hash, hint, USER_MONTHLY_LIMIT_USD, 1, now, now))
         return raw_key
+
+
+def sync_managed_key_labels():
+    """Make existing OpenRouter key names match Noema's stable user numbers."""
+    if not OR_MANAGEMENT_KEY:
+        return {"ok": False, "error": "management_key_missing"}
+    with conn() as c:
+        rows = [dict(row) for row in c.execute(
+            """SELECT m.key_hash, u.user_number FROM managed_api_keys m
+               JOIN bot_users u ON u.chat_id=m.chat_id
+               WHERE m.active=1 AND m.key_hash<>''"""
+        ).fetchall()]
+    if not rows:
+        return {"ok": True, "updated": 0}
+    headers = {"Authorization": f"Bearer {OR_MANAGEMENT_KEY}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(OPENROUTER_KEYS_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        remote = {str(key.get("hash") or ""): str(key.get("name") or "")
+                  for key in (response.json().get("data") or [])}
+    except (requests.RequestException, ValueError, TypeError):
+        LOGGER.warning("Could not load OpenRouter keys for label synchronization")
+        return {"ok": False, "error": "openrouter_unavailable"}
+    updated = 0
+    for row in rows:
+        desired = f"Noema · #{int(row['user_number']):03d}"
+        key_hash = row["key_hash"]
+        if remote.get(key_hash) == desired:
+            continue
+        try:
+            response = requests.patch(f"{OPENROUTER_KEYS_URL}/{key_hash}", headers=headers,
+                                      json={"name": desired}, timeout=30)
+            if response.ok:
+                updated += 1
+            else:
+                LOGGER.warning("Could not rename OpenRouter key %s: HTTP %s", key_hash[:8], response.status_code)
+        except requests.RequestException:
+            LOGGER.warning("Could not rename an OpenRouter key")
+    return {"ok": True, "updated": updated}
 
 
 def api_key_for_chat(chat_id):
@@ -3492,6 +3535,15 @@ async def callback(update,context):
             return await q.answer("Нет доступа.", show_alert=True)
         text, markup = shared_usage_users_page()
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    if q.data == "keys:sync_labels":
+        if q.message.chat_id not in ADMIN_CHAT_IDS:
+            return await q.answer("Нет доступа.", show_alert=True)
+        result = await asyncio.to_thread(sync_managed_key_labels)
+        if not result.get("ok"):
+            return await q.answer("Не удалось связаться с OpenRouter. Попробуйте позже.", show_alert=True)
+        text, markup = api_keys_page(q.message.chat_id)
+        await q.answer(f"Синхронизировано ключей: {int(result.get('updated') or 0)}")
+        return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     if q.data.startswith("keys:admin_users:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
@@ -3503,14 +3555,15 @@ async def callback(update,context):
     if q.data.startswith("keys:admin_user:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
-        _, _, _, user_number, page = q.data.split(":")
+        _, _, user_number, page = q.data.split(":")
         with conn() as c:
             user = c.execute("SELECT user_number,chat_id,username,display_name FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
         if not user:
             return await q.edit_message_text("Пользователь не найден.")
         user = dict(user)
-        rows = usage_summary(user["chat_id"], source="shared")
-        text = usage_text(rows, f'📊 <b>Общий ключ · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        rows = [row for row in usage_summary(user["chat_id"])
+                if row.get("source") in {"shared", "managed"}]
+        text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
             [InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")],
@@ -3625,6 +3678,7 @@ def api_keys_page(chat_id):
     else:
         state = "Автовыдача ждёт <code>USER_SECRETS_MASTER_KEY</code> для безопасного хранения ключей."
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
+               [InlineKeyboardButton("↻ Синхронизировать номера OpenRouter", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
     return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", InlineKeyboardMarkup(buttons)
 
@@ -3664,11 +3718,11 @@ def shared_usage_users_page(page=0, page_size=8):
     page = max(0, min(int(page), pages - 1))
     shown = users[page * page_size:(page + 1) * page_size]
     if not users:
-        return ("📈 <b>Общий ключ · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
+        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")]]))
     total_cost = sum(float(row["cost"] or 0) for row in users)
     total_requests = sum(int(row["requests"] or 0) for row in users)
-    lines = ["📈 <b>Общий ключ · пользователи</b>",
+    lines = ["📈 <b>Ключи Noema · пользователи</b>",
              f"Пользователей: <b>{len(users)}</b> · Запросов: <b>{total_requests:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", ""]
     buttons = []
     for row in shown:
