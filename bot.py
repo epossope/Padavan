@@ -739,14 +739,22 @@ def set_app_setting(key, value):
                   (key, value, datetime.now(timezone.utc).isoformat()))
 
 
+def interface_button(slot, fallback, text):
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    return KeyboardButton(text, icon_custom_emoji_id=emoji_id) if emoji_id else KeyboardButton(f"{fallback} {text}")
+
+
+def interface_inline_button(slot, fallback, text, callback_data):
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    return InlineKeyboardButton(text if emoji_id else f"{fallback} {text}", callback_data=callback_data,
+                                icon_custom_emoji_id=emoji_id or None)
+
+
 def main_keyboard():
-    """Build the persistent keyboard with an optional Telegram custom-emoji icon."""
-    calendar_id = app_setting("today_button_custom_emoji_id")
-    today = (KeyboardButton("Сегодня", icon_custom_emoji_id=calendar_id)
-             if calendar_id else KeyboardButton("📅 Сегодня"))
+    """Build the persistent keyboard with optional Telegram custom-emoji icons."""
     return ReplyKeyboardMarkup([
-        [KeyboardButton("🌅 Брифинг"), today],
-        [KeyboardButton("⚙️ Настройки"), KeyboardButton("☰ Ещё")],
+        [interface_button("briefing", "🌅", "Брифинг"), interface_button("today", "📅", "Сегодня")],
+        [interface_button("settings", "⚙️", "Настройки"), interface_button("more", "☰", "Ещё")],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -2951,7 +2959,7 @@ async def set_today_emoji(update, context):
             "Пришли команду и живой эмодзи в одном сообщении:\n<code>/todayemoji 📆</code>\n\n"
             "Важно: выбери именно анимированный премиум-эмодзи из панели Telegram, а не обычный символ.",
             parse_mode="HTML")
-    set_app_setting("today_button_custom_emoji_id", entity.custom_emoji_id)
+    set_app_setting("interface_today_custom_emoji_id", entity.custom_emoji_id)
     return await update.effective_message.reply_text(
         "Готово — живой календарь установлен на кнопку «Сегодня».", reply_markup=main_keyboard())
 
@@ -2961,18 +2969,36 @@ async def set_interface_emoji(update, context):
     chat_id = update.effective_chat.id
     if chat_id not in ADMIN_CHAT_IDS:
         return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
-    slots = {"open": "пустой квадрат задачи", "done": "выполненная задача"}
+    slots = {
+        "today": "кнопка «Сегодня»", "briefing": "кнопка «Брифинг»",
+        "settings": "кнопка «Настройки»", "more": "кнопка «Ещё»",
+        "tasks": "раздел «Задачи»", "reminders": "раздел «Напоминания»",
+        "people": "раздел «Люди»", "notes": "раздел «Заметки»", "budget": "раздел «Бюджет»",
+        "open": "пустой квадрат задачи", "done": "выполненная задача", "failed": "невыполненная задача",
+    }
     slot = (context.args[0].lower() if context.args else "")
     if slot not in slots:
         return await update.effective_message.reply_text(
-            "Формат: <code>/setemoji open ◻️</code> или <code>/setemoji done ✅</code>\n"
-            "После команды выбери живой эмодзи из Premium-панели.", parse_mode="HTML")
+            "Сначала отправь <code>/emojihelp</code> — там все доступные слоты.", parse_mode="HTML")
     entity = next((item for item in (update.effective_message.entities or [])
                    if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
     if not entity:
         return await update.effective_message.reply_text("Не вижу живого эмодзи. Выбери его из Premium-панели Telegram и отправь команду ещё раз.")
-    set_app_setting(f"task_{slot}_custom_emoji_id", entity.custom_emoji_id)
-    return await update.effective_message.reply_text(f"Готово — установлен значок «{slots[slot]}».")
+    key = f"task_{slot}_custom_emoji_id" if slot in {"open", "done", "failed"} else f"interface_{slot}_custom_emoji_id"
+    set_app_setting(key, entity.custom_emoji_id)
+    return await update.effective_message.reply_text(f"Готово — установлен значок «{slots[slot]}».", reply_markup=main_keyboard())
+
+
+async def emoji_help(update, context):
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return
+    return await update.effective_message.reply_text(
+        "<b>Живые эмодзи Noema</b>\n\n"
+        "Главное меню: <code>today</code>, <code>briefing</code>, <code>settings</code>, <code>more</code>.\n"
+        "Раздел «Ещё»: <code>tasks</code>, <code>reminders</code>, <code>people</code>, <code>notes</code>, <code>budget</code>.\n"
+        "Задачи: <code>open</code>, <code>done</code>, <code>failed</code>.\n\n"
+        "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.",
+        parse_mode="HTML")
 
 
 
@@ -4139,15 +4165,15 @@ async def text_handler(update,context):
             f"Добавила модель: {model}\nОткройте «⚙️ Настройки → 🧠 Модель» и выберите её.",
             reply_markup=settings_keyboard(cid))
 
-    if t=="⚙️ Настройки":
+    if t in ("⚙️ Настройки", "Настройки"):
         return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard(cid))
 
-    if t=="☰ Ещё":
+    if t in ("☰ Ещё", "Ещё"):
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Задачи", callback_data="menu:tasks"), InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
-                [InlineKeyboardButton("👥 Люди", callback_data="menu:people"), InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
-                [InlineKeyboardButton("💳 Бюджет", callback_data="menu:budget")],
+                [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"), interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
+                [interface_inline_button("people", "👥", "Люди", "menu:people"), interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
+                [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
             ]))
 
     if t=="📚 Знания":
@@ -4169,7 +4195,7 @@ async def text_handler(update,context):
 
     if t in ("💰 Расходы", "💳 Бюджет"): return await list_expenses(update,context)
 
-    if t=="🌅 Брифинг": return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
+    if t in ("🌅 Брифинг", "Брифинг"): return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
 
     if t=="🔎 Поиск": return await update.effective_message.reply_text("Напиши: «Найди в интернете ...»")
 
@@ -4707,6 +4733,8 @@ async def main_async():
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
 
     app.add_handler(CommandHandler("setemoji", set_interface_emoji))
+
+    app.add_handler(CommandHandler("emojihelp", emoji_help))
 
     app.add_handler(CallbackQueryHandler(callback))
 
