@@ -804,9 +804,10 @@ def remove_button_fallback(text, fallback):
 
 def interface_button(slot, fallback, text):
     emoji_id = app_setting(f"interface_{slot}_custom_emoji_id") or emoji_id_for(fallback)
-    # Telegram only sends `text` back to the chat; icon_custom_emoji_id is
-    # visual-only. Keep the fallback in text so the user's bubble is readable.
-    return KeyboardButton(f"{fallback} {text}", icon_custom_emoji_id=emoji_id or None)
+    # The live icon is drawn separately by Telegram. Keeping the Unicode
+    # fallback in the label would display two icons side by side.
+    label = text if emoji_id else f"{fallback} {text}"
+    return KeyboardButton(label, icon_custom_emoji_id=emoji_id or None)
 
 
 def interface_inline_button(slot, fallback, text, callback_data):
