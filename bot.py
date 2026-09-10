@@ -31,6 +31,7 @@ import tempfile
 import time
 
 import shutil
+import threading
 from urllib.parse import parse_qsl
 
 from datetime import datetime, timezone, timedelta
@@ -87,6 +88,11 @@ USER_SECRETS_MASTER_KEY = (os.getenv("USER_SECRETS_MASTER_KEY") or "").strip()
 ADMIN_CHAT_IDS = {int(value) for value in os.getenv("ADMIN_CHAT_IDS", "").split(",") if value.strip().isdigit()}
 
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OR_MANAGEMENT_KEY = os.getenv("OPENROUTER_MANAGEMENT_API_KEY", "").strip()
+try:
+    USER_MONTHLY_LIMIT_USD = max(0.01, float(os.getenv("NOEMA_USER_MONTHLY_LIMIT_USD", "2")))
+except ValueError:
+    USER_MONTHLY_LIMIT_USD = 2.0
 
 MODEL = os.getenv("MODEL", "minimax/minimax-m3:free").strip()
 
@@ -118,8 +124,11 @@ PERSISTENT_ROOT.mkdir(parents=True, exist_ok=True)
 DB = PERSISTENT_ROOT / "noema_test.sqlite3"
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
 STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+MANAGED_KEY_LOCK = threading.Lock()
 
 
 
@@ -793,6 +802,13 @@ def init_db():
             key_hint TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS managed_api_keys(
+            chat_id INTEGER PRIMARY KEY, encrypted_key TEXT NOT NULL,
+            key_hash TEXT NOT NULL DEFAULT '', key_hint TEXT NOT NULL DEFAULT '',
+            limit_usd REAL NOT NULL DEFAULT 2, active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS usage_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
             source TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1119,14 +1135,83 @@ def api_key_status(chat_id):
     return row["key_hint"] if row else ""
 
 
+def managed_api_key(chat_id):
+    """Return Noema's per-user key without ever exposing it to Telegram."""
+    cipher = secrets_cipher()
+    if not cipher:
+        return None
+    with conn() as c:
+        row = c.execute("SELECT encrypted_key FROM managed_api_keys WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        return cipher.decrypt(row["encrypted_key"].encode()).decode()
+    except (InvalidToken, UnicodeDecodeError):
+        return None
+
+
+def provision_managed_api_key(chat_id):
+    """Create a $2/month OpenRouter key for one Telegram chat, once."""
+    existing = managed_api_key(chat_id)
+    if existing or not OR_MANAGEMENT_KEY:
+        return existing
+    cipher = secrets_cipher()
+    if not cipher:
+        LOGGER.warning("Managed key provisioning skipped: USER_SECRETS_MASTER_KEY is missing")
+        return None
+    # A start event and a first message can arrive together. Avoid issuing two
+    # billable keys for the same chat in that small window.
+    with MANAGED_KEY_LOCK:
+        existing = managed_api_key(chat_id)
+        if existing:
+            return existing
+        with conn() as c:
+            user = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
+        label = f"Noema user #{int(user['user_number']) if user else chat_id}"
+        try:
+            response = requests.post(
+                OPENROUTER_KEYS_URL,
+                headers={"Authorization": f"Bearer {OR_MANAGEMENT_KEY}", "Content-Type": "application/json"},
+                json={"name": label, "limit": USER_MONTHLY_LIMIT_USD, "limit_reset": "monthly", "include_byok_in_limit": False},
+                timeout=30,
+            )
+        except requests.RequestException:
+            LOGGER.warning("Managed key provisioning failed for chat %s", chat_id)
+            return None
+        if not response.ok:
+            LOGGER.warning("Managed key provisioning rejected for chat %s: HTTP %s", chat_id, response.status_code)
+            return None
+        try:
+            payload = response.json()
+            raw_key = str(payload.get("key") or "")
+            details = payload.get("data") or {}
+            key_hash = str(details.get("hash") or "")
+        except (TypeError, ValueError):
+            return None
+        if not raw_key:
+            LOGGER.warning("Managed key provisioning returned no key for chat %s", chat_id)
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        encrypted = cipher.encrypt(raw_key.encode()).decode()
+        hint = raw_key[:7] + "…" + raw_key[-4:]
+        with conn() as c:
+            c.execute("INSERT INTO managed_api_keys(chat_id,encrypted_key,key_hash,key_hint,limit_usd,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                      "ON CONFLICT(chat_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,key_hash=excluded.key_hash,key_hint=excluded.key_hint,limit_usd=excluded.limit_usd,active=1,updated_at=excluded.updated_at",
+                      (chat_id, encrypted, key_hash, hint, USER_MONTHLY_LIMIT_USD, 1, now, now))
+        return raw_key
+
+
 def api_key_for_chat(chat_id):
+    managed = provision_managed_api_key(chat_id)
+    if managed:
+        return managed, "managed"
     personal = user_api_key(chat_id)
     return (personal or OR_KEY), ("personal" if personal else "shared")
 
 
 def has_personal_api_key(chat_id):
-    """Do not let a stored model preference silently spend the shared key."""
-    return bool(user_api_key(chat_id))
+    """A dedicated managed key counts as private billing for Vision routing."""
+    return bool(managed_api_key(chat_id) or user_api_key(chat_id))
 
 
 def shared_vision_model():
@@ -1197,7 +1282,7 @@ def shared_usage_users(days=30):
         # Older events predate the user catalogue; make them browsable too.
         missing = c.execute("""SELECT DISTINCT e.chat_id FROM usage_events e
                              LEFT JOIN bot_users u ON u.chat_id=e.chat_id
-                             WHERE e.source='shared' AND substr(e.created_at,1,10)>=? AND u.chat_id IS NULL""",
+                             WHERE e.source IN ('shared','managed') AND substr(e.created_at,1,10)>=? AND u.chat_id IS NULL""",
                             (since,)).fetchall()
         for row in missing:
             c.execute("INSERT OR IGNORE INTO bot_users(chat_id,username,display_name,first_seen_at,last_seen_at) VALUES(?,?,?,?,?)",
@@ -1209,7 +1294,7 @@ def shared_usage_users(days=30):
                    SUM(e.cost) AS cost
             FROM usage_events e
             LEFT JOIN bot_users u ON u.chat_id=e.chat_id
-            WHERE e.source='shared' AND substr(e.created_at,1,10)>=?
+            WHERE e.source IN ('shared','managed') AND substr(e.created_at,1,10)>=?
             GROUP BY e.chat_id
             ORDER BY cost DESC, requests DESC, e.chat_id
         """, (since,)).fetchall()
@@ -2199,7 +2284,11 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
     selected=model_router().resolve(chat_id, "chat")
     primary, fallback = selected["primary"], selected["fallback"]
-    models=[primary]+[m for m in ([fallback] + FALLBACK_MODELS) if m and m!=primary]
+    # Explicit FALLBACK_MODELS has priority. If it is not configured, the
+    # preset catalogue is still a useful automatic fallback chain.
+    candidates = [fallback] + FALLBACK_MODELS + AVAILABLE_MODELS
+    models = [primary] + [m for m in candidates if m and m != primary and m not in [primary]]
+    models = list(dict.fromkeys(models))
 
     last=None
 
@@ -2220,6 +2309,9 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 return choice["message"]
 
             last=(r.status_code,r.text)
+
+            if model != models[-1]:
+                print(f"LLM fallback chat_id={chat_id} from={model} status={r.status_code}")
 
             if r.status_code==429 or 500<=r.status_code<600:
 
@@ -2601,7 +2693,12 @@ async def end_activity(card, stopped, task):
 # ---------- UI ----------
 
 async def start(update,context):
-    register_bot_user(update.effective_chat.id, getattr(update, "effective_user", None))
+    chat_id = update.effective_chat.id
+    register_bot_user(chat_id, getattr(update, "effective_user", None))
+    # Provisioning happens in the background: /start remains instant even if
+    # OpenRouter is temporarily slow.
+    if OR_MANAGEMENT_KEY:
+        asyncio.create_task(asyncio.to_thread(provision_managed_api_key, chat_id))
     await update.effective_message.reply_text(
         f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
         reply_markup=KB, parse_mode="HTML")
@@ -2891,6 +2988,12 @@ async def callback(update,context):
     q=update.callback_query; await q.answer()
     register_bot_user(q.message.chat_id, getattr(update, "effective_user", None))
 
+    # Model and key management is a platform setting now. Older inline
+    # messages may still contain these buttons, so protect those too.
+    admin_only = ("settings:model", "settings:vision", "settings:keys", "model:", "vision:", "keys:")
+    if q.data.startswith(admin_only) and q.message.chat_id not in ADMIN_CHAT_IDS:
+        return await q.edit_message_text("Модели и ключи уже настроены Noema.", reply_markup=settings_keyboard(q.message.chat_id))
+
     if q.data == "settings:model":
         selected = model_router().resolve(q.message.chat_id, "chat")
         lines = ["<b>🧠 Текущая модель</b>", html.escape(selected["primary"]), "", "Выберите модель:"]
@@ -2992,7 +3095,7 @@ async def callback(update,context):
         return
 
     if q.data == "settings:back":
-        await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard())
+        await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard(q.message.chat_id))
         return
 
     if q.data in ("menu:mode", "settings:mode"):
@@ -3323,13 +3426,20 @@ async def callback(update,context):
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
 
-def settings_keyboard():
-    rows = [
-        [InlineKeyboardButton("🧠 Модель", callback_data="settings:model"), InlineKeyboardButton("👁 Vision", callback_data="settings:vision")],
-        [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
-        [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
-        [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status"), InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
-    ]
+def settings_keyboard(chat_id=None):
+    if chat_id in ADMIN_CHAT_IDS:
+        rows = [
+            [InlineKeyboardButton("🧠 Модель", callback_data="settings:model"), InlineKeyboardButton("👁 Vision", callback_data="settings:vision")],
+            [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
+            [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("🔐 Управление AI", callback_data="settings:keys")],
+            [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status"), InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
+            [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
+            [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
+        ]
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
     return InlineKeyboardMarkup(rows)
@@ -3367,21 +3477,19 @@ def iphone_device_page(chat_id, device_id):
 
 
 def api_keys_page(chat_id):
-    personal = api_key_status(chat_id)
-    if not secrets_cipher():
-        text = "🔐 <b>API-ключи</b>\nЛичные ключи пока недоступны: администратор не добавил <code>USER_SECRETS_MASTER_KEY</code> в Secrets хостинга. Общий ключ бота работает."
-        return text, InlineKeyboardMarkup([[InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]])
-    source = f'Личный ключ: <code>{html.escape(personal)}</code> · приоритетный' if personal else "Личный ключ не подключён · используется общий ключ бота"
-    buttons = [[InlineKeyboardButton("➕ Добавить личный ключ" if not personal else "✏️ Заменить личный ключ", callback_data="keys:add"),
-                InlineKeyboardButton("📊 Мой расход", callback_data="keys:usage")]]
-    if personal:
-        buttons.append([InlineKeyboardButton("🗑 Удалить личный ключ", callback_data="keys:remove")])
-    if chat_id in ADMIN_CHAT_IDS:
-        buttons.append([InlineKeyboardButton("📈 Общий ключ", callback_data="keys:admin_usage")])
-    buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
-    scope = ("С личным ключом отдельно учитываются чат, Vision и расшифровка голосовых. "
-             "Без него они используют общий ключ бота. Edge Voice остаётся стандартным и не требует ключа.")
-    return "🔐 <b>API-ключи</b>\n" + source + "\n\n" + scope + "\n\nКлюч сохраняется зашифрованным и никогда не показывается после добавления.", InlineKeyboardMarkup(buttons)
+    if chat_id not in ADMIN_CHAT_IDS:
+        return "Ключи и модели настроены Noema.", InlineKeyboardMarkup([[InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]])
+    with conn() as c:
+        count = c.execute("SELECT COUNT(*) AS total FROM managed_api_keys WHERE active=1").fetchone()["total"]
+    if OR_MANAGEMENT_KEY and secrets_cipher():
+        state = f"Автовыдача включена · лимит <b>${USER_MONTHLY_LIMIT_USD:.2f}</b> на пользователя в месяц.\nВыдано ключей: <b>{count}</b>."
+    elif not OR_MANAGEMENT_KEY:
+        state = "Автовыдача выключена: добавьте <code>OPENROUTER_MANAGEMENT_API_KEY</code> в Secrets Amvera. До этого используется общий ключ."
+    else:
+        state = "Автовыдача ждёт <code>USER_SECRETS_MASTER_KEY</code> для безопасного хранения ключей."
+    buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
+               [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
+    return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", InlineKeyboardMarkup(buttons)
 
 
 def usage_text(rows, title, show_chats=False):
@@ -3393,7 +3501,7 @@ def usage_text(rows, title, show_chats=False):
     lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", "",
              "<pre>Модель                    Запр.   Токены        $</pre>"]
     for row in rows[:8]:
-        source = "личный" if row["source"] == "personal" else "общий"
+        source = {"personal": "личный", "managed": "отдельный"}.get(row["source"], "общий")
         chat = f'чат <code>{row["chat_id"]}</code> · ' if show_chats else ""
         model = str(row["model"] or "—")
         model = (model[:23] + "…") if len(model) > 24 else model
@@ -3456,7 +3564,7 @@ def mode_keyboard(chat_id):
 
 def status_text(chat_id):
     selected = model_router().resolve(chat_id, "chat")
-    key_source = "личный" if has_personal_api_key(chat_id) else "общий"
+    key_source = "отдельный" if managed_api_key(chat_id) else ("личный" if api_key_status(chat_id) else "общий")
     return ("<b>Noema активна</b>\n"
             f"Model: <code>{html.escape(selected['primary'])}</code>\n"
             f"Vision: <code>{html.escape(vision_models_for(chat_id)[0])}</code>\n"
@@ -3621,7 +3729,7 @@ async def text_handler(update,context):
             await update.effective_message.delete()
         if not ok:
             return await update.effective_message.reply_text("Не удалось включить личный ключ: администратор не настроил master key.")
-        return await update.effective_message.reply_text(f"🔐 Личный ключ {result} сохранён и теперь имеет приоритет.", reply_markup=settings_keyboard())
+        return await update.effective_message.reply_text(f"🔐 Личный ключ {result} сохранён и теперь имеет приоритет.", reply_markup=settings_keyboard(cid))
 
     vision_scope = context.user_data.pop("awaiting_vision_model", "")
     if vision_scope:
@@ -3635,12 +3743,12 @@ async def text_handler(update,context):
                 return await update.effective_message.reply_text("Нет доступа к общей Vision-модели.")
             set_shared_vision_model(model)
             return await update.effective_message.reply_text(
-                f"👁 Общая Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard())
+                f"👁 Общая Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard(cid))
         if not has_personal_api_key(cid):
             return await update.effective_message.reply_text("Сначала подключите личный API-ключ — тогда Vision будет расходоваться только с него.")
         model_router().set_vision(cid, model)
         return await update.effective_message.reply_text(
-            f"👁 Личная Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard())
+            f"👁 Личная Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard(cid))
 
     if context.user_data.pop("awaiting_budget_range", False):
         dates = re.findall(r"\d{1,2}\.\d{1,2}\.\d{2,4}", t)
@@ -3674,10 +3782,10 @@ async def text_handler(update,context):
         set_chat_model(cid, model, enabled=True)
         return await update.effective_message.reply_text(
             f"Добавила модель: {model}\nОткройте «⚙️ Настройки → 🧠 Модель» и выберите её.",
-            reply_markup=settings_keyboard())
+            reply_markup=settings_keyboard(cid))
 
     if t=="⚙️ Настройки":
-        return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard())
+        return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard(cid))
 
     if t=="☰ Ещё":
         return await update.effective_message.reply_text(
@@ -4048,6 +4156,25 @@ async def send_quick_action_feedback(request, chat_id, ok, message):
     return web.json_response({"ok": ok, "message": message})
 
 
+async def show_iphone_input(request, chat_id, text="", attachment=None):
+    """Make iPhone activity visible in Telegram before Noema handles it."""
+    bot = request.app["telegram_app"].bot
+    if attachment and attachment.local_path:
+        caption = "📤 <b>С iPhone</b>"
+        try:
+            with open(attachment.local_path, "rb") as stream:
+                if (attachment.mime_type or "").lower().startswith("image/"):
+                    await bot.send_photo(chat_id=chat_id, photo=stream, caption=caption, parse_mode="HTML")
+                else:
+                    await bot.send_document(chat_id=chat_id, document=stream, caption=caption, parse_mode="HTML")
+            return
+        except Exception:
+            LOGGER.warning("Unable to mirror iPhone attachment into chat %s", chat_id)
+    visible = str(text or "").strip()
+    if visible:
+        await bot.send_message(chat_id=chat_id, text=f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}", parse_mode="HTML")
+
+
 async def quick_actions_run(request):
     try:
         payload = await request.json()
@@ -4068,7 +4195,10 @@ async def quick_actions_run(request):
         device, error = authenticate_quick_token(payload.get("token"), {"share"})
         if not device:
             return web.json_response({"ok": False, "error": error}, status=401)
-        result = await asyncio.to_thread(ingest_from_iphone, device["chat_id"], payload.get("text") or payload.get("content") or "")
+        content = payload.get("text") or payload.get("content") or ""
+        with contextlib.suppress(Exception):
+            await show_iphone_input(request, device["chat_id"], content)
+        result = await asyncio.to_thread(ingest_from_iphone, device["chat_id"], content)
         message = result.reply if result.ok else "Не удалось сохранить материал с iPhone."
         return await send_quick_action_feedback(request, device["chat_id"], bool(result.ok), message)
     with conn() as c:
@@ -4079,6 +4209,9 @@ async def quick_actions_run(request):
         if not binding:
             return web.json_response({"ok": False, "error": "not_configured"}, status=409)
         c.execute("UPDATE quick_action_devices SET last_used_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), device_id))
+    if binding["action"] == "note":
+        with contextlib.suppress(Exception):
+            await show_iphone_input(request, device["chat_id"], payload.get("text") or payload.get("content") or "")
     ok, message = await asyncio.to_thread(quick_action_result, device["chat_id"], binding["action"], payload)
     return await send_quick_action_feedback(request, device["chat_id"], ok, message)
 
@@ -4112,6 +4245,8 @@ async def quick_actions_upload(request):
                 content = f"Материал с iPhone: {original_name}"
         if not attachment and not content:
             return web.json_response({"ok": False, "error": "empty_share"}, status=400)
+        with contextlib.suppress(Exception):
+            await show_iphone_input(request, device["chat_id"], content, attachment)
         result = await asyncio.to_thread(ingest_from_iphone, device["chat_id"], content, attachment)
         message = result.reply if result.ok else "Не удалось сохранить материал с iPhone."
         return await send_quick_action_feedback(request, device["chat_id"], bool(result.ok), message)
