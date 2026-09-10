@@ -1244,9 +1244,20 @@ def provision_managed_api_key(chat_id):
 
 
 def sync_managed_key_labels():
-    """Make existing OpenRouter key names match Noema's stable user numbers."""
+    """Give active users a key, then match OpenRouter names to Noema numbers."""
     if not OR_MANAGEMENT_KEY:
         return {"ok": False, "error": "management_key_missing"}
+    created = 0
+    # Some people may have spent through the old fallback key before the
+    # management key was configured. Bring those active people onto their own
+    # key first, rather than trying to guess which unrelated OpenRouter row is
+    # theirs by its position in the dashboard.
+    for user in shared_usage_users():
+        chat_id = int(user["chat_id"])
+        if managed_api_key(chat_id):
+            continue
+        if provision_managed_api_key(chat_id):
+            created += 1
     with conn() as c:
         rows = [dict(row) for row in c.execute(
             """SELECT m.key_hash, u.user_number FROM managed_api_keys m
@@ -1254,7 +1265,7 @@ def sync_managed_key_labels():
                WHERE m.active=1 AND m.key_hash<>''"""
         ).fetchall()]
     if not rows:
-        return {"ok": True, "updated": 0}
+        return {"ok": True, "created": created, "updated": 0}
     headers = {"Authorization": f"Bearer {OR_MANAGEMENT_KEY}", "Content-Type": "application/json"}
     try:
         response = requests.get(OPENROUTER_KEYS_URL, headers=headers, timeout=30)
@@ -1279,7 +1290,7 @@ def sync_managed_key_labels():
                 LOGGER.warning("Could not rename OpenRouter key %s: HTTP %s", key_hash[:8], response.status_code)
         except requests.RequestException:
             LOGGER.warning("Could not rename an OpenRouter key")
-    return {"ok": True, "updated": updated}
+    return {"ok": True, "created": created, "updated": updated}
 
 
 def api_key_for_chat(chat_id):
@@ -3542,7 +3553,9 @@ async def callback(update,context):
         if not result.get("ok"):
             return await q.answer("Не удалось связаться с OpenRouter. Попробуйте позже.", show_alert=True)
         text, markup = api_keys_page(q.message.chat_id)
-        await q.answer(f"Синхронизировано ключей: {int(result.get('updated') or 0)}")
+        await q.answer(
+            f"Создано: {int(result.get('created') or 0)} · синхронизировано: {int(result.get('updated') or 0)}"
+        )
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     if q.data.startswith("keys:admin_users:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
@@ -3678,7 +3691,7 @@ def api_keys_page(chat_id):
     else:
         state = "Автовыдача ждёт <code>USER_SECRETS_MASTER_KEY</code> для безопасного хранения ключей."
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
-               [InlineKeyboardButton("↻ Синхронизировать номера OpenRouter", callback_data="keys:sync_labels")],
+               [InlineKeyboardButton("↻ Создать и синхронизировать ключи", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
     return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", InlineKeyboardMarkup(buttons)
 
