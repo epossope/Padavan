@@ -769,7 +769,7 @@ def reply_emoji_palette():
         alt = str(item.get("alt") or "") if isinstance(item, dict) else ""
         if emoji_id.isdigit() and alt and len(alt) <= 16:
             out.append({"id": emoji_id, "alt": alt})
-    return out[:6]
+    return out[:48]
 
 
 def reply_emoji_prefix(chat_id):
@@ -778,7 +778,8 @@ def reply_emoji_prefix(chat_id):
         return ""
     # Stable rotation prevents a noisy random-looking feed while still using
     # the complete palette across the conversation.
-    item = palette[(int(chat_id) + int(time.time() // 60)) % len(palette)]
+    digest = hashlib.sha256(f"{chat_id}:{time.time_ns()}".encode()).digest()
+    item = palette[int.from_bytes(digest[:4], "big") % len(palette)]
     return f'<tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji> '
 
 
@@ -3023,7 +3024,7 @@ async def emoji_help(update, context):
         "Раздел «Ещё»: <code>tasks</code>, <code>reminders</code>, <code>people</code>, <code>notes</code>, <code>budget</code>.\n"
         "Задачи: <code>open</code>, <code>done</code>, <code>failed</code>.\n\n"
         "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.\n\n"
-        "Для ответов: отправь до 6 раз <code>/replyemoji</code> с разными живыми эмодзи. Очистить: <code>/clearreplyemojis</code>.",
+        "Для ответов: отправь <code>/replyemoji</code> и до 48 живых эмодзи в том же сообщении. Очистить: <code>/clearreplyemojis</code>.",
         parse_mode="HTML")
 
 
@@ -3032,18 +3033,22 @@ async def add_reply_emoji(update, context):
     if update.effective_chat.id not in ADMIN_CHAT_IDS:
         return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
     message = update.effective_message
-    entity = next((item for item in (message.entities or [])
-                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
-    if not entity:
+    entities = [item for item in (message.entities or [])
+                if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id]
+    if not entities:
         return await message.reply_text(
             "Отправь <code>/replyemoji</code> и выбери живой эмодзи в этом же сообщении.", parse_mode="HTML")
-    alt = entity.extract_from(message.text or "") or "✨"
     palette = reply_emoji_palette()
-    if not any(item["id"] == entity.custom_emoji_id for item in palette):
-        palette.append({"id": entity.custom_emoji_id, "alt": alt})
-    palette = palette[:6]
+    added = 0
+    for entity in entities:
+        if len(palette) >= 48:
+            break
+        alt = entity.extract_from(message.text or "") or "✨"
+        if not any(item["id"] == entity.custom_emoji_id for item in palette):
+            palette.append({"id": entity.custom_emoji_id, "alt": alt})
+            added += 1
     set_app_setting("reply_custom_emoji_palette", json.dumps(palette, ensure_ascii=False))
-    return await message.reply_text(f"Добавлено в палитру ответов: {len(palette)}/6.")
+    return await message.reply_text(f"Добавлено: {added}. В палитре ответов: {len(palette)}/48.")
 
 
 async def clear_reply_emojis(update, context):
