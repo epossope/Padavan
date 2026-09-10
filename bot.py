@@ -758,6 +758,30 @@ def main_keyboard():
     ], resize_keyboard=True, is_persistent=True)
 
 
+def reply_emoji_palette():
+    try:
+        items = json.loads(app_setting("reply_custom_emoji_palette", "[]"))
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for item in items if isinstance(items, list) else []:
+        emoji_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+        alt = str(item.get("alt") or "") if isinstance(item, dict) else ""
+        if emoji_id.isdigit() and alt and len(alt) <= 16:
+            out.append({"id": emoji_id, "alt": alt})
+    return out[:6]
+
+
+def reply_emoji_prefix(chat_id):
+    palette = reply_emoji_palette()
+    if not palette:
+        return ""
+    # Stable rotation prevents a noisy random-looking feed while still using
+    # the complete palette across the conversation.
+    item = palette[(int(chat_id) + int(time.time() // 60)) % len(palette)]
+    return f'<tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji> '
+
+
 
 def ensure_column(c, table, column, sql_type):
 
@@ -2859,6 +2883,7 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
             kwargs = {"parse_mode": TelegramRenderer.parse_mode}
             if index == 0:
                 kwargs["reply_markup"] = main_keyboard()
+                chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
             await update.effective_message.reply_text(chunk, **kwargs)
 
     if eff in ("voice","voice_and_text"):
@@ -2997,8 +3022,35 @@ async def emoji_help(update, context):
         "Главное меню: <code>today</code>, <code>briefing</code>, <code>settings</code>, <code>more</code>.\n"
         "Раздел «Ещё»: <code>tasks</code>, <code>reminders</code>, <code>people</code>, <code>notes</code>, <code>budget</code>.\n"
         "Задачи: <code>open</code>, <code>done</code>, <code>failed</code>.\n\n"
-        "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.",
+        "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.\n\n"
+        "Для ответов: отправь до 6 раз <code>/replyemoji</code> с разными живыми эмодзи. Очистить: <code>/clearreplyemojis</code>.",
         parse_mode="HTML")
+
+
+async def add_reply_emoji(update, context):
+    """Add one owner-selected custom emoji to Noema's reply palette."""
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    message = update.effective_message
+    entity = next((item for item in (message.entities or [])
+                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+    if not entity:
+        return await message.reply_text(
+            "Отправь <code>/replyemoji</code> и выбери живой эмодзи в этом же сообщении.", parse_mode="HTML")
+    alt = entity.extract_from(message.text or "") or "✨"
+    palette = reply_emoji_palette()
+    if not any(item["id"] == entity.custom_emoji_id for item in palette):
+        palette.append({"id": entity.custom_emoji_id, "alt": alt})
+    palette = palette[:6]
+    set_app_setting("reply_custom_emoji_palette", json.dumps(palette, ensure_ascii=False))
+    return await message.reply_text(f"Добавлено в палитру ответов: {len(palette)}/6.")
+
+
+async def clear_reply_emojis(update, context):
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return
+    set_app_setting("reply_custom_emoji_palette", "[]")
+    return await update.effective_message.reply_text("Палитра живых эмодзи для ответов очищена.")
 
 
 
@@ -4735,6 +4787,10 @@ async def main_async():
     app.add_handler(CommandHandler("setemoji", set_interface_emoji))
 
     app.add_handler(CommandHandler("emojihelp", emoji_help))
+
+    app.add_handler(CommandHandler("replyemoji", add_reply_emoji))
+
+    app.add_handler(CommandHandler("clearreplyemojis", clear_reply_emojis))
 
     app.add_handler(CallbackQueryHandler(callback))
 
