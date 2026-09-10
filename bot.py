@@ -163,6 +163,33 @@ TOOLS = [
     }},
     {"type":"function","function":{
 
+        "name":"get_behavior_rules",
+
+        "description":"Получить список правил поведения Noema с их номерами. Используй, когда пользователь просит показать, изменить или удалить правило.",
+
+        "parameters":{"type":"object","properties":{}}
+
+    }},
+    {"type":"function","function":{
+
+        "name":"update_behavior_rule",
+
+        "description":"Изменить существующее правило поведения по его номеру. Сначала узнай номер через get_behavior_rules, если его не назвали.",
+
+        "parameters":{"type":"object","properties":{"rule_id":{"type":"integer"},"description":{"type":"string"}},"required":["rule_id","description"]}
+
+    }},
+    {"type":"function","function":{
+
+        "name":"delete_behavior_rule",
+
+        "description":"Удалить или отключить правило поведения по его номеру. Сначала узнай номер через get_behavior_rules, если пользователь не сказал удалить все правила.",
+
+        "parameters":{"type":"object","properties":{"rule_id":{"type":"integer"},"all":{"type":"boolean"}}}
+
+    }},
+    {"type":"function","function":{
+
         "name":"internet_search",
 
         "description":"Найти актуальную информацию в интернете: факты, рекомендации, статьи, сервисы, товары, сравнения и ссылки. Вызывай, когда пользователь просит найти, исследовать, проверить или подобрать что-то во внешнем интернете, а не в сохранённой памяти.",
@@ -482,7 +509,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -559,7 +586,7 @@ def build_inquiry_input(result):
         return None
     it = result.item
     parts = [p for p in (it.get("title"), it.get("summary"), it.get("visible_text")) if p]
-    body = "\n".join(parts)
+    body = "\n".join(str(part) for part in parts)[:2200]
     if result.urls:
         body += "\nURL: " + ", ".join(result.urls[:3])
     return ("[Сохранено в память]\n" + body) if body else None
@@ -920,7 +947,9 @@ def history(chat_id, n=18):
 
                        (chat_id,n)).fetchall()
 
-    return [{"role":r["role"],"content":r["content"]} for r in reversed(rs)]
+    # A long OCR/vision response must not make the next ordinary message exceed
+    # a model's context window. The full original is safely kept in knowledge.
+    return [{"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in reversed(rs)]
 
 
 
@@ -1305,7 +1334,7 @@ def behavior_rules_for(chat_id):
     ensure_behavior_rules(chat_id)
     with conn() as c:
         return [dict(row) for row in c.execute(
-            "SELECT id,description,enabled FROM behavior_rules WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()]
+            "SELECT id,rule_key,description,enabled FROM behavior_rules WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()]
 
 
 def save_behavior_rule(chat_id, description=""):
@@ -1318,6 +1347,41 @@ def save_behavior_rule(chat_id, description=""):
                   "ON CONFLICT(chat_id,rule_key) DO UPDATE SET description=excluded.description,enabled=1",
                   (chat_id, key, description))
     return {"ok": True, "tool": "save_behavior_rule", "description": description}
+
+
+def get_behavior_rules(chat_id):
+    return {"ok": True, "tool": "get_behavior_rules", "rules": behavior_rules_for(chat_id)}
+
+
+def update_behavior_rule(chat_id, rule_id, description=""):
+    description = str(description or "").strip()[:280]
+    if not description:
+        return {"ok": False, "tool": "update_behavior_rule", "error": "empty_rule"}
+    with conn() as c:
+        row = c.execute("SELECT rule_key FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "update_behavior_rule", "error": "not_found"}
+        c.execute("UPDATE behavior_rules SET description=?, enabled=1 WHERE id=? AND chat_id=?", (description, int(rule_id), chat_id))
+    return {"ok": True, "tool": "update_behavior_rule", "id": int(rule_id), "description": description}
+
+
+def delete_behavior_rule(chat_id, rule_id=None, all=False):
+    with conn() as c:
+        if all:
+            # Default rules are kept as disabled rows, so ensure_behavior_rules
+            # will respect the user's choice instead of silently restoring them.
+            c.execute("UPDATE behavior_rules SET enabled=0 WHERE chat_id=?", (chat_id,))
+            return {"ok": True, "tool": "delete_behavior_rule", "deleted": c.total_changes}
+        if not rule_id:
+            return {"ok": False, "tool": "delete_behavior_rule", "error": "missing_rule_id"}
+        row = c.execute("SELECT rule_key FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "delete_behavior_rule", "error": "not_found"}
+        if str(row["rule_key"]).startswith("custom:"):
+            cur = c.execute("DELETE FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id))
+        else:
+            cur = c.execute("UPDATE behavior_rules SET enabled=0 WHERE id=? AND chat_id=?", (int(rule_id), chat_id))
+    return {"ok": True, "tool": "delete_behavior_rule", "deleted": cur.rowcount}
 
 
 
@@ -1781,6 +1845,12 @@ def execute_tool(chat_id,name,args):
 
         "save_behavior_rule":save_behavior_rule,
 
+        "get_behavior_rules":get_behavior_rules,
+
+        "update_behavior_rule":update_behavior_rule,
+
+        "delete_behavior_rule":delete_behavior_rule,
+
         "save_note":save_note,
 
         "add_task":add_task,
@@ -1848,13 +1918,25 @@ WEATHER_CODES={0:"ясно",1:"в основном ясно",2:"переменн
 
 61:"слабый дождь",63:"дождь",65:"сильный дождь",71:"слабый снег",73:"снег",80:"ливни",95:"гроза"}
 
+WEATHER_CITY_ALIASES = {
+    "спб": "Санкт-Петербург", "питер": "Санкт-Петербург", "питере": "Санкт-Петербург",
+    "санкт петербург": "Санкт-Петербург", "санкт-петербург": "Санкт-Петербург",
+    "санкт петербурге": "Санкт-Петербург", "санкт-петербурге": "Санкт-Петербург",
+    "москве": "Москва", "москву": "Москва",
+}
+
+
+def weather_city_name(city):
+    raw = re.sub(r"\s+", " ", str(city or "").strip()).strip(" ,.!?;:").lower().replace("ё", "е")
+    return WEATHER_CITY_ALIASES.get(raw, city)
+
 
 
 def geocode_city(city):
 
     r=requests.get("https://geocoding-api.open-meteo.com/v1/search",
 
-                   params={"name":city,"count":1,"language":"ru","format":"json"},timeout=20)
+                   params={"name":weather_city_name(city),"count":1,"language":"ru","format":"json"},timeout=20)
 
     r.raise_for_status()
 
@@ -2214,6 +2296,8 @@ def system_prompt(chat_id):
 
     chat_tz = timezone_for(chat_id)
     now=datetime.now(chat_tz)
+    active_rules = [rule["description"] for rule in behavior_rules_for(chat_id) if rule.get("enabled")]
+    rules_text = "; ".join(active_rules[:12]) or "нет"
 
     return (
 
@@ -2239,6 +2323,10 @@ def system_prompt(chat_id):
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
+        "Правила можно показать через get_behavior_rules, изменить через update_behavior_rule и удалить через delete_behavior_rule. "
+
+        "Никогда не создавай заметку, задачу, напоминание или правило только из короткого ответа «да», «давай», «ок», «продолжай» или другой реплики-подтверждения. Это продолжение разговора, а не команда сохранения. Если до этого предложила рассказ, объяснить или показать что-то — выполни обещанное, а не сохраняй служебную запись. "
+
         "Если пользователь говорит, что находится, переехал или путешествует в другой стране/часовом поясе — используй set_timezone с подходящим IANA ID (например Китай — Asia/Shanghai). Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
         "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
@@ -2247,7 +2335,7 @@ def system_prompt(chat_id):
 
         "У тебя есть сохранённая память пользователя (knowledge): фото, скриншоты, сайты, URL, заметки, чек, сущности, проекты. "
 
-        "Если пользователь спрашивает о ранее сохранённом — например «где я храню базу», «что я сохранял для Noema», «какой сайт я кидал», «покажи/найди Тошку», «что ты знаешь про ...», «что сохранял вчера», «покажи тот фото/скрин» — СНАЧАЛА сделай knowledge_search с подходящими query/project/entity. Не говори «у меня нет доступа», не написав в search. "
+        "Если пользователь спрашивает о ранее сохранённом — например «где я храню базу», «что я сохранял для Noema», «какой сайт я кидал», «покажи/найди Тошку», «что ты знаешь про ...», «что сохранял вчера», «покажи тот фото/скрин» — СНАЧАЛА сделай knowledge_search с подходящими query/project/entity. Вопросы «есть ли у меня питомцы/домашние животные» тоже ищи широко по питомцам, животным и их именам, а не только по точной фразе. Не говори «у меня нет доступа», не написав в search. "
 
         "Если нужен конкретный элемент из results — можно knowledge_get по id или knowledge_files для файлов. "
 
@@ -2260,6 +2348,8 @@ def system_prompt(chat_id):
         "Не раскрывай внутренние модели, OpenRouter или провайдера. "
 
         "Отвечай коротко, естественно и персонально. "
+
+        f"Активные правила пользователя: {rules_text}. "
 
         f"Сейчас {now.isoformat()}, timezone {chat_tz.key}."
 
@@ -2367,6 +2457,10 @@ def write_confirmation(results):
         elif n=="save_note": parts.append("Заметка сохранена.")
 
         elif n=="save_behavior_rule": parts.append("Правило добавлено в настройки.")
+
+        elif n=="update_behavior_rule": parts.append("Правило обновлено.")
+
+        elif n=="delete_behavior_rule": parts.append("Правило удалено.")
 
     out=[]
 
@@ -2635,6 +2729,7 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
 async def safe_error(update,e):
 
     code=str(e)
+    LOGGER.exception("Request failed for chat %s: %s", update.effective_chat.id if update.effective_chat else "?", code, exc_info=e)
 
     msg={"MODEL_BUSY":"Сейчас модель перегружена. Повтори сообщение через минуту.",
 
@@ -3231,10 +3326,32 @@ async def callback(update,context):
         text, markup = notes_page(q.message.chat_id, int(page))
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "settings:rules":
-        rules = behavior_rules_for(q.message.chat_id)
-        text = "📜 Правила бота\n\n" + "\n".join(
-            f"{'●' if r['enabled'] else '○'} {r['description']}" for r in rules)
-        return await q.edit_message_text(text)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data.startswith("rule:edit:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        if not any(rule["id"] == rule_id for rule in behavior_rules_for(q.message.chat_id)):
+            return await q.edit_message_text("Правило не найдено.")
+        context.user_data["awaiting_rule_edit"] = rule_id
+        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:rules")]]))
+    if q.data.startswith("rule:deleteask:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        return await q.edit_message_text(f"Удалить правило <code>#{rule_id}</code>?", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+        ]))
+    if q.data.startswith("rule:delete:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        delete_behavior_rule(q.message.chat_id, rule_id=rule_id)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data == "rule:deleteallask":
+        return await q.edit_message_text("Удалить все правила? Напоминания и другие данные не затрону.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+        ]))
+    if q.data == "rule:deleteall":
+        delete_behavior_rule(q.message.chat_id, all=True)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "settings:iphone":
         text, markup = iphone_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -3444,6 +3561,27 @@ def settings_keyboard(chat_id=None):
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
     return InlineKeyboardMarkup(rows)
+
+
+def rules_page(chat_id):
+    rules = behavior_rules_for(chat_id)
+    lines = ["📜 <b>Правила поведения</b>", ""]
+    if not rules:
+        lines.append("Правил пока нет.")
+    else:
+        for rule in rules:
+            marker = "●" if rule["enabled"] else "○"
+            lines.append(f'{marker} <code>#{rule["id"]}</code> {html.escape(rule["description"])}')
+    buttons = []
+    for rule in rules:
+        buttons.append([
+            InlineKeyboardButton(f'✏️ #{rule["id"]}', callback_data=f'rule:edit:{rule["id"]}'),
+            InlineKeyboardButton(f'🗑 #{rule["id"]}', callback_data=f'rule:deleteask:{rule["id"]}'),
+        ])
+    if rules:
+        buttons.append([InlineKeyboardButton("🗑 Удалить все правила", callback_data="rule:deleteallask")])
+    buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 def iphone_settings_page(chat_id):
@@ -3702,6 +3840,13 @@ async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
     register_bot_user(cid, getattr(update, "effective_user", None))
+
+    rule_id = context.user_data.pop("awaiting_rule_edit", None)
+    if rule_id is not None:
+        result = update_behavior_rule(cid, int(rule_id), t)
+        if not result.get("ok"):
+            return await update.effective_message.reply_text("Не удалось обновить правило.")
+        return await update.effective_message.reply_text(f'📜 Правило <code>#{rule_id}</code> обновлено.', parse_mode="HTML")
 
     if context.user_data.pop("awaiting_task_text", False):
         raw = t.strip()
@@ -3997,11 +4142,17 @@ async def image_handler(update,context):
 
         final_text=pre
 
+        # A later "да, поищи такой плагин" must still know what was on the
+        # preceding screenshot. Image ingestion previously answered in
+        # Telegram but left no conversational trace for the next message.
+        inquiry = build_inquiry_input(result)
+        if inquiry:
+            add_message(cid, "user", inquiry)
+            add_message(cid, "assistant", pre)
+
         q=caption.strip().lower()
 
         if q.endswith("?") or any(w in q for w in ("что","какой","какая","какие","какое","сколько","написано","опиши","расскажи","покажи")):
-
-            inquiry=build_inquiry_input(result)
 
             if inquiry:
 

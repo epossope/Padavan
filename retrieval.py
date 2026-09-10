@@ -239,6 +239,25 @@ _SEARCH_STOPWORDS = {
     "хранить", "для", "использовать",
 }
 
+# Questions such as "есть ли у меня питомцы?" are category questions, not
+# literal text searches. A photo may mention "морская свинка" or a pet's name
+# without ever containing the exact phrase "домашнее животное".
+_PET_QUERY_WORDS = {"питомец", "питомцы", "животное", "животные", "домашний", "домашние"}
+_PET_CONTENT_STEMS = (
+    "питом", "живот", "морск", "свинк", "собак", "щен", "кот", "кошк", "хомяк",
+    "кролик", "попуга", "черепах", "рыбк", "крыса", "шиншилл", "хорек",
+)
+
+
+def _looks_like_pet_item(item: dict) -> bool:
+    entities = item.get("entities") or []
+    entity_text = " ".join(f"{e.get('name') or ''} {e.get('type') or ''}" for e in entities)
+    hay = normalize_token(" ".join([
+        item.get("title") or "", item.get("summary") or "", item.get("searchable_text") or "",
+        " ".join(item.get("tags") or []), entity_text,
+    ]))
+    return any(stem in hay for stem in _PET_CONTENT_STEMS)
+
 
 def _meaningful_tokens(query: str) -> list:
     return [t for t in normalize_token(query).split() if t and t not in _SEARCH_STOPWORDS]
@@ -297,6 +316,16 @@ def retrieve(store: "KnowledgeSearch", chat_id: int, query: str,
             for it in latest(chat_id, limit=100):
                 names = [normalize_token(e.get("name") or "") for e in it.get("entities") or []]
                 if any(_word_stems_close(t, n) for t in meaningful for n in names):
+                    items[it["id"]] = it
+
+    # Expand an umbrella pet question over recent visual memories. This is
+    # intentionally narrow: ordinary broad questions still use normal ranking.
+    normalized_query_words = set(normalize_token(query).split())
+    if normalized_query_words & _PET_QUERY_WORDS:
+        latest = getattr(store, "latest", None)
+        if latest:
+            for it in latest(chat_id, limit=150):
+                if _looks_like_pet_item(it):
                     items[it["id"]] = it
 
     # date filtering

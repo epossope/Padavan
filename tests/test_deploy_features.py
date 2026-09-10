@@ -6,6 +6,7 @@ from pathlib import Path
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
 from knowledge_store import KnowledgeItem, KnowledgeStore
+from retrieval import retrieve
 
 
 class DeployFeaturesTest(unittest.TestCase):
@@ -36,6 +37,16 @@ class DeployFeaturesTest(unittest.TestCase):
         relations = store.relations_for(1, "Узел")
         self.assertEqual(relations[0]["target"], "Hosting R")
         self.assertEqual(relations[0]["knowledge_item_id"], item["id"])
+
+    def test_pet_category_query_finds_saved_guinea_pigs(self):
+        db = Path(tempfile.mkdtemp()) / "pets.sqlite3"
+        store = KnowledgeStore(db)
+        item, _ = store.insert_item(KnowledgeItem(
+            chat_id=7, title="Люся и Пинита", summary="Две морские свинки",
+            searchable_text="Люся Пинита едят огурец", content_hash="pets-1", source_message_id=1,
+        ))
+        found = retrieve(store, 7, "У меня есть домашние животные?")
+        self.assertEqual([row["id"] for row in found], [item["id"]])
 
 
 if __name__ == "__main__":
