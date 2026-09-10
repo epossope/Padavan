@@ -201,6 +201,15 @@ TOOLS = [
     }},
     {"type":"function","function":{
 
+        "name":"get_weather",
+
+        "description":"Получить актуальную погоду. Используй для любого вопроса о погоде. Сам извлеки город из смысла и контекста диалога: понимай сокращения, разговорные названия и падежи; передавай нормальное название города. Если город не указан, передай пустую строку — будет использован город пользователя.",
+
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
+
+    }},
+    {"type":"function","function":{
+
         "name":"set_reminder",
 
         "description":"Создать реальное напоминание с уведомлением в точное время. Используй, когда пользователь указал время или просит, чтобы бот сам напомнил. Если время можно разумно определить, не спрашивать подтверждение.",
@@ -1897,6 +1906,8 @@ def execute_tool(chat_id,name,args):
 
         "internet_search":internet_search,
 
+        "get_weather":get_weather,
+
         "knowledge_search":knowledge_search_tool,
 
         "knowledge_get":knowledge_get_tool,
@@ -1918,25 +1929,11 @@ WEATHER_CODES={0:"ясно",1:"в основном ясно",2:"переменн
 
 61:"слабый дождь",63:"дождь",65:"сильный дождь",71:"слабый снег",73:"снег",80:"ливни",95:"гроза"}
 
-WEATHER_CITY_ALIASES = {
-    "спб": "Санкт-Петербург", "питер": "Санкт-Петербург", "питере": "Санкт-Петербург",
-    "санкт петербург": "Санкт-Петербург", "санкт-петербург": "Санкт-Петербург",
-    "санкт петербурге": "Санкт-Петербург", "санкт-петербурге": "Санкт-Петербург",
-    "москве": "Москва", "москву": "Москва",
-}
-
-
-def weather_city_name(city):
-    raw = re.sub(r"\s+", " ", str(city or "").strip()).strip(" ,.!?;:").lower().replace("ё", "е")
-    return WEATHER_CITY_ALIASES.get(raw, city)
-
-
-
 def geocode_city(city):
 
     r=requests.get("https://geocoding-api.open-meteo.com/v1/search",
 
-                   params={"name":weather_city_name(city),"count":1,"language":"ru","format":"json"},timeout=20)
+                   params={"name":str(city or DEFAULT_CITY).strip(),"count":1,"language":"ru","format":"json"},timeout=20)
 
     r.raise_for_status()
 
@@ -1998,6 +1995,11 @@ def get_weather_live(city):
 
         return {"ok":False,"error":"weather_unavailable"}
 
+
+
+def get_weather(chat_id, city=""):
+    """LLM-facing weather tool: city interpretation belongs to the model, not an alias list."""
+    return get_weather_live(str(city or DEFAULT_CITY).strip())
 
 
 def get_exchange_rate_live(base="USD",quote="RUB"):
@@ -2235,10 +2237,6 @@ def direct_live_request(text):
 
     t=text.lower().strip()
 
-    if "погод" in t or "температур" in t:
-
-        return format_weather(get_weather_live(extract_city(text)))
-
     if ("курс" in t and any(x in t for x in ("доллар","евро","руб","usd","eur","юан","cny"))) or "сколько стоит доллар" in t:
 
         b,q=detect_pair(text); d=get_exchange_rate_live(b,q)
@@ -2329,7 +2327,7 @@ def system_prompt(chat_id):
 
         "Если пользователь говорит, что находится, переехал или путешествует в другой стране/часовом поясе — используй set_timezone с подходящим IANA ID (например Китай — Asia/Shanghai). Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
-        "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+        "Для актуальной погоды обязательно вызывай get_weather. Понимай город по смыслу и контексту: сокращения, разговорные названия и падежи; если город не указан, передай пустой city, чтобы использовать город пользователя. Если город невозможно понять однозначно — задай короткий уточняющий вопрос, не угадывай. Актуальные новости и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
         "Когда пользователь просит найти, проверить, изучить, сравнить, подобрать или исследовать что-то во внешнем интернете, вызывай internet_search. Это относится не только к товарам: ищи статьи, сервисы, факты, рекомендации и ссылки. Сначала различай внешний интернет и сохранённую память пользователя. "
 
@@ -4142,9 +4140,9 @@ async def image_handler(update,context):
 
         final_text=pre
 
-        # A later "да, поищи такой плагин" must still know what was on the
-        # preceding screenshot. Image ingestion previously answered in
-        # Telegram but left no conversational trace for the next message.
+        # Preserve a compact representation of the shared material in the
+        # dialogue, so any later follow-up refers to it without phrase-specific
+        # matching or a special-case workflow.
         inquiry = build_inquiry_input(result)
         if inquiry:
             add_message(cid, "user", inquiry)
