@@ -163,6 +163,33 @@ TOOLS = [
     }},
     {"type":"function","function":{
 
+        "name":"get_behavior_rules",
+
+        "description":"Получить список правил поведения Noema с их номерами. Используй, когда пользователь просит показать, изменить или удалить правило.",
+
+        "parameters":{"type":"object","properties":{}}
+
+    }},
+    {"type":"function","function":{
+
+        "name":"update_behavior_rule",
+
+        "description":"Изменить существующее правило поведения по его номеру. Сначала узнай номер через get_behavior_rules, если его не назвали.",
+
+        "parameters":{"type":"object","properties":{"rule_id":{"type":"integer"},"description":{"type":"string"}},"required":["rule_id","description"]}
+
+    }},
+    {"type":"function","function":{
+
+        "name":"delete_behavior_rule",
+
+        "description":"Удалить или отключить правило поведения по его номеру. Сначала узнай номер через get_behavior_rules, если пользователь не сказал удалить все правила.",
+
+        "parameters":{"type":"object","properties":{"rule_id":{"type":"integer"},"all":{"type":"boolean"}}}
+
+    }},
+    {"type":"function","function":{
+
         "name":"internet_search",
 
         "description":"Найти актуальную информацию в интернете: факты, рекомендации, статьи, сервисы, товары, сравнения и ссылки. Вызывай, когда пользователь просит найти, исследовать, проверить или подобрать что-то во внешнем интернете, а не в сохранённой памяти.",
@@ -170,6 +197,15 @@ TOOLS = [
         "parameters":{"type":"object","properties":{
             "query":{"type":"string"},"limit":{"type":"integer"},"news":{"type":"boolean"}
         },"required":["query"]}
+
+    }},
+    {"type":"function","function":{
+
+        "name":"get_weather",
+
+        "description":"Получить актуальную погоду. Используй для любого вопроса о погоде. Сам извлеки город из смысла и контекста диалога: понимай сокращения, разговорные названия и падежи; передавай нормальное название города. Если город не указан, передай пустую строку — будет использован город пользователя.",
+
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
 
     }},
     {"type":"function","function":{
@@ -482,7 +518,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -559,7 +595,7 @@ def build_inquiry_input(result):
         return None
     it = result.item
     parts = [p for p in (it.get("title"), it.get("summary"), it.get("visible_text")) if p]
-    body = "\n".join(parts)
+    body = "\n".join(str(part) for part in parts)[:2200]
     if result.urls:
         body += "\nURL: " + ", ".join(result.urls[:3])
     return ("[Сохранено в память]\n" + body) if body else None
@@ -920,7 +956,9 @@ def history(chat_id, n=18):
 
                        (chat_id,n)).fetchall()
 
-    return [{"role":r["role"],"content":r["content"]} for r in reversed(rs)]
+    # A long OCR/vision response must not make the next ordinary message exceed
+    # a model's context window. The full original is safely kept in knowledge.
+    return [{"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in reversed(rs)]
 
 
 
@@ -1167,7 +1205,11 @@ def provision_managed_api_key(chat_id):
             return existing
         with conn() as c:
             user = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
-        label = f"Noema user #{int(user['user_number']) if user else chat_id}"
+        number = int(user["user_number"]) if user else int(chat_id)
+        # This visible name is the bridge between the OpenRouter dashboard and
+        # the numbered people list in Noema. The provider's internal hash is
+        # deliberately not used as a user-facing number.
+        label = f"Noema · #{number:03d}"
         try:
             response = requests.post(
                 OPENROUTER_KEYS_URL,
@@ -1199,6 +1241,45 @@ def provision_managed_api_key(chat_id):
                       "ON CONFLICT(chat_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,key_hash=excluded.key_hash,key_hint=excluded.key_hint,limit_usd=excluded.limit_usd,active=1,updated_at=excluded.updated_at",
                       (chat_id, encrypted, key_hash, hint, USER_MONTHLY_LIMIT_USD, 1, now, now))
         return raw_key
+
+
+def sync_managed_key_labels():
+    """Make existing OpenRouter key names match Noema's stable user numbers."""
+    if not OR_MANAGEMENT_KEY:
+        return {"ok": False, "error": "management_key_missing"}
+    with conn() as c:
+        rows = [dict(row) for row in c.execute(
+            """SELECT m.key_hash, u.user_number FROM managed_api_keys m
+               JOIN bot_users u ON u.chat_id=m.chat_id
+               WHERE m.active=1 AND m.key_hash<>''"""
+        ).fetchall()]
+    if not rows:
+        return {"ok": True, "updated": 0}
+    headers = {"Authorization": f"Bearer {OR_MANAGEMENT_KEY}", "Content-Type": "application/json"}
+    try:
+        response = requests.get(OPENROUTER_KEYS_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        remote = {str(key.get("hash") or ""): str(key.get("name") or "")
+                  for key in (response.json().get("data") or [])}
+    except (requests.RequestException, ValueError, TypeError):
+        LOGGER.warning("Could not load OpenRouter keys for label synchronization")
+        return {"ok": False, "error": "openrouter_unavailable"}
+    updated = 0
+    for row in rows:
+        desired = f"Noema · #{int(row['user_number']):03d}"
+        key_hash = row["key_hash"]
+        if remote.get(key_hash) == desired:
+            continue
+        try:
+            response = requests.patch(f"{OPENROUTER_KEYS_URL}/{key_hash}", headers=headers,
+                                      json={"name": desired}, timeout=30)
+            if response.ok:
+                updated += 1
+            else:
+                LOGGER.warning("Could not rename OpenRouter key %s: HTTP %s", key_hash[:8], response.status_code)
+        except requests.RequestException:
+            LOGGER.warning("Could not rename an OpenRouter key")
+    return {"ok": True, "updated": updated}
 
 
 def api_key_for_chat(chat_id):
@@ -1305,7 +1386,7 @@ def behavior_rules_for(chat_id):
     ensure_behavior_rules(chat_id)
     with conn() as c:
         return [dict(row) for row in c.execute(
-            "SELECT id,description,enabled FROM behavior_rules WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()]
+            "SELECT id,rule_key,description,enabled FROM behavior_rules WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()]
 
 
 def save_behavior_rule(chat_id, description=""):
@@ -1318,6 +1399,41 @@ def save_behavior_rule(chat_id, description=""):
                   "ON CONFLICT(chat_id,rule_key) DO UPDATE SET description=excluded.description,enabled=1",
                   (chat_id, key, description))
     return {"ok": True, "tool": "save_behavior_rule", "description": description}
+
+
+def get_behavior_rules(chat_id):
+    return {"ok": True, "tool": "get_behavior_rules", "rules": behavior_rules_for(chat_id)}
+
+
+def update_behavior_rule(chat_id, rule_id, description=""):
+    description = str(description or "").strip()[:280]
+    if not description:
+        return {"ok": False, "tool": "update_behavior_rule", "error": "empty_rule"}
+    with conn() as c:
+        row = c.execute("SELECT rule_key FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "update_behavior_rule", "error": "not_found"}
+        c.execute("UPDATE behavior_rules SET description=?, enabled=1 WHERE id=? AND chat_id=?", (description, int(rule_id), chat_id))
+    return {"ok": True, "tool": "update_behavior_rule", "id": int(rule_id), "description": description}
+
+
+def delete_behavior_rule(chat_id, rule_id=None, all=False):
+    with conn() as c:
+        if all:
+            # Default rules are kept as disabled rows, so ensure_behavior_rules
+            # will respect the user's choice instead of silently restoring them.
+            c.execute("UPDATE behavior_rules SET enabled=0 WHERE chat_id=?", (chat_id,))
+            return {"ok": True, "tool": "delete_behavior_rule", "deleted": c.total_changes}
+        if not rule_id:
+            return {"ok": False, "tool": "delete_behavior_rule", "error": "missing_rule_id"}
+        row = c.execute("SELECT rule_key FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "delete_behavior_rule", "error": "not_found"}
+        if str(row["rule_key"]).startswith("custom:"):
+            cur = c.execute("DELETE FROM behavior_rules WHERE id=? AND chat_id=?", (int(rule_id), chat_id))
+        else:
+            cur = c.execute("UPDATE behavior_rules SET enabled=0 WHERE id=? AND chat_id=?", (int(rule_id), chat_id))
+    return {"ok": True, "tool": "delete_behavior_rule", "deleted": cur.rowcount}
 
 
 
@@ -1781,6 +1897,12 @@ def execute_tool(chat_id,name,args):
 
         "save_behavior_rule":save_behavior_rule,
 
+        "get_behavior_rules":get_behavior_rules,
+
+        "update_behavior_rule":update_behavior_rule,
+
+        "delete_behavior_rule":delete_behavior_rule,
+
         "save_note":save_note,
 
         "add_task":add_task,
@@ -1827,6 +1949,8 @@ def execute_tool(chat_id,name,args):
 
         "internet_search":internet_search,
 
+        "get_weather":get_weather,
+
         "knowledge_search":knowledge_search_tool,
 
         "knowledge_get":knowledge_get_tool,
@@ -1848,13 +1972,11 @@ WEATHER_CODES={0:"ясно",1:"в основном ясно",2:"переменн
 
 61:"слабый дождь",63:"дождь",65:"сильный дождь",71:"слабый снег",73:"снег",80:"ливни",95:"гроза"}
 
-
-
 def geocode_city(city):
 
     r=requests.get("https://geocoding-api.open-meteo.com/v1/search",
 
-                   params={"name":city,"count":1,"language":"ru","format":"json"},timeout=20)
+                   params={"name":str(city or DEFAULT_CITY).strip(),"count":1,"language":"ru","format":"json"},timeout=20)
 
     r.raise_for_status()
 
@@ -1916,6 +2038,11 @@ def get_weather_live(city):
 
         return {"ok":False,"error":"weather_unavailable"}
 
+
+
+def get_weather(chat_id, city=""):
+    """LLM-facing weather tool: city interpretation belongs to the model, not an alias list."""
+    return get_weather_live(str(city or DEFAULT_CITY).strip())
 
 
 def get_exchange_rate_live(base="USD",quote="RUB"):
@@ -2153,10 +2280,6 @@ def direct_live_request(text):
 
     t=text.lower().strip()
 
-    if "погод" in t or "температур" in t:
-
-        return format_weather(get_weather_live(extract_city(text)))
-
     if ("курс" in t and any(x in t for x in ("доллар","евро","руб","usd","eur","юан","cny"))) or "сколько стоит доллар" in t:
 
         b,q=detect_pair(text); d=get_exchange_rate_live(b,q)
@@ -2214,6 +2337,8 @@ def system_prompt(chat_id):
 
     chat_tz = timezone_for(chat_id)
     now=datetime.now(chat_tz)
+    active_rules = [rule["description"] for rule in behavior_rules_for(chat_id) if rule.get("enabled")]
+    rules_text = "; ".join(active_rules[:12]) or "нет"
 
     return (
 
@@ -2239,15 +2364,19 @@ def system_prompt(chat_id):
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
+        "Правила можно показать через get_behavior_rules, изменить через update_behavior_rule и удалить через delete_behavior_rule. "
+
+        "Никогда не создавай заметку, задачу, напоминание или правило только из короткого ответа «да», «давай», «ок», «продолжай» или другой реплики-подтверждения. Это продолжение разговора, а не команда сохранения. Если до этого предложила рассказ, объяснить или показать что-то — выполни обещанное, а не сохраняй служебную запись. "
+
         "Если пользователь говорит, что находится, переехал или путешествует в другой стране/часовом поясе — используй set_timezone с подходящим IANA ID (например Китай — Asia/Shanghai). Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
-        "Текущие новости, погоду и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
+        "Для актуальной погоды обязательно вызывай get_weather. Понимай город по смыслу и контексту: сокращения, разговорные названия и падежи; если город не указан, передай пустой city, чтобы использовать город пользователя. Если город невозможно понять однозначно — задай короткий уточняющий вопрос, не угадывай. Актуальные новости и курс обрабатывает внешний live-router — не выдумывай их самостоятельно. "
 
         "Когда пользователь просит найти, проверить, изучить, сравнить, подобрать или исследовать что-то во внешнем интернете, вызывай internet_search. Это относится не только к товарам: ищи статьи, сервисы, факты, рекомендации и ссылки. Сначала различай внешний интернет и сохранённую память пользователя. "
 
         "У тебя есть сохранённая память пользователя (knowledge): фото, скриншоты, сайты, URL, заметки, чек, сущности, проекты. "
 
-        "Если пользователь спрашивает о ранее сохранённом — например «где я храню базу», «что я сохранял для Noema», «какой сайт я кидал», «покажи/найди Тошку», «что ты знаешь про ...», «что сохранял вчера», «покажи тот фото/скрин» — СНАЧАЛА сделай knowledge_search с подходящими query/project/entity. Не говори «у меня нет доступа», не написав в search. "
+        "Если пользователь спрашивает о ранее сохранённом — например «где я храню базу», «что я сохранял для Noema», «какой сайт я кидал», «покажи/найди Тошку», «что ты знаешь про ...», «что сохранял вчера», «покажи тот фото/скрин» — СНАЧАЛА сделай knowledge_search с подходящими query/project/entity. Вопросы «есть ли у меня питомцы/домашние животные» тоже ищи широко по питомцам, животным и их именам, а не только по точной фразе. Не говори «у меня нет доступа», не написав в search. "
 
         "Если нужен конкретный элемент из results — можно knowledge_get по id или knowledge_files для файлов. "
 
@@ -2260,6 +2389,8 @@ def system_prompt(chat_id):
         "Не раскрывай внутренние модели, OpenRouter или провайдера. "
 
         "Отвечай коротко, естественно и персонально. "
+
+        f"Активные правила пользователя: {rules_text}. "
 
         f"Сейчас {now.isoformat()}, timezone {chat_tz.key}."
 
@@ -2367,6 +2498,10 @@ def write_confirmation(results):
         elif n=="save_note": parts.append("Заметка сохранена.")
 
         elif n=="save_behavior_rule": parts.append("Правило добавлено в настройки.")
+
+        elif n=="update_behavior_rule": parts.append("Правило обновлено.")
+
+        elif n=="delete_behavior_rule": parts.append("Правило удалено.")
 
     out=[]
 
@@ -2635,6 +2770,7 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
 async def safe_error(update,e):
 
     code=str(e)
+    LOGGER.exception("Request failed for chat %s: %s", update.effective_chat.id if update.effective_chat else "?", code, exc_info=e)
 
     msg={"MODEL_BUSY":"Сейчас модель перегружена. Повтори сообщение через минуту.",
 
@@ -3231,10 +3367,32 @@ async def callback(update,context):
         text, markup = notes_page(q.message.chat_id, int(page))
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "settings:rules":
-        rules = behavior_rules_for(q.message.chat_id)
-        text = "📜 Правила бота\n\n" + "\n".join(
-            f"{'●' if r['enabled'] else '○'} {r['description']}" for r in rules)
-        return await q.edit_message_text(text)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data.startswith("rule:edit:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        if not any(rule["id"] == rule_id for rule in behavior_rules_for(q.message.chat_id)):
+            return await q.edit_message_text("Правило не найдено.")
+        context.user_data["awaiting_rule_edit"] = rule_id
+        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:rules")]]))
+    if q.data.startswith("rule:deleteask:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        return await q.edit_message_text(f"Удалить правило <code>#{rule_id}</code>?", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+        ]))
+    if q.data.startswith("rule:delete:"):
+        rule_id = int(q.data.rsplit(":", 1)[1])
+        delete_behavior_rule(q.message.chat_id, rule_id=rule_id)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data == "rule:deleteallask":
+        return await q.edit_message_text("Удалить все правила? Напоминания и другие данные не затрону.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+        ]))
+    if q.data == "rule:deleteall":
+        delete_behavior_rule(q.message.chat_id, all=True)
+        text, markup = rules_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "settings:iphone":
         text, markup = iphone_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -3377,6 +3535,15 @@ async def callback(update,context):
             return await q.answer("Нет доступа.", show_alert=True)
         text, markup = shared_usage_users_page()
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    if q.data == "keys:sync_labels":
+        if q.message.chat_id not in ADMIN_CHAT_IDS:
+            return await q.answer("Нет доступа.", show_alert=True)
+        result = await asyncio.to_thread(sync_managed_key_labels)
+        if not result.get("ok"):
+            return await q.answer("Не удалось связаться с OpenRouter. Попробуйте позже.", show_alert=True)
+        text, markup = api_keys_page(q.message.chat_id)
+        await q.answer(f"Синхронизировано ключей: {int(result.get('updated') or 0)}")
+        return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     if q.data.startswith("keys:admin_users:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
@@ -3388,14 +3555,15 @@ async def callback(update,context):
     if q.data.startswith("keys:admin_user:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
-        _, _, _, user_number, page = q.data.split(":")
+        _, _, user_number, page = q.data.split(":")
         with conn() as c:
             user = c.execute("SELECT user_number,chat_id,username,display_name FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
         if not user:
             return await q.edit_message_text("Пользователь не найден.")
         user = dict(user)
-        rows = usage_summary(user["chat_id"], source="shared")
-        text = usage_text(rows, f'📊 <b>Общий ключ · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        rows = [row for row in usage_summary(user["chat_id"])
+                if row.get("source") in {"shared", "managed"}]
+        text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
             [InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")],
@@ -3446,6 +3614,27 @@ def settings_keyboard(chat_id=None):
     return InlineKeyboardMarkup(rows)
 
 
+def rules_page(chat_id):
+    rules = behavior_rules_for(chat_id)
+    lines = ["📜 <b>Правила поведения</b>", ""]
+    if not rules:
+        lines.append("Правил пока нет.")
+    else:
+        for rule in rules:
+            marker = "●" if rule["enabled"] else "○"
+            lines.append(f'{marker} <code>#{rule["id"]}</code> {html.escape(rule["description"])}')
+    buttons = []
+    for rule in rules:
+        buttons.append([
+            InlineKeyboardButton(f'✏️ #{rule["id"]}', callback_data=f'rule:edit:{rule["id"]}'),
+            InlineKeyboardButton(f'🗑 #{rule["id"]}', callback_data=f'rule:deleteask:{rule["id"]}'),
+        ])
+    if rules:
+        buttons.append([InlineKeyboardButton("🗑 Удалить все правила", callback_data="rule:deleteallask")])
+    buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
 def iphone_settings_page(chat_id):
     devices = quick_action_devices(chat_id)
     lines = ["📱 <b>Быстрые действия iPhone</b>", "Одна голосовая команда — на любую кнопку iPhone. Отдельно можно добавить отправку файлов через «Поделиться». Каждое устройство привязано только к своему чату."]
@@ -3489,6 +3678,7 @@ def api_keys_page(chat_id):
     else:
         state = "Автовыдача ждёт <code>USER_SECRETS_MASTER_KEY</code> для безопасного хранения ключей."
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
+               [InlineKeyboardButton("↻ Синхронизировать номера OpenRouter", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
     return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", InlineKeyboardMarkup(buttons)
 
@@ -3528,11 +3718,11 @@ def shared_usage_users_page(page=0, page_size=8):
     page = max(0, min(int(page), pages - 1))
     shown = users[page * page_size:(page + 1) * page_size]
     if not users:
-        return ("📈 <b>Общий ключ · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
+        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")]]))
     total_cost = sum(float(row["cost"] or 0) for row in users)
     total_requests = sum(int(row["requests"] or 0) for row in users)
-    lines = ["📈 <b>Общий ключ · пользователи</b>",
+    lines = ["📈 <b>Ключи Noema · пользователи</b>",
              f"Пользователей: <b>{len(users)}</b> · Запросов: <b>{total_requests:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", ""]
     buttons = []
     for row in shown:
@@ -3702,6 +3892,13 @@ async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
     register_bot_user(cid, getattr(update, "effective_user", None))
+
+    rule_id = context.user_data.pop("awaiting_rule_edit", None)
+    if rule_id is not None:
+        result = update_behavior_rule(cid, int(rule_id), t)
+        if not result.get("ok"):
+            return await update.effective_message.reply_text("Не удалось обновить правило.")
+        return await update.effective_message.reply_text(f'📜 Правило <code>#{rule_id}</code> обновлено.', parse_mode="HTML")
 
     if context.user_data.pop("awaiting_task_text", False):
         raw = t.strip()
@@ -3997,11 +4194,17 @@ async def image_handler(update,context):
 
         final_text=pre
 
+        # Preserve a compact representation of the shared material in the
+        # dialogue, so any later follow-up refers to it without phrase-specific
+        # matching or a special-case workflow.
+        inquiry = build_inquiry_input(result)
+        if inquiry:
+            add_message(cid, "user", inquiry)
+            add_message(cid, "assistant", pre)
+
         q=caption.strip().lower()
 
         if q.endswith("?") or any(w in q for w in ("что","какой","какая","какие","какое","сколько","написано","опиши","расскажи","покажи")):
-
-            inquiry=build_inquiry_input(result)
 
             if inquiry:
 
