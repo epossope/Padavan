@@ -128,7 +128,7 @@ OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
 STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
-MANAGED_KEY_LOCK = threading.Lock()
+MANAGED_KEY_LOCK = threading.RLock()
 
 
 
@@ -864,6 +864,12 @@ def init_db():
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS managed_key_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            user_number INTEGER NOT NULL DEFAULT 0, previous_key_hash TEXT NOT NULL DEFAULT '',
+            new_key_hash TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS usage_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
             source TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1260,6 +1266,48 @@ def provision_managed_api_key(chat_id):
                       "ON CONFLICT(chat_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,key_hash=excluded.key_hash,key_hint=excluded.key_hint,limit_usd=excluded.limit_usd,active=1,updated_at=excluded.updated_at",
                       (chat_id, encrypted, key_hash, hint, USER_MONTHLY_LIMIT_USD, 1, now, now))
         return raw_key
+
+
+def replace_missing_managed_api_key(chat_id, reason="OpenRouter rejected the previous key"):
+    """Replace only a confirmed-invalid managed key and preserve an audit trail."""
+    if not OR_MANAGEMENT_KEY or not secrets_cipher():
+        return None
+    with MANAGED_KEY_LOCK:
+        with conn() as c:
+            old = c.execute("SELECT key_hash FROM managed_api_keys WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+            user = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
+            if not old:
+                return None
+            c.execute("UPDATE managed_api_keys SET active=0,updated_at=? WHERE chat_id=?",
+                      (datetime.now(timezone.utc).isoformat(), chat_id))
+        new_key = provision_managed_api_key(chat_id)
+        if not new_key:
+            # Do not silently fall through to the common project key after a
+            # user's private key was deleted remotely.
+            with conn() as c:
+                c.execute("UPDATE managed_api_keys SET active=1 WHERE chat_id=?", (chat_id,))
+            return None
+        with conn() as c:
+            current = c.execute("SELECT key_hash FROM managed_api_keys WHERE chat_id=?", (chat_id,)).fetchone()
+            c.execute("INSERT INTO managed_key_events(chat_id,user_number,previous_key_hash,new_key_hash,reason,created_at) VALUES(?,?,?,?,?,?)",
+                      (chat_id, int(user["user_number"]) if user else 0, old["key_hash"] or "",
+                       current["key_hash"] if current else "", reason, datetime.now(timezone.utc).isoformat()))
+        LOGGER.warning("Reissued managed OpenRouter key for chat %s", chat_id)
+        return new_key
+
+
+def recover_missing_managed_key(chat_id, response):
+    """A 401 is the safe signal for a deleted/revoked credential, not a quota error."""
+    if getattr(response, "status_code", None) != 401 or not managed_api_key(chat_id):
+        return False
+    return bool(replace_missing_managed_api_key(chat_id, "OpenRouter returned HTTP 401"))
+
+
+def managed_key_history(chat_id, limit=5):
+    with conn() as c:
+        rows = c.execute("SELECT reason,created_at FROM managed_key_events WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                         (chat_id, limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def sync_managed_key_labels():
@@ -2455,6 +2503,8 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
     for model in models:
 
+        recovered_key = False
+
         for attempt in range(2):
 
             started = time.perf_counter()
@@ -2470,6 +2520,10 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 return choice["message"]
 
             last=(r.status_code,r.text)
+
+            if not recovered_key and recover_missing_managed_key(chat_id, r):
+                recovered_key = True
+                continue
 
             if model != models[-1]:
                 print(f"LLM fallback chat_id={chat_id} from={model} status={r.status_code}")
@@ -2700,6 +2754,16 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
                 return content.strip()
 
             last=(r.status_code,r.text)
+            if recover_missing_managed_key(chat_id, r):
+                r=request_chat(chat_id, model, messages, tools, "auto")
+                if r.ok:
+                    data = r.json()
+                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                    return data["choices"][0]["message"]
+                last=(r.status_code,r.text)
+
+            if recover_missing_managed_key(chat_id, r) and attempt == 0:
+                continue
 
             if r.status_code==429 or 500<=r.status_code<600:
 
@@ -2719,10 +2783,14 @@ def transcribe(chat_id, path):
 
     # A Noema-managed key is a complete private balance: speech-to-text,
     # chat and Vision all belong to the same Telegram user.
-    key, source = api_key_for_chat(chat_id)
-    r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-
-                    json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+    source = ""
+    r = None
+    for attempt in range(2):
+        key, source = api_key_for_chat(chat_id)
+        r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+        if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
+            break
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
@@ -2886,6 +2954,25 @@ async def set_today_emoji(update, context):
     set_app_setting("today_button_custom_emoji_id", entity.custom_emoji_id)
     return await update.effective_message.reply_text(
         "Готово — живой календарь установлен на кнопку «Сегодня».", reply_markup=main_keyboard())
+
+
+async def set_interface_emoji(update, context):
+    """Capture a premium custom emoji for a supported Noema interface slot."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    slots = {"open": "пустой квадрат задачи", "done": "выполненная задача"}
+    slot = (context.args[0].lower() if context.args else "")
+    if slot not in slots:
+        return await update.effective_message.reply_text(
+            "Формат: <code>/setemoji open ◻️</code> или <code>/setemoji done ✅</code>\n"
+            "После команды выбери живой эмодзи из Premium-панели.", parse_mode="HTML")
+    entity = next((item for item in (update.effective_message.entities or [])
+                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+    if not entity:
+        return await update.effective_message.reply_text("Не вижу живого эмодзи. Выбери его из Premium-панели Telegram и отправь команду ещё раз.")
+    set_app_setting(f"task_{slot}_custom_emoji_id", entity.custom_emoji_id)
+    return await update.effective_message.reply_text(f"Готово — установлен значок «{slots[slot]}».")
 
 
 
@@ -3129,8 +3216,10 @@ def plan_page(chat_id, day, page=0, page_size=12):
             late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
             lines.append(f'{marker} <code>#{task["id"]}</code> · задача — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
+            emoji_id = app_setting(f"task_{'done' if status == 'done' else 'open'}_custom_emoji_id")
             task_toggle_buttons.append(InlineKeyboardButton(
-                f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
+                f"#{task['id']}" if emoji_id else f"{toggle_icon} #{task['id']}",
+                callback_data=f"tasktoggle:{task['id']}:{day}:{page}", icon_custom_emoji_id=emoji_id or None))
         else:
             reminder = entry
             is_completed = bool(reminder["acknowledged"])
@@ -3613,6 +3702,7 @@ async def callback(update,context):
         rows = [row for row in usage_summary(user["chat_id"])
                 if row.get("source") in {"shared", "managed"}]
         text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        text += managed_key_lifecycle_text(user["chat_id"])
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
             [InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")],
@@ -3751,6 +3841,24 @@ def usage_text(rows, title, show_chats=False):
             lines.append(f"  {source} ключ")
     if len(rows) > 8:
         lines.append(f"\nПоказаны 8 из {len(rows)} моделей.")
+    return "\n".join(lines)
+
+
+def managed_key_lifecycle_text(chat_id):
+    with conn() as c:
+        current = c.execute("SELECT created_at,updated_at FROM managed_api_keys WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+    lines = ["", "🔑 <b>Ключ Noema</b>"]
+    if current:
+        created = str(current["created_at"] or "")[:10]
+        lines.append(f"Текущий · выпущен {created or '—'} · лимит ${USER_MONTHLY_LIMIT_USD:.2f}/мес.")
+    else:
+        lines.append("Отдельный ключ пока не выпущен.")
+    events = managed_key_history(chat_id)
+    if events:
+        lines.append("Замены:")
+        for event in events:
+            when = str(event["created_at"] or "")[:16].replace("T", " ")
+            lines.append(f"• {when} · новый ключ выпущен ({html.escape(event['reason'])})")
     return "\n".join(lines)
 
 
@@ -4597,6 +4705,8 @@ async def main_async():
     app.add_handler(CommandHandler("start",start))
 
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
+
+    app.add_handler(CommandHandler("setemoji", set_interface_emoji))
 
     app.add_handler(CallbackQueryHandler(callback))
 
