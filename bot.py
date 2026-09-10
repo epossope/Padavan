@@ -32,6 +32,7 @@ import time
 
 import shutil
 import threading
+import unicodedata
 from urllib.parse import parse_qsl
 
 from datetime import datetime, timezone, timedelta
@@ -765,11 +766,24 @@ def emoji_key(value):
     return html.unescape(str(value or "")).replace("\ufe0f", "").replace("\ufe0e", "")
 
 
+def is_live_emoji_fallback(value):
+    """Only custom emoji glyphs belong in the palette, never ordinary words."""
+    fallback = emoji_key(value)
+    if not fallback or len(fallback) > 16:
+        return False
+    # A custom emoji has an emoji/symbol glyph as its fallback.  Rejecting
+    # letters and digits prevents a malformed entity from turning every word
+    # like “Сегодня” into a picture in the UI.
+    if any(char.isalnum() or unicodedata.category(char)[0] in {"L", "N"} for char in fallback):
+        return False
+    return any(unicodedata.category(char) == "So" for char in fallback)
+
+
 def emoji_id_for(fallback):
     """Return the live equivalent for an ordinary interface emoji, if known."""
     expected = emoji_key(fallback)
     for item in reversed(reply_emoji_palette()):
-        if emoji_key(item["alt"]) == expected:
+        if is_live_emoji_fallback(item["alt"]) and emoji_key(item["alt"]) == expected:
             return item["id"]
     slot = EMOJI_SLOT_BY_FALLBACK.get(str(fallback or ""))
     return app_setting(f"interface_{slot}_custom_emoji_id") if slot else ""
@@ -818,7 +832,7 @@ def reply_emoji_palette():
     for item in items if isinstance(items, list) else []:
         emoji_id = str(item.get("id") or "") if isinstance(item, dict) else ""
         alt = str(item.get("alt") or "") if isinstance(item, dict) else ""
-        if emoji_id.isdigit() and alt and len(alt) <= 16:
+        if emoji_id.isdigit() and is_live_emoji_fallback(alt):
             out.append({"id": emoji_id, "alt": alt})
     return out
 
@@ -847,19 +861,26 @@ def reply_emoji_prefix(chat_id):
 def animate_configured_emojis(rendered_html, limit):
     """Replace every configured Unicode fallback in a rendered reply with its live Telegram emoji."""
     replacements = {}
+    variants = set()
     for item in reply_emoji_palette():
         # One animation per Unicode fallback; the newest configured variant is
         # enough and avoids nesting tags when a pack has duplicates.
+        if not is_live_emoji_fallback(item["alt"]):
+            continue
         canonical = emoji_key(item["alt"])
         if canonical:
             replacements[canonical] = item["id"]
+            variants.update((item["alt"], canonical, canonical + "\ufe0f"))
+    # A separately chosen interface icon (for example the Today calendar)
+    # must also animate in headings and system notices, not just in its button.
+    for fallback, slot in EMOJI_SLOT_BY_FALLBACK.items():
+        emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+        canonical = emoji_key(fallback)
+        if emoji_id and canonical:
+            replacements[canonical] = emoji_id
+            variants.update((fallback, canonical, canonical + "\ufe0f"))
     if not replacements or limit <= 0:
         return rendered_html, 0
-    variants = set()
-    for item in reply_emoji_palette():
-        canonical = emoji_key(item["alt"])
-        if canonical:
-            variants.update((item["alt"], canonical, canonical + "\ufe0f"))
     pattern = re.compile("|".join(re.escape(html.escape(alt)) for alt in sorted(variants, key=len, reverse=True) if alt))
     used = 0
     parts = re.split(r"(<[^>]+>)", rendered_html)
@@ -895,14 +916,24 @@ def live_markup(markup):
     if not isinstance(markup, InlineKeyboardMarkup):
         return markup
     rows = []
+    palette = reply_emoji_palette()
     for row in markup.inline_keyboard:
         rendered_row = []
         for button in row:
             if button.icon_custom_emoji_id:
-                rendered_row.append(button)
+                fallback = next((item["alt"] for item in reversed(palette)
+                                 if is_live_emoji_fallback(item["alt"])
+                                 and item["id"] == button.icon_custom_emoji_id), "")
+                if fallback:
+                    payload = button.to_dict()
+                    payload["text"] = remove_button_fallback(button.text, fallback)
+                    rendered_row.append(InlineKeyboardButton.de_json(payload, None))
+                else:
+                    rendered_row.append(button)
                 continue
-            match = next((item["alt"] for item in reversed(reply_emoji_palette())
-                          if emoji_key(item["alt"]) and emoji_key(item["alt"]) in emoji_key(button.text)), "")
+            match = next((item["alt"] for item in reversed(palette)
+                          if is_live_emoji_fallback(item["alt"])
+                          and emoji_key(item["alt"]) in emoji_key(button.text)), "")
             emoji_id = emoji_id_for(match) if match else ""
             if not emoji_id:
                 rendered_row.append(button)
@@ -3217,6 +3248,8 @@ async def add_reply_emoji(update, context):
     added = 0
     for entity in entities:
         alt = message.parse_entity(entity) or "✨"
+        if not is_live_emoji_fallback(alt):
+            continue
         if not any(item["id"] == entity.custom_emoji_id for item in palette):
             palette.append({"id": entity.custom_emoji_id, "alt": alt})
             added += 1
