@@ -783,6 +783,20 @@ def reply_emoji_prefix(chat_id):
     return f'<tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji> '
 
 
+def animate_configured_emojis(rendered_html):
+    """Replace every configured Unicode fallback in a rendered reply with its live Telegram emoji."""
+    replacements = {}
+    for item in reply_emoji_palette():
+        # One animation per Unicode fallback; the newest configured variant is
+        # enough and avoids nesting tags when a pack has duplicates.
+        replacements[item["alt"]] = item["id"]
+    result = rendered_html
+    for alt, emoji_id in sorted(replacements.items(), key=lambda pair: len(pair[0]), reverse=True):
+        live = f'<tg-emoji emoji-id="{emoji_id}">{html.escape(alt)}</tg-emoji>'
+        result = result.replace(html.escape(alt), live)
+    return result
+
+
 
 def ensure_column(c, table, column, sql_type):
 
@@ -2882,6 +2896,7 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
             # The reply keyboard belongs to a lasting answer, never to the
             # temporary activity card which is deleted after processing.
             kwargs = {"parse_mode": TelegramRenderer.parse_mode}
+            chunk = animate_configured_emojis(chunk)
             if index == 0:
                 kwargs["reply_markup"] = main_keyboard()
                 chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
