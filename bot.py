@@ -769,7 +769,17 @@ def reply_emoji_palette():
         alt = str(item.get("alt") or "") if isinstance(item, dict) else ""
         if emoji_id.isdigit() and alt and len(alt) <= 16:
             out.append({"id": emoji_id, "alt": alt})
-    return out[:48]
+    return out
+
+
+def reply_emoji_limit(text_length):
+    if text_length <= 180:
+        return 1
+    if text_length <= 700:
+        return 3
+    if text_length <= 1600:
+        return 5
+    return 7
 
 
 def reply_emoji_prefix(chat_id):
@@ -783,18 +793,30 @@ def reply_emoji_prefix(chat_id):
     return f'<tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji> '
 
 
-def animate_configured_emojis(rendered_html):
+def animate_configured_emojis(rendered_html, limit):
     """Replace every configured Unicode fallback in a rendered reply with its live Telegram emoji."""
     replacements = {}
     for item in reply_emoji_palette():
         # One animation per Unicode fallback; the newest configured variant is
         # enough and avoids nesting tags when a pack has duplicates.
         replacements[item["alt"]] = item["id"]
-    result = rendered_html
-    for alt, emoji_id in sorted(replacements.items(), key=lambda pair: len(pair[0]), reverse=True):
-        live = f'<tg-emoji emoji-id="{emoji_id}">{html.escape(alt)}</tg-emoji>'
-        result = result.replace(html.escape(alt), live)
-    return result
+    if not replacements or limit <= 0:
+        return rendered_html, 0
+    pattern = re.compile("|".join(re.escape(html.escape(alt)) for alt in sorted(replacements, key=len, reverse=True)))
+    used = 0
+    parts = re.split(r"(<[^>]+>)", rendered_html)
+    for index, part in enumerate(parts):
+        if part.startswith("<"):
+            continue
+        def replace(match):
+            nonlocal used
+            if used >= limit:
+                return match.group(0)
+            alt = html.unescape(match.group(0))
+            used += 1
+            return f'<tg-emoji emoji-id="{replacements[alt]}">{match.group(0)}</tg-emoji>'
+        parts[index] = pattern.sub(replace, part)
+    return "".join(parts), used
 
 
 
@@ -2892,14 +2914,19 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
     eff="voice_and_text" if force_voice else (("voice_and_text" if voice_in else "text") if mode=="auto" else mode)
 
     if eff in ("text","voice_and_text"):
+        total_emoji_limit = reply_emoji_limit(len(str(answer or "")))
         for index, chunk in enumerate(TelegramRenderer.chunks(answer)):
             # The reply keyboard belongs to a lasting answer, never to the
             # temporary activity card which is deleted after processing.
             kwargs = {"parse_mode": TelegramRenderer.parse_mode}
-            chunk = animate_configured_emojis(chunk)
+            # Reserve one animation for the leading marker on the first part.
+            available = max(0, total_emoji_limit - (1 if index == 0 else 0))
+            chunk, used = animate_configured_emojis(chunk, available)
+            total_emoji_limit -= used
             if index == 0:
                 kwargs["reply_markup"] = main_keyboard()
                 chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
+                total_emoji_limit -= 1
             await update.effective_message.reply_text(chunk, **kwargs)
 
     if eff in ("voice","voice_and_text"):
@@ -3015,6 +3042,10 @@ async def set_interface_emoji(update, context):
         "settings": "кнопка «Настройки»", "more": "кнопка «Ещё»",
         "tasks": "раздел «Задачи»", "reminders": "раздел «Напоминания»",
         "people": "раздел «Люди»", "notes": "раздел «Заметки»", "budget": "раздел «Бюджет»",
+        "model": "настройка «Модель»", "vision": "настройка «Vision»",
+        "replymode": "настройка «Режим ответа»", "rules": "настройка «Правила»",
+        "iphone": "настройка «iPhone»", "keys": "настройка «Управление AI»",
+        "status": "настройка «Статус»", "clear": "настройка «Очистить диалог»",
         "open": "пустой квадрат задачи", "done": "выполненная задача", "failed": "невыполненная задача",
     }
     slot = (context.args[0].lower() if context.args else "")
@@ -3037,9 +3068,10 @@ async def emoji_help(update, context):
         "<b>Живые эмодзи Noema</b>\n\n"
         "Главное меню: <code>today</code>, <code>briefing</code>, <code>settings</code>, <code>more</code>.\n"
         "Раздел «Ещё»: <code>tasks</code>, <code>reminders</code>, <code>people</code>, <code>notes</code>, <code>budget</code>.\n"
+        "Настройки: <code>model</code>, <code>vision</code>, <code>replymode</code>, <code>rules</code>, <code>iphone</code>, <code>keys</code>, <code>status</code>, <code>clear</code>.\n"
         "Задачи: <code>open</code>, <code>done</code>, <code>failed</code>.\n\n"
         "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.\n\n"
-        "Для ответов: отправь <code>/replyemoji</code> и до 48 живых эмодзи в том же сообщении. Очистить: <code>/clearreplyemojis</code>.",
+        "Для ответов: отправь <code>/replyemoji</code> и любые живые эмодзи в том же сообщении. Список — «Настройки → ✨ Эмодзи».",
         parse_mode="HTML")
 
 
@@ -3056,14 +3088,12 @@ async def add_reply_emoji(update, context):
     palette = reply_emoji_palette()
     added = 0
     for entity in entities:
-        if len(palette) >= 48:
-            break
         alt = entity.extract_from(message.text or "") or "✨"
         if not any(item["id"] == entity.custom_emoji_id for item in palette):
             palette.append({"id": entity.custom_emoji_id, "alt": alt})
             added += 1
     set_app_setting("reply_custom_emoji_palette", json.dumps(palette, ensure_ascii=False))
-    return await message.reply_text(f"Добавлено: {added}. В палитре ответов: {len(palette)}/48.")
+    return await message.reply_text(f"Добавлено: {added}. В палитре ответов: {len(palette)}.")
 
 
 async def clear_reply_emojis(update, context):
@@ -3751,6 +3781,28 @@ async def callback(update,context):
     if q.data == "settings:keys":
         text, markup = api_keys_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data == "settings:emoji":
+        if q.message.chat_id not in ADMIN_CHAT_IDS:
+            return await q.answer("Нет доступа.", show_alert=True)
+        text, markup = emoji_palette_page()
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data.startswith("emoji:page:"):
+        if q.message.chat_id not in ADMIN_CHAT_IDS:
+            return await q.answer("Нет доступа.", show_alert=True)
+        page = q.data.rsplit(":", 1)[1]
+        if page == "noop":
+            return
+        text, markup = emoji_palette_page(int(page))
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data == "emoji:clearask":
+        return await q.edit_message_text("Очистить всю палитру живых эмодзи для ответов?", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Очистить", callback_data="emoji:clear")],
+            [InlineKeyboardButton("Отмена", callback_data="settings:emoji")],
+        ]))
+    if q.data == "emoji:clear":
+        set_app_setting("reply_custom_emoji_palette", "[]")
+        text, markup = emoji_palette_page()
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "keys:add":
         if not secrets_cipher():
             return await q.answer("Сначала нужен USER_SECRETS_MASTER_KEY на сервере.", show_alert=True)
@@ -3835,20 +3887,50 @@ async def callback(update,context):
 def settings_keyboard(chat_id=None):
     if chat_id in ADMIN_CHAT_IDS:
         rows = [
-            [InlineKeyboardButton("🧠 Модель", callback_data="settings:model"), InlineKeyboardButton("👁 Vision", callback_data="settings:vision")],
-            [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
-            [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("🔐 Управление AI", callback_data="settings:keys")],
-            [InlineKeyboardButton("⚙️ Статус", callback_data="settings:status"), InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
+            [interface_inline_button("model", "🧠", "Модель", "settings:model"), interface_inline_button("vision", "👁", "Vision", "settings:vision")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("keys", "🔐", "Управление AI", "settings:keys")],
+            [InlineKeyboardButton("✨ Эмодзи", callback_data="settings:emoji")],
+            [interface_inline_button("status", "⚙️", "Статус", "settings:status"), interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
     else:
         rows = [
-            [InlineKeyboardButton("🔊 Режим ответа", callback_data="menu:mode"), InlineKeyboardButton("📜 Правила", callback_data="settings:rules")],
-            [InlineKeyboardButton("📱 iPhone", callback_data="settings:iphone"), InlineKeyboardButton("⚙️ Статус", callback_data="settings:status")],
-            [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("status", "⚙️", "Статус", "settings:status")],
+            [interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
     return InlineKeyboardMarkup(rows)
+
+
+def emoji_palette_page(page=0, page_size=25):
+    palette = reply_emoji_palette()
+    pages = max(1, (len(palette) + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    shown = palette[page * page_size:(page + 1) * page_size]
+    lines = ["✨ <b>Живые эмодзи Noema</b>",
+             f"В палитре: <b>{len(palette)}</b>. В одном ответе Noema использует до 1 / 3 / 5 / 7 анимаций — по длине текста.",
+             "", "Добавить: отправь <code>/replyemoji</code> и любые живые эмодзи в том же сообщении."]
+    if shown:
+        lines.extend(["", f"<b>Список · {page + 1}/{pages}</b>"])
+        for index, item in enumerate(shown, page * page_size + 1):
+            lines.append(f'<code>{index:03d}</code> <tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji>')
+    else:
+        lines.append("\nПалитра пока пуста.")
+    buttons = []
+    if pages > 1:
+        nav = []
+        if page:
+            nav.append(InlineKeyboardButton("‹", callback_data=f"emoji:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="emoji:page:noop"))
+        if page + 1 < pages:
+            nav.append(InlineKeyboardButton("›", callback_data=f"emoji:page:{page + 1}"))
+        buttons.append(nav)
+    if palette:
+        buttons.append([InlineKeyboardButton("🗑 Очистить палитру", callback_data="emoji:clearask")])
+    buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 def rules_page(chat_id):
