@@ -748,16 +748,55 @@ EMOJI_SLOT_GROUPS = {
 }
 EMOJI_SLOT_NAMES = {slot: label for group in EMOJI_SLOT_GROUPS.values() for slot, label in group}
 
+# A button can have its own hand-picked icon, while the reply palette remains
+# the convenient default for the rest of the interface.  The map also lets a
+# configured menu icon animate the same symbol in headings and notices.
+EMOJI_SLOT_BY_FALLBACK = {
+    "📅": "today", "🌅": "briefing", "⚙️": "settings", "☰": "more",
+    "✅": "done", "◻️": "open", "❌": "failed", "⏰": "reminders",
+    "👥": "people", "📝": "notes", "💳": "budget", "🧠": "model",
+    "👁": "vision", "🔊": "replymode", "📜": "rules", "📱": "iphone",
+    "🔐": "keys", "🧹": "clear",
+}
+
+
+def emoji_key(value):
+    """Compare emoji without text/emoji presentation variation selectors."""
+    return html.unescape(str(value or "")).replace("\ufe0f", "").replace("\ufe0e", "")
+
+
+def emoji_id_for(fallback):
+    """Return the live equivalent for an ordinary interface emoji, if known."""
+    expected = emoji_key(fallback)
+    for item in reversed(reply_emoji_palette()):
+        if emoji_key(item["alt"]) == expected:
+            return item["id"]
+    slot = EMOJI_SLOT_BY_FALLBACK.get(str(fallback or ""))
+    return app_setting(f"interface_{slot}_custom_emoji_id") if slot else ""
+
+
+def remove_button_fallback(text, fallback):
+    """Leave a readable label after Telegram renders the live button icon."""
+    label = str(text or "")
+    canonical = emoji_key(fallback)
+    variants = (str(fallback or ""), canonical, canonical + "\ufe0f")
+    for variant in variants:
+        if variant and variant in label:
+            candidate = re.sub(r"\s{2,}", " ", label.replace(variant, "", 1)).strip()
+            if candidate:
+                return candidate
+    return label
+
 
 def interface_button(slot, fallback, text):
-    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id") or emoji_id_for(fallback)
     # Telegram only sends `text` back to the chat; icon_custom_emoji_id is
     # visual-only. Keep the fallback in text so the user's bubble is readable.
     return KeyboardButton(f"{fallback} {text}", icon_custom_emoji_id=emoji_id or None)
 
 
 def interface_inline_button(slot, fallback, text, callback_data):
-    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id") or emoji_id_for(fallback)
     return InlineKeyboardButton(text if emoji_id else f"{fallback} {text}", callback_data=callback_data,
                                 icon_custom_emoji_id=emoji_id or None)
 
@@ -811,20 +850,34 @@ def animate_configured_emojis(rendered_html, limit):
     for item in reply_emoji_palette():
         # One animation per Unicode fallback; the newest configured variant is
         # enough and avoids nesting tags when a pack has duplicates.
-        replacements[item["alt"]] = item["id"]
+        canonical = emoji_key(item["alt"])
+        if canonical:
+            replacements[canonical] = item["id"]
     if not replacements or limit <= 0:
         return rendered_html, 0
-    pattern = re.compile("|".join(re.escape(html.escape(alt)) for alt in sorted(replacements, key=len, reverse=True)))
+    variants = set()
+    for item in reply_emoji_palette():
+        canonical = emoji_key(item["alt"])
+        if canonical:
+            variants.update((item["alt"], canonical, canonical + "\ufe0f"))
+    pattern = re.compile("|".join(re.escape(html.escape(alt)) for alt in sorted(variants, key=len, reverse=True) if alt))
     used = 0
     parts = re.split(r"(<[^>]+>)", rendered_html)
+    inside_live_emoji = False
     for index, part in enumerate(parts):
         if part.startswith("<"):
+            if re.match(r"<tg-emoji\b", part, re.I):
+                inside_live_emoji = True
+            elif re.match(r"</tg-emoji\s*>", part, re.I):
+                inside_live_emoji = False
+            continue
+        if inside_live_emoji:
             continue
         def replace(match):
             nonlocal used
             if used >= limit:
                 return match.group(0)
-            alt = html.unescape(match.group(0))
+            alt = emoji_key(html.unescape(match.group(0)))
             used += 1
             return f'<tg-emoji emoji-id="{replacements[alt]}">{match.group(0)}</tg-emoji>'
         parts[index] = pattern.sub(replace, part)
@@ -841,9 +894,6 @@ def live_markup(markup):
     """Give every ordinary inline control a live icon when its emoji is in the palette."""
     if not isinstance(markup, InlineKeyboardMarkup):
         return markup
-    replacements = {item["alt"]: item["id"] for item in reply_emoji_palette()}
-    if not replacements:
-        return markup
     rows = []
     for row in markup.inline_keyboard:
         rendered_row = []
@@ -851,16 +901,57 @@ def live_markup(markup):
             if button.icon_custom_emoji_id:
                 rendered_row.append(button)
                 continue
-            emoji_id = next((replacements[alt] for alt in sorted(replacements, key=len, reverse=True)
-                             if alt and alt in button.text), "")
+            match = next((item["alt"] for item in reversed(reply_emoji_palette())
+                          if emoji_key(item["alt"]) and emoji_key(item["alt"]) in emoji_key(button.text)), "")
+            emoji_id = emoji_id_for(match) if match else ""
             if not emoji_id:
                 rendered_row.append(button)
                 continue
             payload = button.to_dict()
             payload["icon_custom_emoji_id"] = emoji_id
+            payload["text"] = remove_button_fallback(button.text, match)
             rendered_row.append(InlineKeyboardButton.de_json(payload, None))
         rows.append(rendered_row)
     return InlineKeyboardMarkup(rows)
+
+
+class LiveMessage:
+    """Apply the shared live palette to ordinary bot replies."""
+    def __init__(self, message):
+        self._message = message
+
+    def __getattr__(self, name):
+        return getattr(self._message, name)
+
+    async def reply_text(self, text, *args, **kwargs):
+        rendered = live_ui_text(text)
+        if rendered != str(text) and not kwargs.get("parse_mode"):
+            kwargs["parse_mode"] = "HTML"
+        if kwargs.get("reply_markup") is not None:
+            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
+        return await self._message.reply_text(rendered, *args, **kwargs)
+
+
+class LiveCallbackQuery:
+    """Keep every callback screen consistent without duplicating UI plumbing."""
+    def __init__(self, query):
+        self._query = query
+        self._message = LiveMessage(query.message) if query.message else None
+
+    def __getattr__(self, name):
+        return getattr(self._query, name)
+
+    @property
+    def message(self):
+        return self._message
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        rendered = live_ui_text(text)
+        if rendered != str(text) and not kwargs.get("parse_mode"):
+            kwargs["parse_mode"] = "HTML"
+        if kwargs.get("reply_markup") is not None:
+            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
+        return await self._query.edit_message_text(rendered, *args, **kwargs)
 
 
 
@@ -3014,7 +3105,8 @@ def activity_labels(text):
 
 async def begin_activity(message, labels):
     """One temporary, unobtrusive progress card for operations lasting seconds."""
-    card = await message.reply_text(labels[0])
+    first = live_ui_text(labels[0])
+    card = await message.reply_text(first, parse_mode="HTML" if first != labels[0] else None)
     stopped = asyncio.Event()
 
     async def animate():
@@ -3025,7 +3117,9 @@ async def begin_activity(message, labels):
                 break
             except asyncio.TimeoutError:
                 try:
-                    await card.edit_text(labels[min(index, len(labels) - 1)])
+                    label = labels[min(index, len(labels) - 1)]
+                    rendered = live_ui_text(label)
+                    await card.edit_text(rendered, parse_mode="HTML" if rendered != label else None)
                 except Exception:
                     return
                 index += 1
@@ -3142,9 +3236,10 @@ async def list_people(update,context):
 
     d=get_people(update.effective_chat.id)
 
-    if not d["people"]: return await update.effective_message.reply_text("Людей пока нет.")
+    if not d["people"]:
+        return await update.effective_message.reply_text(live_ui_text("👥 Людей пока нет."), parse_mode="HTML")
 
-    lines=["Люди:"]
+    lines=["👥 Люди:"]
 
     for p in d["people"][:20]:
 
@@ -3166,7 +3261,7 @@ async def list_people(update,context):
 
         for x in p.get("recent_interactions",[])[:3]: lines.append(f'  ↳ {x["interaction_date"]}: {x["interaction"]}')
 
-    await update.effective_message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text(live_ui_text("\n".join(lines)), parse_mode="HTML")
 
 
 
@@ -3420,7 +3515,8 @@ async def today_plan(update,context, day=None):
 
 async def callback(update,context):
 
-    q=update.callback_query; await q.answer()
+    raw_query=update.callback_query; await raw_query.answer()
+    q=LiveCallbackQuery(raw_query)
     register_bot_user(q.message.chat_id, getattr(update, "effective_user", None))
 
     # Model and key management is a platform setting now. Older inline
@@ -3957,7 +4053,7 @@ def settings_keyboard(chat_id=None):
         ]
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
-    return InlineKeyboardMarkup(rows)
+    return live_markup(InlineKeyboardMarkup(rows))
 
 
 def emoji_palette_page(page=0, page_size=25):
@@ -4287,6 +4383,16 @@ async def text_handler(update,context):
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
     register_bot_user(cid, getattr(update, "effective_user", None))
 
+    async def consume_menu_tap():
+        """Reply-keyboard taps cannot carry a custom-emoji entity.
+
+        Telegram only sends their plain text back to a bot.  Remove that
+        technical message in a private chat; the resulting Noema screen and
+        its controls carry the animated icon instead.
+        """
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+
     emoji_slot = context.user_data.pop("awaiting_interface_emoji", "")
     if emoji_slot:
         entity = next((item for item in (update.effective_message.entities or [])
@@ -4389,15 +4495,17 @@ async def text_handler(update,context):
             reply_markup=settings_keyboard(cid))
 
     if t in ("⚙️ Настройки", "Настройки"):
-        return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard(cid))
+        await consume_menu_tap()
+        return await update.effective_message.reply_text(live_ui_text("⚙️ Настройки"), reply_markup=settings_keyboard(cid), parse_mode="HTML")
 
     if t in ("☰ Ещё", "Ещё"):
+        await consume_menu_tap()
         return await update.effective_message.reply_text(
-            "Дополнительно:", reply_markup=InlineKeyboardMarkup([
+            live_ui_text("✨ Дополнительно:"), parse_mode="HTML", reply_markup=live_markup(InlineKeyboardMarkup([
                 [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"), interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
                 [interface_inline_button("people", "👥", "Люди", "menu:people"), interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
                 [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
-            ]))
+            ])))
 
     if t=="📚 Знания":
         return await update.effective_message.reply_text("📚 Знания\nНапишите, что найти: проект, человека, ресурс или тему. Например: «где Узел задеплоен?»")
@@ -4408,17 +4516,29 @@ async def text_handler(update,context):
 
     if t=="🔊 Голос+текст": set_mode(cid,"voice_and_text"); return await update.effective_message.reply_text("Режим: голос + текст.")
 
-    if t in ("📅 Сегодня", "Сегодня"): return await today_plan(update,context)
+    if t in ("📅 Сегодня", "Сегодня"):
+        await consume_menu_tap()
+        return await today_plan(update,context)
 
-    if t=="⏰ Напоминания": return await reminders(update,context)
+    if t=="⏰ Напоминания":
+        await consume_menu_tap()
+        return await reminders(update,context)
 
-    if t=="📝 Заметки": return await notes(update,context)
+    if t=="📝 Заметки":
+        await consume_menu_tap()
+        return await notes(update,context)
 
-    if t=="👥 Люди": return await list_people(update,context)
+    if t=="👥 Люди":
+        await consume_menu_tap()
+        return await list_people(update,context)
 
-    if t in ("💰 Расходы", "💳 Бюджет"): return await list_expenses(update,context)
+    if t in ("💰 Расходы", "💳 Бюджет"):
+        await consume_menu_tap()
+        return await list_expenses(update,context)
 
-    if t in ("🌅 Брифинг", "Брифинг"): return await update.effective_message.reply_text(live_ui_text(build_briefing(cid)), parse_mode="HTML")
+    if t in ("🌅 Брифинг", "Брифинг"):
+        await consume_menu_tap()
+        return await update.effective_message.reply_text(live_ui_text(build_briefing(cid)), parse_mode="HTML")
 
     if t=="🔎 Поиск": return await update.effective_message.reply_text("Напиши: «Найди в интернете ...»")
 
@@ -4517,7 +4637,9 @@ async def voice_handler(update,context):
     activity = await begin_activity(update.effective_message, ["🎙 Расшифровываю голос…", "🧠 Думаю…", "✍️ Готовлю ответ…"])
     try:
         f=await context.bot.get_file(update.effective_message.voice.file_id); await f.download_to_drive(custom_path=str(p))
-        txt=await asyncio.to_thread(transcribe, update.effective_chat.id, p); await update.effective_message.reply_text("🎤 "+txt)
+        txt=await asyncio.to_thread(transcribe, update.effective_chat.id, p)
+        transcript = "🎤 " + html.escape(txt)
+        await update.effective_message.reply_text(live_ui_text(transcript), parse_mode="HTML")
         a=await asyncio.to_thread(ask,update.effective_chat.id,txt); await send_answer(update,a,True,wants_voice(txt))
         await drain_media_outbox(update, context)
     except Exception as e:
@@ -4561,7 +4683,12 @@ async def image_handler(update,context):
 
         caption=msg.caption or ""
 
-        status_msg=await msg.reply_text("🧠 Расшифровываю изображение…")
+        status = "🧠 Расшифровываю изображение…"
+        rendered_status = live_ui_text(status)
+        try:
+            status_msg=await msg.reply_text(rendered_status, parse_mode="HTML")
+        except TypeError:  # lightweight test/message adapters without kwargs
+            status_msg=await msg.reply_text(status)
 
         try:
 
@@ -4616,7 +4743,8 @@ async def image_handler(update,context):
 
                 try:
 
-                    await status_msg.edit_text("🧠 Изучаю материал и готовлю ответ…")
+                    status = "🧠 Изучаю материал и готовлю ответ…"
+                    await status_msg.edit_text(live_ui_text(status), parse_mode="HTML")
                     model_ans=await asyncio.to_thread(ask,cid,inquiry)
 
                     if model_ans and model_ans not in (pre,"Готово."):
@@ -4627,11 +4755,13 @@ async def image_handler(update,context):
 
         chunks = TelegramRenderer.chunks(final_text or "Готово.")
         try:
-            await status_msg.edit_text(chunks[0], parse_mode=TelegramRenderer.parse_mode)
+            rendered, _ = animate_configured_emojis(chunks[0], reply_emoji_limit(len(chunks[0])))
+            await status_msg.edit_text(rendered, parse_mode=TelegramRenderer.parse_mode)
         except TypeError:  # lightweight test/message adapters without kwargs
             await status_msg.edit_text(chunks[0])
         for chunk in chunks[1:]:
-            await msg.reply_text(chunk, parse_mode=TelegramRenderer.parse_mode)
+            rendered, _ = animate_configured_emojis(chunk, reply_emoji_limit(len(chunk)))
+            await msg.reply_text(rendered, parse_mode=TelegramRenderer.parse_mode)
 
         await drain_media_outbox(update, context)
 
@@ -4657,7 +4787,7 @@ async def reminder_tick(context):
         prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
         sent_message = await context.bot.send_message(
             chat_id=row["chat_id"], text=live_ui_text(prefix + row["text"]), parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Выполнено", callback_data=f"ackrem:{row['id']}")]]),
+            reply_markup=live_markup(InlineKeyboardMarkup([[InlineKeyboardButton("✅ Выполнено", callback_data=f"ackrem:{row['id']}")]])),
         )
         next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
         with conn() as c:
@@ -4760,7 +4890,8 @@ def ingest_from_iphone(chat_id, text="", attachment=None):
 
 async def send_quick_action_feedback(request, chat_id, ok, message):
     try:
-        await request.app["telegram_app"].bot.send_message(chat_id=chat_id, text=message)
+        await request.app["telegram_app"].bot.send_message(
+            chat_id=chat_id, text=live_ui_text(message), parse_mode="HTML")
     except Exception:
         return web.json_response({"ok": False, "error": "telegram_delivery_failed"}, status=502)
     return web.json_response({"ok": ok, "message": message})
@@ -4770,7 +4901,7 @@ async def show_iphone_input(request, chat_id, text="", attachment=None):
     """Make iPhone activity visible in Telegram before Noema handles it."""
     bot = request.app["telegram_app"].bot
     if attachment and attachment.local_path:
-        caption = "📤 <b>С iPhone</b>"
+        caption = live_ui_text("📤 <b>С iPhone</b>")
         try:
             with open(attachment.local_path, "rb") as stream:
                 if (attachment.mime_type or "").lower().startswith("image/"):
@@ -4782,7 +4913,10 @@ async def show_iphone_input(request, chat_id, text="", attachment=None):
             LOGGER.warning("Unable to mirror iPhone attachment into chat %s", chat_id)
     visible = str(text or "").strip()
     if visible:
-        await bot.send_message(chat_id=chat_id, text=f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}", parse_mode="HTML")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=live_ui_text(f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}"),
+            parse_mode="HTML")
 
 
 async def quick_actions_run(request):
