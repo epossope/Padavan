@@ -739,6 +739,16 @@ def set_app_setting(key, value):
                   (key, value, datetime.now(timezone.utc).isoformat()))
 
 
+EMOJI_SLOT_GROUPS = {
+    "main": [("today", "Сегодня"), ("briefing", "Брифинг"), ("settings", "Настройки"), ("more", "Ещё")],
+    "more": [("tasks", "Задачи"), ("reminders", "Напоминания"), ("people", "Люди"), ("notes", "Заметки"), ("budget", "Бюджет")],
+    "settings": [("model", "Модель"), ("vision", "Vision"), ("replymode", "Режим ответа"), ("rules", "Правила"),
+                 ("iphone", "iPhone"), ("keys", "Управление AI"), ("status", "Статус"), ("clear", "Очистить диалог")],
+    "tasks": [("open", "Пустой квадрат"), ("done", "Галочка"), ("failed", "Не выполнено")],
+}
+EMOJI_SLOT_NAMES = {slot: label for group in EMOJI_SLOT_GROUPS.values() for slot, label in group}
+
+
 def interface_button(slot, fallback, text):
     emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
     return KeyboardButton(text, icon_custom_emoji_id=emoji_id) if emoji_id else KeyboardButton(f"{fallback} {text}")
@@ -3037,17 +3047,7 @@ async def set_interface_emoji(update, context):
     chat_id = update.effective_chat.id
     if chat_id not in ADMIN_CHAT_IDS:
         return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
-    slots = {
-        "today": "кнопка «Сегодня»", "briefing": "кнопка «Брифинг»",
-        "settings": "кнопка «Настройки»", "more": "кнопка «Ещё»",
-        "tasks": "раздел «Задачи»", "reminders": "раздел «Напоминания»",
-        "people": "раздел «Люди»", "notes": "раздел «Заметки»", "budget": "раздел «Бюджет»",
-        "model": "настройка «Модель»", "vision": "настройка «Vision»",
-        "replymode": "настройка «Режим ответа»", "rules": "настройка «Правила»",
-        "iphone": "настройка «iPhone»", "keys": "настройка «Управление AI»",
-        "status": "настройка «Статус»", "clear": "настройка «Очистить диалог»",
-        "open": "пустой квадрат задачи", "done": "выполненная задача", "failed": "невыполненная задача",
-    }
+    slots = EMOJI_SLOT_NAMES
     slot = (context.args[0].lower() if context.args else "")
     if slot not in slots:
         return await update.effective_message.reply_text(
@@ -3088,7 +3088,7 @@ async def add_reply_emoji(update, context):
     palette = reply_emoji_palette()
     added = 0
     for entity in entities:
-        alt = entity.extract_from(message.text or "") or "✨"
+        alt = message.parse_entity(entity) or "✨"
         if not any(item["id"] == entity.custom_emoji_id for item in palette):
             palette.append({"id": entity.custom_emoji_id, "alt": alt})
             added += 1
@@ -3786,6 +3786,28 @@ async def callback(update,context):
             return await q.answer("Нет доступа.", show_alert=True)
         text, markup = emoji_palette_page()
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+    if q.data == "emoji:slots":
+        return await q.edit_message_text("🎛 <b>Настройка кнопок</b>\n\nВыбери раздел.", parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="emoji:group:main"), InlineKeyboardButton("☰ Ещё", callback_data="emoji:group:more")],
+                [InlineKeyboardButton("⚙️ Настройки", callback_data="emoji:group:settings"), InlineKeyboardButton("✅ Задачи", callback_data="emoji:group:tasks")],
+                [InlineKeyboardButton("‹ Эмодзи", callback_data="settings:emoji")],
+            ]))
+    if q.data.startswith("emoji:group:"):
+        group = q.data.rsplit(":", 1)[1]
+        if group not in EMOJI_SLOT_GROUPS:
+            return await q.answer("Раздел не найден.", show_alert=True)
+        buttons = [[InlineKeyboardButton(label, callback_data=f"emoji:pick:{slot}")] for slot, label in EMOJI_SLOT_GROUPS[group]]
+        buttons.append([InlineKeyboardButton("‹ Разделы", callback_data="emoji:slots")])
+        return await q.edit_message_text("Выбери кнопку, затем отправь живой эмодзи.", reply_markup=InlineKeyboardMarkup(buttons))
+    if q.data.startswith("emoji:pick:"):
+        slot = q.data.rsplit(":", 1)[1]
+        if slot not in EMOJI_SLOT_NAMES:
+            return await q.answer("Кнопка не найдена.", show_alert=True)
+        context.user_data["awaiting_interface_emoji"] = slot
+        return await q.edit_message_text(
+            f"Выбрано: <b>{html.escape(EMOJI_SLOT_NAMES[slot])}</b>.\n\nТеперь просто отправь один живой эмодзи из Premium-панели.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="emoji:slots")]]))
     if q.data.startswith("emoji:page:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
@@ -3929,6 +3951,7 @@ def emoji_palette_page(page=0, page_size=25):
         buttons.append(nav)
     if palette:
         buttons.append([InlineKeyboardButton("🗑 Очистить палитру", callback_data="emoji:clearask")])
+    buttons.append([InlineKeyboardButton("🎛 Настроить кнопки", callback_data="emoji:slots")])
     buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -4229,6 +4252,18 @@ async def text_handler(update,context):
 
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
     register_bot_user(cid, getattr(update, "effective_user", None))
+
+    emoji_slot = context.user_data.pop("awaiting_interface_emoji", "")
+    if emoji_slot:
+        entity = next((item for item in (update.effective_message.entities or [])
+                       if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+        if not entity:
+            context.user_data["awaiting_interface_emoji"] = emoji_slot
+            return await update.effective_message.reply_text("Нужен именно живой эмодзи из Premium-панели. Попробуй ещё раз.")
+        key = f"task_{emoji_slot}_custom_emoji_id" if emoji_slot in {"open", "done", "failed"} else f"interface_{emoji_slot}_custom_emoji_id"
+        set_app_setting(key, entity.custom_emoji_id)
+        return await update.effective_message.reply_text(
+            f"Готово — кнопка «{EMOJI_SLOT_NAMES[emoji_slot]}» обновлена.", reply_markup=main_keyboard())
 
     rule_id = context.user_data.pop("awaiting_rule_edit", None)
     if rule_id is not None:
