@@ -52,7 +52,7 @@ from ddgs import DDGS
 
 from dotenv import load_dotenv
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update, WebAppInfo
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.error import BadRequest
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -128,14 +128,9 @@ OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
 STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
-MANAGED_KEY_LOCK = threading.Lock()
+MANAGED_KEY_LOCK = threading.RLock()
 
 
-
-KB = ReplyKeyboardMarkup([
-    ["🌅 Брифинг", "📅 Сегодня"],
-    ["⚙️ Настройки", "☰ Ещё"],
-], resize_keyboard=True, is_persistent=True)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -731,6 +726,77 @@ def conn():
     return c
 
 
+def app_setting(key, default=""):
+    with conn() as c:
+        row = c.execute("SELECT setting_value FROM app_settings WHERE setting_key=?", (key,)).fetchone()
+    return row["setting_value"] if row else default
+
+
+def set_app_setting(key, value):
+    with conn() as c:
+        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) "
+                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
+                  (key, value, datetime.now(timezone.utc).isoformat()))
+
+
+def interface_button(slot, fallback, text):
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    return KeyboardButton(text, icon_custom_emoji_id=emoji_id) if emoji_id else KeyboardButton(f"{fallback} {text}")
+
+
+def interface_inline_button(slot, fallback, text, callback_data):
+    emoji_id = app_setting(f"interface_{slot}_custom_emoji_id")
+    return InlineKeyboardButton(text if emoji_id else f"{fallback} {text}", callback_data=callback_data,
+                                icon_custom_emoji_id=emoji_id or None)
+
+
+def main_keyboard():
+    """Build the persistent keyboard with optional Telegram custom-emoji icons."""
+    return ReplyKeyboardMarkup([
+        [interface_button("briefing", "🌅", "Брифинг"), interface_button("today", "📅", "Сегодня")],
+        [interface_button("settings", "⚙️", "Настройки"), interface_button("more", "☰", "Ещё")],
+    ], resize_keyboard=True, is_persistent=True)
+
+
+def reply_emoji_palette():
+    try:
+        items = json.loads(app_setting("reply_custom_emoji_palette", "[]"))
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for item in items if isinstance(items, list) else []:
+        emoji_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+        alt = str(item.get("alt") or "") if isinstance(item, dict) else ""
+        if emoji_id.isdigit() and alt and len(alt) <= 16:
+            out.append({"id": emoji_id, "alt": alt})
+    return out[:48]
+
+
+def reply_emoji_prefix(chat_id):
+    palette = reply_emoji_palette()
+    if not palette:
+        return ""
+    # Stable rotation prevents a noisy random-looking feed while still using
+    # the complete palette across the conversation.
+    digest = hashlib.sha256(f"{chat_id}:{time.time_ns()}".encode()).digest()
+    item = palette[int.from_bytes(digest[:4], "big") % len(palette)]
+    return f'<tg-emoji emoji-id="{item["id"]}">{html.escape(item["alt"])}</tg-emoji> '
+
+
+def animate_configured_emojis(rendered_html):
+    """Replace every configured Unicode fallback in a rendered reply with its live Telegram emoji."""
+    replacements = {}
+    for item in reply_emoji_palette():
+        # One animation per Unicode fallback; the newest configured variant is
+        # enough and avoids nesting tags when a pack has duplicates.
+        replacements[item["alt"]] = item["id"]
+    result = rendered_html
+    for alt, emoji_id in sorted(replacements.items(), key=lambda pair: len(pair[0]), reverse=True):
+        live = f'<tg-emoji emoji-id="{emoji_id}">{html.escape(alt)}</tg-emoji>'
+        result = result.replace(html.escape(alt), live)
+    return result
+
+
 
 def ensure_column(c, table, column, sql_type):
 
@@ -843,6 +909,12 @@ def init_db():
             key_hash TEXT NOT NULL DEFAULT '', key_hint TEXT NOT NULL DEFAULT '',
             limit_usd REAL NOT NULL DEFAULT 2, active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS managed_key_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            user_number INTEGER NOT NULL DEFAULT 0, previous_key_hash TEXT NOT NULL DEFAULT '',
+            new_key_hash TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS usage_events(
@@ -1243,10 +1315,63 @@ def provision_managed_api_key(chat_id):
         return raw_key
 
 
+def replace_missing_managed_api_key(chat_id, reason="OpenRouter rejected the previous key"):
+    """Replace only a confirmed-invalid managed key and preserve an audit trail."""
+    if not OR_MANAGEMENT_KEY or not secrets_cipher():
+        return None
+    with MANAGED_KEY_LOCK:
+        with conn() as c:
+            old = c.execute("SELECT key_hash FROM managed_api_keys WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+            user = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
+            if not old:
+                return None
+            c.execute("UPDATE managed_api_keys SET active=0,updated_at=? WHERE chat_id=?",
+                      (datetime.now(timezone.utc).isoformat(), chat_id))
+        new_key = provision_managed_api_key(chat_id)
+        if not new_key:
+            # Do not silently fall through to the common project key after a
+            # user's private key was deleted remotely.
+            with conn() as c:
+                c.execute("UPDATE managed_api_keys SET active=1 WHERE chat_id=?", (chat_id,))
+            return None
+        with conn() as c:
+            current = c.execute("SELECT key_hash FROM managed_api_keys WHERE chat_id=?", (chat_id,)).fetchone()
+            c.execute("INSERT INTO managed_key_events(chat_id,user_number,previous_key_hash,new_key_hash,reason,created_at) VALUES(?,?,?,?,?,?)",
+                      (chat_id, int(user["user_number"]) if user else 0, old["key_hash"] or "",
+                       current["key_hash"] if current else "", reason, datetime.now(timezone.utc).isoformat()))
+        LOGGER.warning("Reissued managed OpenRouter key for chat %s", chat_id)
+        return new_key
+
+
+def recover_missing_managed_key(chat_id, response):
+    """A 401 is the safe signal for a deleted/revoked credential, not a quota error."""
+    if getattr(response, "status_code", None) != 401 or not managed_api_key(chat_id):
+        return False
+    return bool(replace_missing_managed_api_key(chat_id, "OpenRouter returned HTTP 401"))
+
+
+def managed_key_history(chat_id, limit=5):
+    with conn() as c:
+        rows = c.execute("SELECT reason,created_at FROM managed_key_events WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                         (chat_id, limit)).fetchall()
+    return [dict(row) for row in rows]
+
+
 def sync_managed_key_labels():
-    """Make existing OpenRouter key names match Noema's stable user numbers."""
+    """Give active users a key, then match OpenRouter names to Noema numbers."""
     if not OR_MANAGEMENT_KEY:
         return {"ok": False, "error": "management_key_missing"}
+    created = 0
+    # Some people may have spent through the old fallback key before the
+    # management key was configured. Bring those active people onto their own
+    # key first, rather than trying to guess which unrelated OpenRouter row is
+    # theirs by its position in the dashboard.
+    for user in shared_usage_users():
+        chat_id = int(user["chat_id"])
+        if managed_api_key(chat_id):
+            continue
+        if provision_managed_api_key(chat_id):
+            created += 1
     with conn() as c:
         rows = [dict(row) for row in c.execute(
             """SELECT m.key_hash, u.user_number FROM managed_api_keys m
@@ -1254,7 +1379,7 @@ def sync_managed_key_labels():
                WHERE m.active=1 AND m.key_hash<>''"""
         ).fetchall()]
     if not rows:
-        return {"ok": True, "updated": 0}
+        return {"ok": True, "created": created, "updated": 0}
     headers = {"Authorization": f"Bearer {OR_MANAGEMENT_KEY}", "Content-Type": "application/json"}
     try:
         response = requests.get(OPENROUTER_KEYS_URL, headers=headers, timeout=30)
@@ -1279,7 +1404,7 @@ def sync_managed_key_labels():
                 LOGGER.warning("Could not rename OpenRouter key %s: HTTP %s", key_hash[:8], response.status_code)
         except requests.RequestException:
             LOGGER.warning("Could not rename an OpenRouter key")
-    return {"ok": True, "updated": updated}
+    return {"ok": True, "created": created, "updated": updated}
 
 
 def api_key_for_chat(chat_id):
@@ -2425,6 +2550,8 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
     for model in models:
 
+        recovered_key = False
+
         for attempt in range(2):
 
             started = time.perf_counter()
@@ -2440,6 +2567,10 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 return choice["message"]
 
             last=(r.status_code,r.text)
+
+            if not recovered_key and recover_missing_managed_key(chat_id, r):
+                recovered_key = True
+                continue
 
             if model != models[-1]:
                 print(f"LLM fallback chat_id={chat_id} from={model} status={r.status_code}")
@@ -2670,6 +2801,16 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
                 return content.strip()
 
             last=(r.status_code,r.text)
+            if recover_missing_managed_key(chat_id, r):
+                r=request_chat(chat_id, model, messages, tools, "auto")
+                if r.ok:
+                    data = r.json()
+                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                    return data["choices"][0]["message"]
+                last=(r.status_code,r.text)
+
+            if recover_missing_managed_key(chat_id, r) and attempt == 0:
+                continue
 
             if r.status_code==429 or 500<=r.status_code<600:
 
@@ -2689,10 +2830,14 @@ def transcribe(chat_id, path):
 
     # A Noema-managed key is a complete private balance: speech-to-text,
     # chat and Vision all belong to the same Telegram user.
-    key, source = api_key_for_chat(chat_id)
-    r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-
-                    json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+    source = ""
+    r = None
+    for attempt in range(2):
+        key, source = api_key_for_chat(chat_id)
+        r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+        if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
+            break
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
@@ -2751,8 +2896,10 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
             # The reply keyboard belongs to a lasting answer, never to the
             # temporary activity card which is deleted after processing.
             kwargs = {"parse_mode": TelegramRenderer.parse_mode}
+            chunk = animate_configured_emojis(chunk)
             if index == 0:
-                kwargs["reply_markup"] = KB
+                kwargs["reply_markup"] = main_keyboard()
+                chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
             await update.effective_message.reply_text(chunk, **kwargs)
 
     if eff in ("voice","voice_and_text"):
@@ -2838,7 +2985,92 @@ async def start(update,context):
         asyncio.create_task(asyncio.to_thread(provision_managed_api_key, chat_id))
     await update.effective_message.reply_text(
         f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
-        reply_markup=KB, parse_mode="HTML")
+        reply_markup=main_keyboard(), parse_mode="HTML")
+
+
+async def set_today_emoji(update, context):
+    """Save a custom emoji supplied by the bot owner as the Today button icon."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    entity = next((item for item in (update.effective_message.entities or [])
+                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+    if not entity:
+        return await update.effective_message.reply_text(
+            "Пришли команду и живой эмодзи в одном сообщении:\n<code>/todayemoji 📆</code>\n\n"
+            "Важно: выбери именно анимированный премиум-эмодзи из панели Telegram, а не обычный символ.",
+            parse_mode="HTML")
+    set_app_setting("interface_today_custom_emoji_id", entity.custom_emoji_id)
+    return await update.effective_message.reply_text(
+        "Готово — живой календарь установлен на кнопку «Сегодня».", reply_markup=main_keyboard())
+
+
+async def set_interface_emoji(update, context):
+    """Capture a premium custom emoji for a supported Noema interface slot."""
+    chat_id = update.effective_chat.id
+    if chat_id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    slots = {
+        "today": "кнопка «Сегодня»", "briefing": "кнопка «Брифинг»",
+        "settings": "кнопка «Настройки»", "more": "кнопка «Ещё»",
+        "tasks": "раздел «Задачи»", "reminders": "раздел «Напоминания»",
+        "people": "раздел «Люди»", "notes": "раздел «Заметки»", "budget": "раздел «Бюджет»",
+        "open": "пустой квадрат задачи", "done": "выполненная задача", "failed": "невыполненная задача",
+    }
+    slot = (context.args[0].lower() if context.args else "")
+    if slot not in slots:
+        return await update.effective_message.reply_text(
+            "Сначала отправь <code>/emojihelp</code> — там все доступные слоты.", parse_mode="HTML")
+    entity = next((item for item in (update.effective_message.entities or [])
+                   if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id), None)
+    if not entity:
+        return await update.effective_message.reply_text("Не вижу живого эмодзи. Выбери его из Premium-панели Telegram и отправь команду ещё раз.")
+    key = f"task_{slot}_custom_emoji_id" if slot in {"open", "done", "failed"} else f"interface_{slot}_custom_emoji_id"
+    set_app_setting(key, entity.custom_emoji_id)
+    return await update.effective_message.reply_text(f"Готово — установлен значок «{slots[slot]}».", reply_markup=main_keyboard())
+
+
+async def emoji_help(update, context):
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return
+    return await update.effective_message.reply_text(
+        "<b>Живые эмодзи Noema</b>\n\n"
+        "Главное меню: <code>today</code>, <code>briefing</code>, <code>settings</code>, <code>more</code>.\n"
+        "Раздел «Ещё»: <code>tasks</code>, <code>reminders</code>, <code>people</code>, <code>notes</code>, <code>budget</code>.\n"
+        "Задачи: <code>open</code>, <code>done</code>, <code>failed</code>.\n\n"
+        "Формат: <code>/setemoji done</code>, затем в том же сообщении выбери живой эмодзи из Premium-панели.\n\n"
+        "Для ответов: отправь <code>/replyemoji</code> и до 48 живых эмодзи в том же сообщении. Очистить: <code>/clearreplyemojis</code>.",
+        parse_mode="HTML")
+
+
+async def add_reply_emoji(update, context):
+    """Add one owner-selected custom emoji to Noema's reply palette."""
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return await update.effective_message.reply_text("Эта настройка доступна владельцу Noema.")
+    message = update.effective_message
+    entities = [item for item in (message.entities or [])
+                if item.type == MessageEntity.CUSTOM_EMOJI and item.custom_emoji_id]
+    if not entities:
+        return await message.reply_text(
+            "Отправь <code>/replyemoji</code> и выбери живой эмодзи в этом же сообщении.", parse_mode="HTML")
+    palette = reply_emoji_palette()
+    added = 0
+    for entity in entities:
+        if len(palette) >= 48:
+            break
+        alt = entity.extract_from(message.text or "") or "✨"
+        if not any(item["id"] == entity.custom_emoji_id for item in palette):
+            palette.append({"id": entity.custom_emoji_id, "alt": alt})
+            added += 1
+    set_app_setting("reply_custom_emoji_palette", json.dumps(palette, ensure_ascii=False))
+    return await message.reply_text(f"Добавлено: {added}. В палитре ответов: {len(palette)}/48.")
+
+
+async def clear_reply_emojis(update, context):
+    if update.effective_chat.id not in ADMIN_CHAT_IDS:
+        return
+    set_app_setting("reply_custom_emoji_palette", "[]")
+    return await update.effective_message.reply_text("Палитра живых эмодзи для ответов очищена.")
 
 
 
@@ -3082,8 +3314,10 @@ def plan_page(chat_id, day, page=0, page_size=12):
             late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
             lines.append(f'{marker} <code>#{task["id"]}</code> · задача — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
+            emoji_id = app_setting(f"task_{'done' if status == 'done' else 'open'}_custom_emoji_id")
             task_toggle_buttons.append(InlineKeyboardButton(
-                f"{toggle_icon} #{task['id']}", callback_data=f"tasktoggle:{task['id']}:{day}:{page}"))
+                f"#{task['id']}" if emoji_id else f"{toggle_icon} #{task['id']}",
+                callback_data=f"tasktoggle:{task['id']}:{day}:{page}", icon_custom_emoji_id=emoji_id or None))
         else:
             reminder = entry
             is_completed = bool(reminder["acknowledged"])
@@ -3542,7 +3776,9 @@ async def callback(update,context):
         if not result.get("ok"):
             return await q.answer("Не удалось связаться с OpenRouter. Попробуйте позже.", show_alert=True)
         text, markup = api_keys_page(q.message.chat_id)
-        await q.answer(f"Синхронизировано ключей: {int(result.get('updated') or 0)}")
+        await q.answer(
+            f"Создано: {int(result.get('created') or 0)} · синхронизировано: {int(result.get('updated') or 0)}"
+        )
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     if q.data.startswith("keys:admin_users:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
@@ -3564,6 +3800,7 @@ async def callback(update,context):
         rows = [row for row in usage_summary(user["chat_id"])
                 if row.get("source") in {"shared", "managed"}]
         text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        text += managed_key_lifecycle_text(user["chat_id"])
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
             [InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")],
@@ -3678,7 +3915,7 @@ def api_keys_page(chat_id):
     else:
         state = "Автовыдача ждёт <code>USER_SECRETS_MASTER_KEY</code> для безопасного хранения ключей."
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
-               [InlineKeyboardButton("↻ Синхронизировать номера OpenRouter", callback_data="keys:sync_labels")],
+               [InlineKeyboardButton("↻ Создать и синхронизировать ключи", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
     return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", InlineKeyboardMarkup(buttons)
 
@@ -3702,6 +3939,24 @@ def usage_text(rows, title, show_chats=False):
             lines.append(f"  {source} ключ")
     if len(rows) > 8:
         lines.append(f"\nПоказаны 8 из {len(rows)} моделей.")
+    return "\n".join(lines)
+
+
+def managed_key_lifecycle_text(chat_id):
+    with conn() as c:
+        current = c.execute("SELECT created_at,updated_at FROM managed_api_keys WHERE chat_id=? AND active=1", (chat_id,)).fetchone()
+    lines = ["", "🔑 <b>Ключ Noema</b>"]
+    if current:
+        created = str(current["created_at"] or "")[:10]
+        lines.append(f"Текущий · выпущен {created or '—'} · лимит ${USER_MONTHLY_LIMIT_USD:.2f}/мес.")
+    else:
+        lines.append("Отдельный ключ пока не выпущен.")
+    events = managed_key_history(chat_id)
+    if events:
+        lines.append("Замены:")
+        for event in events:
+            when = str(event["created_at"] or "")[:16].replace("T", " ")
+            lines.append(f"• {when} · новый ключ выпущен ({html.escape(event['reason'])})")
     return "\n".join(lines)
 
 
@@ -3982,15 +4237,15 @@ async def text_handler(update,context):
             f"Добавила модель: {model}\nОткройте «⚙️ Настройки → 🧠 Модель» и выберите её.",
             reply_markup=settings_keyboard(cid))
 
-    if t=="⚙️ Настройки":
+    if t in ("⚙️ Настройки", "Настройки"):
         return await update.effective_message.reply_text("⚙️ Настройки", reply_markup=settings_keyboard(cid))
 
-    if t=="☰ Ещё":
+    if t in ("☰ Ещё", "Ещё"):
         return await update.effective_message.reply_text(
             "Дополнительно:", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Задачи", callback_data="menu:tasks"), InlineKeyboardButton("⏰ Напоминания", callback_data="menu:reminders")],
-                [InlineKeyboardButton("👥 Люди", callback_data="menu:people"), InlineKeyboardButton("📝 Заметки", callback_data="menu:notes")],
-                [InlineKeyboardButton("💳 Бюджет", callback_data="menu:budget")],
+                [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"), interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
+                [interface_inline_button("people", "👥", "Люди", "menu:people"), interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
+                [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
             ]))
 
     if t=="📚 Знания":
@@ -4002,7 +4257,7 @@ async def text_handler(update,context):
 
     if t=="🔊 Голос+текст": set_mode(cid,"voice_and_text"); return await update.effective_message.reply_text("Режим: голос + текст.")
 
-    if t=="📅 Сегодня": return await today_plan(update,context)
+    if t in ("📅 Сегодня", "Сегодня"): return await today_plan(update,context)
 
     if t=="⏰ Напоминания": return await reminders(update,context)
 
@@ -4012,7 +4267,7 @@ async def text_handler(update,context):
 
     if t in ("💰 Расходы", "💳 Бюджет"): return await list_expenses(update,context)
 
-    if t=="🌅 Брифинг": return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
+    if t in ("🌅 Брифинг", "Брифинг"): return await update.effective_message.reply_text(build_briefing(cid), parse_mode="HTML")
 
     if t=="🔎 Поиск": return await update.effective_message.reply_text("Напиши: «Найди в интернете ...»")
 
@@ -4546,6 +4801,16 @@ async def main_async():
     app.add_error_handler(telegram_error_handler)
 
     app.add_handler(CommandHandler("start",start))
+
+    app.add_handler(CommandHandler("todayemoji", set_today_emoji))
+
+    app.add_handler(CommandHandler("setemoji", set_interface_emoji))
+
+    app.add_handler(CommandHandler("emojihelp", emoji_help))
+
+    app.add_handler(CommandHandler("replyemoji", add_reply_emoji))
+
+    app.add_handler(CommandHandler("clearreplyemojis", clear_reply_emojis))
 
     app.add_handler(CallbackQueryHandler(callback))
 
