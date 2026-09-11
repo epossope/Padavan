@@ -1,0 +1,25 @@
+/* Fixed controls share the same phone-safe baseline on every workspace. */
+:root{--dock-height:168px}
+.grid>[data-widget]{min-width:0;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.sorting,.sorting *{touch-action:none!important;cursor:grabbing!important}
+.widget-dragging{position:relative;z-index:8;opacity:.7;scale:1.025;outline:1px solid var(--active);border-radius:var(--radius);pointer-events:none}
+#dock{grid-template-columns:1fr 156px 1fr;bottom:calc(var(--keyboard-inset,0px) - 4px);height:calc(168px + env(safe-area-inset-bottom));align-items:end}
+#dock .orb-button{width:156px;height:156px;aspect-ratio:1;justify-self:center;transform:translateY(8px)}
+.orb-button canvas{pointer-events:none}
+.chat-screen{height:var(--visible-height,100dvh);min-height:0!important;padding-bottom:0!important;display:flex;flex-direction:column;overflow:hidden}
+.chat-screen header{flex-shrink:0;margin-bottom:var(--space-md)}
+.chat-screen #notice{flex-shrink:0}
+.chat-screen #content{min-height:0;flex:1;display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom)}
+.chat-screen .chat{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:var(--space-sm) 0 var(--space-lg)}
+.chat-screen .chat>.empty{margin:auto;text-align:center;max-width:260px}
+.chat-screen #content{position:relative;isolation:isolate}
+.chat-screen .chat-ambient{position:absolute;z-index:-1;right:-68px;bottom:34px;width:270px;height:270px;opacity:.14;pointer-events:none;filter:grayscale(1)}
+.chat-screen .chat-ambient canvas{width:100%;height:100%}
+.chat-screen .composer{position:relative;bottom:auto;flex-shrink:0;margin:var(--space-md) 0;padding:var(--space-xs) var(--space-sm);min-height:56px}
+.composer input{font-size:16px;outline:none!important;box-shadow:none;min-width:0}
+.composer input:focus{border:none}
+.budget-screen .segments{width:max-content;max-width:100%;border:0;border-bottom:1px solid var(--border);border-radius:0;padding:0;gap:var(--space-sm);margin-bottom:var(--space-md)}
+.budget-screen .segments button{flex:none;min-width:60px;border-radius:0;background:none;border-bottom:1px solid transparent;padding:var(--space-sm)}
+.budget-screen .segments button.selected{border-bottom-color:var(--active)}
+@media(max-width:600px){#shell{padding-top:calc(var(--space-md) + env(safe-area-inset-top))}.grid .card{min-height:170px}.hero{min-height:155px}.focus-pill span{font-size:var(--type-xs)}#dock{grid-template-columns:minmax(0,1fr) 156px minmax(0,1fr);gap:0}.focus-pill{padding:var(--space-sm);transform:translateY(5px)}.keyboard-button{width:48px;height:48px;transform:translateY(5px)}}
+@media(max-height:600px){.chat-screen #notice{display:none}.chat-screen .chat-ambient{width:170px;height:170px}}

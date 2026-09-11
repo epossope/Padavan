@@ -1,0 +1,11 @@
+{
+  "bg":"#0A0A0A", "surface":"#151517", "smoke":"#2A2E33", "muted":"#A6A7AA", "ink":"#F5F5F5", "active":"#F7F7F7",
+  "border":"rgba(245,245,245,0.13)", "border-active":"rgba(245,245,245,0.32)",
+  "glass":"linear-gradient(125deg,rgba(245,245,245,0.035),rgba(245,245,245,0.005) 60%,rgba(245,245,245,0.025))",
+  "shadow":"inset 0 1px 0 rgba(245,245,245,0.04)",
+  "font-ui":"'IBM Plex Sans',sans-serif", "font-mono":"'IBM Plex Mono',monospace",
+  "radius":"24px", "radius-sm":"14px", "radius-pill":"999px",
+  "space-xs":"4px", "space-sm":"8px", "space-md":"16px", "space-lg":"24px", "space-xl":"32px",
+  "type-xs":"11px", "type-sm":"13px", "type-body":"15px", "type-title":"22px", "type-display":"36px",
+  "touch":"44px", "dock-height":"156px", "width":"780px", "motion":"260ms"
+}
