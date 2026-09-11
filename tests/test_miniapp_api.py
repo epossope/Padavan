@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,6 +12,11 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core = SimpleNamespace(
             valid_webapp_user=lambda value: {"id": 42} if value == "signed" else None,
             set_mode=Mock(), set_app_setting=Mock(), LOGGER=Mock(),
+            mint_mistral_realtime_session=Mock(return_value={
+                "token": "rt_scoped", "expires_at": "soon",
+                "model": "voxtral-mini-transcribe-realtime-2602",
+                "url": "wss://api.mistral.ai/v1/audio/transcriptions/realtime",
+            }),
             stream_agent_response=lambda cid, text, cancel: iter([
                 {"type": "delta", "text": "При"}, {"type": "delta", "text": "вет"},
                 {"type": "done", "text": "Привет"},
@@ -75,3 +81,15 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"type": "delta"', body)
         self.assertIn('"text": "При"', body)
         self.assertIn('"type": "done"', body)
+
+    async def test_realtime_token_requires_signed_miniapp_user(self):
+        response = await self.client.post('/api/v1/miniapp/voice/realtime-token', json={"init_data": "bad"})
+        self.assertEqual(response.status, 401)
+        self.core.mint_mistral_realtime_session.assert_not_called()
+
+    async def test_realtime_token_returns_only_scoped_secret(self):
+        response = await self.client.post('/api/v1/miniapp/voice/realtime-token', json={"init_data": "signed"})
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["data"]["token"], "rt_scoped")
+        self.assertNotIn("api_key", json.dumps(payload).lower())

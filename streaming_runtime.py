@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 
@@ -120,3 +121,28 @@ class SentenceChunker:
         tail = self.buffer.strip()
         self.buffer = ""
         return [tail] if tail else []
+
+
+class AdaptiveDraftThrottle:
+    """Rate-limit Telegram draft updates while keeping short answers responsive."""
+
+    def __init__(self, min_interval=0.8, max_interval=1.2, min_chars=24, clock=None):
+        self.min_interval = float(min_interval)
+        self.max_interval = float(max_interval)
+        self.min_chars = int(min_chars)
+        self.clock = clock or time.monotonic
+        self.last_at = 0.0
+        self.last_size = 0
+
+    def should_send(self, text: str, *, force=False) -> bool:
+        now = self.clock()
+        size = len(text or "")
+        elapsed = now - self.last_at
+        growth = size - self.last_size
+        if not force and elapsed < self.min_interval:
+            return False
+        if not force and growth < self.min_chars and elapsed < self.max_interval:
+            return False
+        self.last_at = now
+        self.last_size = size
+        return True

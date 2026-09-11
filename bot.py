@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
 from telegram.error import BadRequest, Forbidden
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
 from aiohttp import web
 from cryptography.fernet import Fernet, InvalidToken
@@ -72,7 +72,7 @@ from url_enricher import HttpUrlEnricher
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
-from streaming_runtime import StreamAccumulator, ToolPackResolver, iter_sse_json
+from streaming_runtime import AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver, iter_sse_json
 
 
 
@@ -105,6 +105,13 @@ VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 VISION_FALLBACK_MODELS = [x.strip() for x in os.getenv("VISION_FALLBACK_MODELS", "google/gemini-2.5-flash-lite").split(",") if x.strip()]
 
 STT_MODEL = os.getenv("STT_MODEL", "mistralai/voxtral-mini-transcribe").strip()
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-transcribe-realtime-2602").strip()
+MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
+TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
+TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
+TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
 VOICE_CONVERSATION_ENABLED = os.getenv("VOICE_CONVERSATION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 VOICE_MODE = os.getenv("VOICE_MODE", "push_to_talk").strip().lower()
 VOICE_SESSION_TIMEOUT_SEC = max(5, int(os.getenv("VOICE_SESSION_TIMEOUT_SEC", "25")))
@@ -137,6 +144,10 @@ OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 MANAGED_KEY_LOCK = threading.RLock()
+ACTIVE_DRAFTS_LOCK = threading.RLock()
+ACTIVE_DRAFTS = {}
+ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
+ACTIVE_STREAM_RESPONSES = {}
 
 
 
@@ -2944,6 +2955,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     """One streaming core for text and voice; yields display-safe runtime events."""
     started = time.perf_counter()
     cancel_event = cancel_event or threading.Event()
+    if cancel_event.is_set():
+        yield {"type": "cancelled"}
+        return
     live = direct_live_request(text)
     if live is not None:
         add_message(chat_id, "user", text); add_message(chat_id, "assistant", live)
@@ -2968,6 +2982,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 response.close()
                 continue
             accumulator = StreamAccumulator()
+            with ACTIVE_STREAM_RESPONSES_LOCK:
+                ACTIVE_STREAM_RESPONSES[cancel_event] = response
             try:
                 for payload in iter_sse_json(response.iter_lines()):
                     if cancel_event.is_set():
@@ -2981,7 +2997,15 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 if accumulator.usage:
                     record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
                 break
+            except requests.RequestException:
+                if cancel_event.is_set():
+                    yield {"type": "cancelled"}
+                    return
+                raise
             finally:
+                with ACTIVE_STREAM_RESPONSES_LOCK:
+                    if ACTIVE_STREAM_RESPONSES.get(cancel_event) is response:
+                        ACTIVE_STREAM_RESPONSES.pop(cancel_event, None)
                 response.close()
         if message is None:
             raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
@@ -2993,6 +3017,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             return
         messages.append(message)
         for call in calls:
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
             name = call.get("function", {}).get("name", "")
             raw = call.get("function", {}).get("arguments", "{}")
             try:
@@ -3004,9 +3031,143 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 writes.append(result)
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
     answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
     add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
     yield {"type": "done", "text": answer}
+
+
+def mint_mistral_realtime_session():
+    """Mint a model-scoped, short-lived rt_* token without exposing the API key."""
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_NOT_CONFIGURED")
+    response = requests.post(
+        MISTRAL_CLIENT_SESSIONS_URL,
+        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+        json={"purpose": "realtime", "model": MISTRAL_REALTIME_MODEL},
+        timeout=20,
+    )
+    if not response.ok:
+        raise RuntimeError("MISTRAL_SESSION_ERROR")
+    payload = response.json()
+    secret = payload.get("client_secret") or {}
+    token = secret.get("value")
+    if not isinstance(token, str) or not token.startswith("rt_"):
+        raise RuntimeError("MISTRAL_SESSION_ERROR")
+    return {
+        "token": token,
+        "expires_at": secret.get("expires_at") or payload.get("expires_at"),
+        "model": MISTRAL_REALTIME_MODEL,
+        "url": "wss://api.mistral.ai/v1/audio/transcriptions/realtime",
+    }
+
+
+def _new_draft_id():
+    return secrets.randbelow(2_147_483_646) + 1
+
+
+def register_active_draft(chat_id, draft_id, cancel_event):
+    with ACTIVE_DRAFTS_LOCK:
+        previous = ACTIVE_DRAFTS.get(chat_id)
+        if previous:
+            cancel_stream(previous[1])
+        ACTIVE_DRAFTS[chat_id] = (draft_id, cancel_event)
+
+
+def unregister_active_draft(chat_id, draft_id):
+    with ACTIVE_DRAFTS_LOCK:
+        current = ACTIVE_DRAFTS.get(chat_id)
+        if current and current[0] == draft_id:
+            ACTIVE_DRAFTS.pop(chat_id, None)
+
+
+def cancel_active_draft(chat_id, draft_id=None):
+    with ACTIVE_DRAFTS_LOCK:
+        current = ACTIVE_DRAFTS.get(chat_id)
+        if not current or (draft_id is not None and current[0] != draft_id):
+            return False
+        cancel_stream(current[1])
+        return True
+
+
+def cancel_stream(cancel_event):
+    cancel_event.set()
+    with ACTIVE_STREAM_RESPONSES_LOCK:
+        response = ACTIVE_STREAM_RESPONSES.get(cancel_event)
+    if response is not None:
+        with contextlib.suppress(Exception):
+            response.close()
+
+
+async def stopped_generation_handler(update, context):
+    stopped = (getattr(update, "api_kwargs", None) or {}).get("stopped_message_generation")
+    if not isinstance(stopped, dict):
+        return
+    chat = stopped.get("chat") or {}
+    chat_id, draft_id = chat.get("id"), stopped.get("draft_id")
+    if isinstance(chat_id, int):
+        cancel_active_draft(chat_id, draft_id if isinstance(draft_id, int) else None)
+
+
+async def stream_answer_to_telegram(update, context, text):
+    """Stream one ephemeral draft, then persist exactly one formatted final answer."""
+    chat_id = update.effective_chat.id
+    draft_id, cancelled = _new_draft_id(), threading.Event()
+    register_active_draft(chat_id, draft_id, cancelled)
+    queue, loop = asyncio.Queue(), asyncio.get_running_loop()
+
+    def produce():
+        try:
+            for event in stream_agent_response(chat_id, text, cancelled):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
+    throttle = AdaptiveDraftThrottle(TELEGRAM_DRAFT_MIN_INTERVAL, TELEGRAM_DRAFT_MAX_INTERVAL, TELEGRAM_DRAFT_MIN_CHARS)
+    accumulated, final = "", ""
+    draft_available = True
+    try:
+        try:
+            await context.bot.send_message_draft(chat_id, draft_id, "", api_kwargs={"can_stop": True, "keep_on_stop": False})
+        except Exception:
+            draft_available = False
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            if isinstance(event, Exception):
+                raise event
+            kind = event.get("type")
+            if kind == "delta":
+                accumulated += event.get("text", "")
+                if draft_available and throttle.should_send(accumulated):
+                    try:
+                        await context.bot.send_message_draft(
+                            chat_id, draft_id, accumulated[-4096:],
+                            api_kwargs={"can_stop": True, "keep_on_stop": False},
+                        )
+                    except Exception:
+                        draft_available = False
+            elif kind == "done":
+                final = event.get("text") or accumulated
+            elif kind == "cancelled":
+                cancelled.set()
+        if cancelled.is_set():
+            return False
+        final = final or accumulated
+        if draft_available and final and throttle.should_send(final, force=True):
+            with contextlib.suppress(Exception):
+                await context.bot.send_message_draft(chat_id, draft_id, final[-4096:], api_kwargs={"can_stop": False})
+        await send_answer(update, final, context=context, voice_in=False, force_voice=wants_voice(text))
+        return True
+    finally:
+        cancelled.set()
+        unregister_active_draft(chat_id, draft_id)
 
 
 
@@ -5062,6 +5223,15 @@ async def text_handler(update,context):
 
 
 
+    if TELEGRAM_DRAFT_STREAMING_ENABLED and update.effective_chat.type == "private":
+        try:
+            completed = await stream_answer_to_telegram(update, context, t)
+            if completed:
+                await drain_media_outbox(update, context)
+        except Exception as e:
+            await safe_error(update, e)
+        return
+
     activity = await begin_activity(update.effective_message, activity_labels(t))
     try:
         a=await asyncio.to_thread(ask,cid,t)
@@ -5586,6 +5756,10 @@ async def main_async():
 
     app.add_error_handler(telegram_error_handler)
 
+    # PTB 22.8 preserves the newest Bot API stop event in Update.api_kwargs.
+    # A separate group lets normal message handlers continue unchanged.
+    app.add_handler(TypeHandler(Update, stopped_generation_handler), group=-1)
+
     app.add_handler(CommandHandler("start",start))
 
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
@@ -5602,7 +5776,9 @@ async def main_async():
 
     app.add_handler(MessageHandler(filters.VOICE,voice_handler))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
+    # block=False is required so a stopped_message_generation update can cancel
+    # a still-running draft instead of waiting behind the text handler.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler, block=False))
 
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,image_handler))
 

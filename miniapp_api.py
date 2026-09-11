@@ -197,6 +197,31 @@ def register_miniapp(app, core):
         finally:
             Path(name).unlink(missing_ok=True)
 
+    async def voice_transcribe(request):
+        form = await request.post()
+        user = core.valid_webapp_user(form.get("init_data"))
+        if not user or not isinstance(user.get("id"), int):
+            raise web.HTTPUnauthorized()
+        upload = form.get("audio")
+        if not getattr(upload, "file", None):
+            raise web.HTTPBadRequest()
+        suffix = ".mp4" if "mp4" in str(upload.content_type) else ".webm"
+        fd, name = tempfile.mkstemp(suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                content = upload.file.read(20 * 1024 * 1024 + 1)
+                if len(content) > 20 * 1024 * 1024:
+                    raise web.HTTPRequestEntityTooLarge(max_size=20 * 1024 * 1024, actual_size=len(content))
+                output.write(content)
+            text = await asyncio.to_thread(core.transcribe, user["id"], Path(name))
+            return web.json_response({"ok": True, "data": {"text": text}}, headers={"Cache-Control": "no-store"})
+        except RuntimeError as exc:
+            code = str(exc)
+            message = "Речь не распознана. Попробуй ещё раз." if code == "STT_EMPTY" else "Распознавание временно недоступно."
+            return web.json_response({"ok": False, "error": message, "code": code}, status=422 if code == "STT_EMPTY" else 503)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
     async def chat_stream(request):
         payload = await request.json()
         user = core.valid_webapp_user(payload.get("init_data"))
@@ -230,15 +255,40 @@ def register_miniapp(app, core):
                         break
                     await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
             except (ConnectionResetError, asyncio.CancelledError):
-                cancelled.set()
+                if hasattr(core, "cancel_stream"):
+                    core.cancel_stream(cancelled)
+                else:
+                    cancelled.set()
             finally:
-                cancelled.set()
+                if hasattr(core, "cancel_stream"):
+                    core.cancel_stream(cancelled)
+                else:
+                    cancelled.set()
         with contextlib.suppress(ConnectionResetError):
             await response.write_eof()
         return response
 
+    async def realtime_token(request):
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            raise web.HTTPBadRequest(text="Некорректный запрос")
+        user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
+        if not user or not isinstance(user.get("id"), int):
+            raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        try:
+            session = await asyncio.to_thread(core.mint_mistral_realtime_session)
+        except RuntimeError as exc:
+            code = str(exc)
+            status = 503 if code in {"MISTRAL_NOT_CONFIGURED", "MISTRAL_SESSION_ERROR"} else 500
+            return web.json_response({"ok": False, "code": code, "error": "Realtime-распознавание временно недоступно."}, status=status)
+        # Deliberately return only Mistral's scoped rt_* secret, never the server API key.
+        return web.json_response({"ok": True, "data": session}, headers={"Cache-Control": "no-store"})
+
     app.router.add_post("/api/v1/miniapp/voice", voice)
+    app.router.add_post("/api/v1/miniapp/voice/transcribe", voice_transcribe)
     app.router.add_post("/api/v1/miniapp/chat-stream", chat_stream)
+    app.router.add_post("/api/v1/miniapp/voice/realtime-token", realtime_token)
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
     app.router.add_static("/app/assets/", root, show_index=False)

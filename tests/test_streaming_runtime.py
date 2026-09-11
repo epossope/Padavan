@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from streaming_runtime import SentenceChunker, StreamAccumulator, ToolPackResolver, iter_sse_json
+from streaming_runtime import AdaptiveDraftThrottle, SentenceChunker, StreamAccumulator, ToolPackResolver, iter_sse_json
 
 
 class StreamingRuntimeTests(unittest.TestCase):
@@ -33,6 +33,14 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertIn("knowledge_search", names)
         self.assertIn("add_expense", names)
         self.assertNotIn("internet_search", names)
+
+    def test_draft_throttle_uses_growth_and_deadline(self):
+        ticks = iter([0.4, 0.5, 0.8, 1.7])
+        throttle = AdaptiveDraftThrottle(min_interval=0.35, max_interval=1.2, min_chars=10, clock=lambda: next(ticks))
+        self.assertTrue(throttle.should_send("0123456789"))
+        self.assertFalse(throttle.should_send("0123456789abc"))
+        self.assertTrue(throttle.should_send("0123456789abcdefghij"))
+        self.assertFalse(throttle.should_send("0123456789abcdefghijkl"))
 
 
 if __name__ == "__main__":
