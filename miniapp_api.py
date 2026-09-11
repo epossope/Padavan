@@ -190,6 +190,10 @@ def register_miniapp(app, core):
                 text = await asyncio.to_thread(core.transcribe, cid, Path(name))
                 answer = await asyncio.to_thread(core.ask, cid, text)
             return web.json_response({"ok": True, "data": {"answer": answer}}, headers={"Cache-Control": "no-store"})
+        except RuntimeError as exc:
+            code = str(exc)
+            message = "Речь не распознана. Попробуй ещё раз." if code == "STT_EMPTY" else "Распознавание временно недоступно."
+            return web.json_response({"ok": False, "error": message, "code": code}, status=422 if code == "STT_EMPTY" else 503)
         finally:
             Path(name).unlink(missing_ok=True)
 
