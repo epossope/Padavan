@@ -126,7 +126,7 @@ class SentenceChunker:
 class AdaptiveDraftThrottle:
     """Rate-limit Telegram draft updates while keeping short answers responsive."""
 
-    def __init__(self, min_interval=0.35, max_interval=1.2, min_chars=24, clock=None):
+    def __init__(self, min_interval=0.8, max_interval=1.2, min_chars=24, clock=None):
         self.min_interval = float(min_interval)
         self.max_interval = float(max_interval)
         self.min_chars = int(min_chars)
