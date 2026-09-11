@@ -11,6 +11,10 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core = SimpleNamespace(
             valid_webapp_user=lambda value: {"id": 42} if value == "signed" else None,
             set_mode=Mock(), set_app_setting=Mock(), LOGGER=Mock(),
+            stream_agent_response=lambda cid, text, cancel: iter([
+                {"type": "delta", "text": "При"}, {"type": "delta", "text": "вет"},
+                {"type": "done", "text": "Привет"},
+            ]),
         )
         app = web.Application()
         register_miniapp(app, self.core)
@@ -63,3 +67,11 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "home_layout", "args": {"widgets": []}})
         self.assertEqual(response.status, 200)
         self.core.set_app_setting.assert_called_once_with('miniapp_home_widgets:42', '[]')
+
+    async def test_chat_stream_is_ndjson_and_preserves_deltas(self):
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет"})
+        self.assertEqual(response.status, 200)
+        body = await response.text()
+        self.assertIn('"type": "delta"', body)
+        self.assertIn('"text": "При"', body)
+        self.assertIn('"type": "done"', body)

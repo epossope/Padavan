@@ -1,0 +1,122 @@
+"""Provider-neutral primitives shared by Telegram, Mini App and voice runtimes."""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+
+
+TOOL_PACKS = {
+    "core_memory": {"knowledge_search", "knowledge_get"},
+    "planning": {"add_task", "get_today_plan", "delete_task", "set_reminder", "delete_reminder"},
+    "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "delete_expense"},
+    "people": {"person_upsert", "person_interaction", "get_people", "delete_person", "delete_interaction"},
+    "web": {"internet_search", "get_weather"},
+    "files": {"knowledge_files", "send_stored_image", "get_files"},
+    "preferences": {"set_timezone", "set_briefing_preferences", "save_behavior_rule", "update_behavior_rule", "delete_behavior_rule"},
+}
+
+
+class ToolPackResolver:
+    """Cheap conservative routing: no extra LLM request and no lost common actions."""
+    RULES = {
+        "planning": ("задач", "напом", "план", "встреч", "календар"),
+        "finance": ("руб", "расход", "доход", "бюджет", "купил", "потрат"),
+        "people": ("контакт", "человек", "день рождения", "познаком", "созвон"),
+        "web": ("интернет", "найди", "проверь", "погода", "новост", "сайт"),
+        "files": ("файл", "фото", "скрин", "документ", "отправ"),
+        "preferences": ("настрой", "правило", "часовой пояс", "брифинг"),
+    }
+
+    def select_names(self, text: str) -> set[str]:
+        lowered = str(text or "").lower()
+        packs = {"core_memory", "planning"}
+        for pack, words in self.RULES.items():
+            if any(word in lowered for word in words):
+                packs.add(pack)
+        return set().union(*(TOOL_PACKS[name] for name in packs))
+
+    def resolve(self, tools: list[dict], text: str) -> list[dict]:
+        names = self.select_names(text)
+        selected = [tool for tool in tools if tool.get("function", {}).get("name") in names]
+        return selected or tools
+
+
+@dataclass
+class StreamAccumulator:
+    content: list[str] = field(default_factory=list)
+    calls: dict[int, dict] = field(default_factory=dict)
+    finish_reason: str | None = None
+    usage: dict = field(default_factory=dict)
+
+    def add(self, payload: dict) -> list[str]:
+        if payload.get("usage"):
+            self.usage = payload["usage"]
+        choice = (payload.get("choices") or [{}])[0]
+        self.finish_reason = choice.get("finish_reason") or self.finish_reason
+        delta = choice.get("delta") or {}
+        emitted = []
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            self.content.append(content)
+            emitted.append(content)
+        for part in delta.get("tool_calls") or []:
+            index = int(part.get("index", 0))
+            call = self.calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            if part.get("id"):
+                call["id"] = part["id"]
+            fn = part.get("function") or {}
+            if fn.get("name"):
+                call["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                call["function"]["arguments"] += fn["arguments"]
+        return emitted
+
+    def message(self) -> dict:
+        result = {"role": "assistant", "content": "".join(self.content)}
+        if self.calls:
+            result["tool_calls"] = [self.calls[i] for i in sorted(self.calls)]
+        return result
+
+
+def iter_sse_json(lines):
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            yield json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+
+class SentenceChunker:
+    def __init__(self, max_chars=260):
+        self.buffer = ""
+        self.max_chars = max_chars
+
+    def feed(self, text: str) -> list[str]:
+        self.buffer += text
+        output = []
+        while True:
+            match = re.search(r"(?<=[.!?…])\s+", self.buffer)
+            if match:
+                output.append(self.buffer[:match.end()].strip())
+                self.buffer = self.buffer[match.end():]
+            elif len(self.buffer) >= self.max_chars:
+                split = self.buffer.rfind(" ", 0, self.max_chars)
+                split = split if split > self.max_chars // 2 else self.max_chars
+                output.append(self.buffer[:split].strip())
+                self.buffer = self.buffer[split:].lstrip()
+            else:
+                break
+        return [x for x in output if x]
+
+    def flush(self) -> list[str]:
+        tail = self.buffer.strip()
+        self.buffer = ""
+        return [tail] if tail else []

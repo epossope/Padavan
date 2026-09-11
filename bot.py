@@ -54,7 +54,7 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -72,6 +72,7 @@ from url_enricher import HttpUrlEnricher
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
+from streaming_runtime import StreamAccumulator, ToolPackResolver, iter_sse_json
 
 
 
@@ -2927,6 +2928,87 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
                          json=payload,timeout=180)
 
 
+def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"):
+    payload = {"model": model, "messages": messages, "temperature": 0.25,
+               "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1800")), "stream": True,
+               "stream_options": {"include_usage": True}}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    key, _ = api_key_for_chat(chat_id)
+    return requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                         json=payload, timeout=(20, 180), stream=True)
+
+
+def stream_agent_response(chat_id, text, cancel_event=None):
+    """One streaming core for text and voice; yields display-safe runtime events."""
+    started = time.perf_counter()
+    cancel_event = cancel_event or threading.Event()
+    live = direct_live_request(text)
+    if live is not None:
+        add_message(chat_id, "user", text); add_message(chat_id, "assistant", live)
+        yield {"type": "delta", "text": live}
+        yield {"type": "done", "text": live}
+        return
+    messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
+    tools = ToolPackResolver().resolve(TOOLS, text)
+    selected = model_router().resolve(chat_id, "chat")
+    models = list(dict.fromkeys([selected["primary"], selected["fallback"], *FALLBACK_MODELS, *AVAILABLE_MODELS]))
+    writes, final_text = [], ""
+    for round_index in range(5):
+        message = None
+        last_error = None
+        for model in [m for m in models if m]:
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
+            response = request_chat_stream(chat_id, model, messages, tools, "required" if round_index == 0 and asks_external_web(text) else "auto")
+            if not response.ok:
+                last_error = response.status_code
+                response.close()
+                continue
+            accumulator = StreamAccumulator()
+            try:
+                for payload in iter_sse_json(response.iter_lines()):
+                    if cancel_event.is_set():
+                        response.close()
+                        yield {"type": "cancelled"}
+                        return
+                    for delta in accumulator.add(payload):
+                        final_text += delta
+                        yield {"type": "delta", "text": delta}
+                message = accumulator.message()
+                if accumulator.usage:
+                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
+                break
+            finally:
+                response.close()
+        if message is None:
+            raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
+        calls = message.get("tool_calls") or []
+        if not calls:
+            answer = (message.get("content") or "").strip() or write_confirmation(writes)
+            add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
+            yield {"type": "done", "text": answer, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+            return
+        messages.append(message)
+        for call in calls:
+            name = call.get("function", {}).get("name", "")
+            raw = call.get("function", {}).get("arguments", "{}")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else raw
+                result = execute_tool(chat_id, name, args or {})
+            except Exception as exc:
+                result = {"ok": False, "tool": name, "error": str(exc)}
+            if name in WRITE_TOOLS:
+                writes.append(result)
+            messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
+            yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
+    answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
+    add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
+    yield {"type": "done", "text": answer}
+
+
 
 def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
@@ -5162,13 +5244,23 @@ async def reminder_tick(context):
     for row in initial:
         try:
             await deliver(row)
+        except Forbidden:
+            set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=reminder", row["chat_id"])
+            with conn() as c:
+                c.execute("UPDATE reminders SET sent=1,next_followup_at='' WHERE id=?", (row["id"],))
         except Exception:
-            pass
+            LOGGER.exception("Reminder delivery failed chat_id=%s", row["chat_id"])
     for row in followups:
         try:
             await deliver(row, is_followup=True)
+        except Forbidden:
+            set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=reminder_followup", row["chat_id"])
+            with conn() as c:
+                c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='' WHERE id=?", (row["id"],))
         except Exception:
-            pass
+            LOGGER.exception("Reminder follow-up failed chat_id=%s", row["chat_id"])
 
 
 
@@ -5219,7 +5311,12 @@ async def briefing_tick(context):
             if first:
                 set_app_setting(welcome_key, "done")
 
-        except Exception: pass
+        except Forbidden:
+            set_app_setting(f'telegram_destination_unavailable:{cfg["chat_id"]}', datetime.now(timezone.utc).isoformat())
+            set_briefing_preferences(cfg["chat_id"], enabled=False)
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=briefing", cfg["chat_id"])
+        except Exception:
+            LOGGER.exception("Briefing delivery failed chat_id=%s", cfg["chat_id"])
 
 
 
@@ -5434,6 +5531,12 @@ async def save_webapp_timezone(request):
 
 async def telegram_error_handler(update, context):
     """Keep unexpected callback errors visible in the operator log."""
+    if isinstance(context.error, Forbidden):
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            set_app_setting(f"telegram_destination_unavailable:{chat.id}", datetime.now(timezone.utc).isoformat())
+        LOGGER.warning("Telegram destination unavailable chat_id=%s", getattr(chat, "id", None))
+        return
     LOGGER.exception("Unhandled Telegram update", exc_info=context.error)
 
 

@@ -1,8 +1,10 @@
 """Same-origin Telegram Mini App API; all data is scoped to signed Telegram identity."""
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -191,7 +193,48 @@ def register_miniapp(app, core):
         finally:
             Path(name).unlink(missing_ok=True)
 
+    async def chat_stream(request):
+        payload = await request.json()
+        user = core.valid_webapp_user(payload.get("init_data"))
+        if not user or not isinstance(user.get("id"), int):
+            raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        text = str(payload.get("text", "")).strip()
+        if not text or len(text) > 12000:
+            raise web.HTTPBadRequest(text="Некорректное сообщение")
+        cid = user["id"]
+        response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        await response.prepare(request)
+        queue, loop, cancelled = asyncio.Queue(), asyncio.get_running_loop(), threading.Event()
+
+        def produce():
+            try:
+                for event in core.stream_agent_response(cid, text, cancelled):
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+            except Exception as exc:
+                core.LOGGER.exception("Mini App stream failed for chat %s", cid)
+                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": str(exc)})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        async with locks.setdefault(cid, asyncio.Lock()):
+            worker = threading.Thread(target=produce, name=f"miniapp-stream-{cid}", daemon=True)
+            worker.start()
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is None:
+                        break
+                    await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+            except (ConnectionResetError, asyncio.CancelledError):
+                cancelled.set()
+            finally:
+                cancelled.set()
+        with contextlib.suppress(ConnectionResetError):
+            await response.write_eof()
+        return response
+
     app.router.add_post("/api/v1/miniapp/voice", voice)
+    app.router.add_post("/api/v1/miniapp/chat-stream", chat_stream)
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
     app.router.add_static("/app/assets/", root, show_index=False)
