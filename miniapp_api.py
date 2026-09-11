@@ -56,6 +56,7 @@ def register_miniapp(app, core):
         return web.FileResponse(root / "index.html", headers={"Cache-Control": "no-cache"})
 
     async def api(request):
+        started = time.perf_counter()
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
@@ -142,7 +143,11 @@ def register_miniapp(app, core):
                     raise ValueError("Не удалось сохранить изменение. Проверь поля.")
             else:
                 raise ValueError("Неизвестное действие")
-            return web.json_response({"ok": True, "data": result}, headers={"Cache-Control": "no-store"})
+            duration_ms = (time.perf_counter() - started) * 1000
+            return web.json_response(
+                {"ok": True, "data": result},
+                headers={"Cache-Control": "no-store", "Server-Timing": f"ui_action;dur={duration_ms:.1f}"},
+            )
         except web.HTTPException:
             raise
         except (ValueError, TypeError, KeyError):

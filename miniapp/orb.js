@@ -5,19 +5,22 @@
   window.NoemaMembrane={setState(value){state=['idle','listening','thinking','responding','attention','muted'].includes(value)?value:'idle';changed=performance.now()},setAudioLevel(value){amplitude=Math.max(0,Math.min(1,Number(value)||0))}};
   function draw(ms){
     requestAnimationFrame(draw);
-    if(document.hidden||ms-last<(reduced?250:33))return;
+    const frameInterval=reduced?250:(state==='idle'?50:33);
+    if(document.hidden||ms-last<frameInterval)return;
     const elapsed=Math.min(80,ms-last);last=ms;
-    if(!reduced&&state!=='muted')phase+=elapsed/(state==='thinking'?1800:3500);
+    const speed={idle:5200,listening:2800,thinking:1500,responding:950,attention:750,muted:8000}[state]||5200;
+    if(!reduced&&state!=='muted')phase+=elapsed/speed;
     opacity+=((state==='muted'?.28:1)-opacity)*.08;
     const t=reduced?0:phase;
     const pulse=!reduced&&['responding','attention'].includes(state)?Math.max(0,1-(ms-changed)/280):0;
+    const breathing=!reduced&&state==='listening'?(Math.sin(t*5)+1)*.006:0;
     for(const canvas of document.querySelectorAll('canvas.membrane')){
       if(canvas.closest('.hidden,[hidden]') || !canvas.getClientRects().length)continue;
-      const c=canvas.getContext('2d'), w=canvas.width, r=w*.29*(1+Math.sin(t)*.015+(state==='listening'?amplitude*.045:0)+pulse*.035), mid=w/2;
+      const c=canvas.getContext('2d'), w=canvas.width, r=w*.29*(1+Math.sin(t)*.012+breathing+(state==='listening'?amplitude*.04:0)+pulse*.03), mid=w/2;
       if(!c)continue;c.globalAlpha=opacity;
       c.clearRect(0,0,w,w);
       const halo=c.createRadialGradient(mid,mid,r*.4,mid,mid,r*1.7);
-      halo.addColorStop(0,'#f5f5f500');halo.addColorStop(.55,'#f5f5f510');halo.addColorStop(1,'#f5f5f500');c.fillStyle=halo;c.fillRect(0,0,w,w);
+      halo.addColorStop(0,'#f5f5f500');halo.addColorStop(.55,state==='idle'?'#f5f5f50a':state==='listening'?'#f5f5f51b':'#f5f5f516');halo.addColorStop(1,'#f5f5f500');c.fillStyle=halo;c.fillRect(0,0,w,w);
       c.save();c.translate(mid,mid+r*1.17);c.scale(1,.16);
       const reflection=c.createRadialGradient(0,0,0,0,0,r);reflection.addColorStop(0,'#f5f5f522');reflection.addColorStop(1,'#f5f5f500');c.fillStyle=reflection;c.fillRect(-r,-r,r*2,r*2);c.restore();
       for(let layer=0;layer<7;layer++){

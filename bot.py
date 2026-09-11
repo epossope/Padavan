@@ -54,7 +54,7 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
@@ -112,6 +112,13 @@ TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED",
 TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
 TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
 TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
+TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
+TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
+TELEGRAM_READ_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15")))
+TELEGRAM_WRITE_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "15")))
+TELEGRAM_POOL_TIMEOUT = max(1.0, float(os.getenv("TELEGRAM_POOL_TIMEOUT", "3")))
+TELEGRAM_CONNECTION_POOL_SIZE = max(8, int(os.getenv("TELEGRAM_CONNECTION_POOL_SIZE", "32")))
+REMINDER_TICK_SECONDS = min(30, max(15, int(os.getenv("REMINDER_TICK_SECONDS", "20"))))
 VOICE_CONVERSATION_ENABLED = os.getenv("VOICE_CONVERSATION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 VOICE_MODE = os.getenv("VOICE_MODE", "push_to_talk").strip().lower()
 VOICE_SESSION_TIMEOUT_SEC = max(5, int(os.getenv("VOICE_SESSION_TIMEOUT_SEC", "25")))
@@ -148,6 +155,7 @@ ACTIVE_DRAFTS_LOCK = threading.RLock()
 ACTIVE_DRAFTS = {}
 ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
 ACTIVE_STREAM_RESPONSES = {}
+RUNTIME_METRICS = {}
 
 
 
@@ -767,38 +775,95 @@ def set_active_ui_message_id(chat_id, message_id=0):
     set_app_setting(f"active_ui_message:{chat_id}", str(int(message_id or 0)))
 
 
+def record_runtime_metric(name, value_ms, **detail):
+    sample = {"value_ms": max(0, round(float(value_ms), 1)), "at": time.time(), **detail}
+    RUNTIME_METRICS[name] = sample
+    return sample
+
+
+async def telegram_send_with_retry(bot, source="telegram", **kwargs):
+    """Send without monopolizing handlers; retry only transient Telegram transport errors."""
+    kwargs.setdefault("connect_timeout", TELEGRAM_CONNECT_TIMEOUT)
+    kwargs.setdefault("read_timeout", TELEGRAM_READ_TIMEOUT)
+    kwargs.setdefault("write_timeout", TELEGRAM_WRITE_TIMEOUT)
+    kwargs.setdefault("pool_timeout", TELEGRAM_POOL_TIMEOUT)
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        started = time.perf_counter()
+        try:
+            sent = await bot.send_message(**kwargs)
+            elapsed = (time.perf_counter() - started) * 1000
+            record_runtime_metric("telegram_send_ms", elapsed, source=source, attempt=attempt)
+            if elapsed > 2000:
+                LOGGER.warning("telemetry telegram_send_ms=%.1f source=%s attempt=%d", elapsed, source, attempt)
+            else:
+                LOGGER.debug("telemetry telegram_send_ms=%.1f source=%s attempt=%d", elapsed, source, attempt)
+            return sent
+        except Forbidden:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source=source, attempt=attempt, error="forbidden")
+            raise
+        except (TimedOut, NetworkError) as exc:
+            elapsed = (time.perf_counter() - started) * 1000
+            record_runtime_metric("telegram_send_ms", elapsed, source=source, attempt=attempt, error=type(exc).__name__)
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                raise
+            delay = 0.15 * (2 ** attempt) + secrets.randbelow(80) / 1000
+            LOGGER.warning("Telegram send retry source=%s attempt=%d delay_ms=%d", source, attempt + 1, round(delay * 1000))
+            await asyncio.sleep(delay)
+
+
 async def replace_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
     """Keep exactly one persistent inline control window per private chat."""
     chat_id = update.effective_chat.id
-    previous_id = active_ui_message_id(chat_id)
+    previous_id = await asyncio.to_thread(active_ui_message_id, chat_id)
     if previous_id:
-        with contextlib.suppress(Exception):
+        try:
             await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
-    sent = await context.bot.send_message(
-        chat_id=chat_id,
-        text=live_ui_text(text),
-        reply_markup=live_markup(reply_markup),
-        parse_mode=parse_mode,
-    )
-    set_active_ui_message_id(chat_id, sent.message_id)
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+        except (BadRequest, Forbidden):
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Telegram delete delayed chat_id=%s", chat_id)
+    try:
+        rendered_text, rendered_markup = await asyncio.to_thread(
+            lambda: (live_ui_text(text), live_markup(reply_markup)))
+        sent = await telegram_send_with_retry(
+            context.bot, source="replace_active_ui", chat_id=chat_id,
+            text=rendered_text, reply_markup=rendered_markup, parse_mode=parse_mode,
+        )
+    except Forbidden:
+        await asyncio.to_thread(set_app_setting, f"telegram_destination_unavailable:{chat_id}", datetime.now(timezone.utc).isoformat())
+        LOGGER.warning("Telegram destination unavailable chat_id=%s source=replace_active_ui", chat_id)
+        return None
+    except (TimedOut, NetworkError):
+        LOGGER.warning("Telegram UI send timed out chat_id=%s after bounded retry", chat_id)
+        return None
+    await asyncio.to_thread(set_active_ui_message_id, chat_id, sent.message_id)
     return sent
 
 
 async def refresh_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
     """Edit the current control window after a form-style text response."""
     chat_id = update.effective_chat.id
-    message_id = active_ui_message_id(chat_id)
+    message_id = await asyncio.to_thread(active_ui_message_id, chat_id)
     if message_id:
         try:
+            rendered_text, rendered_markup = await asyncio.to_thread(
+                lambda: (live_ui_text(text), live_markup(reply_markup)))
             return await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=live_ui_text(text),
-                reply_markup=live_markup(reply_markup),
+                text=rendered_text,
+                reply_markup=rendered_markup,
                 parse_mode=parse_mode,
             )
-        except Exception:
-            set_active_ui_message_id(chat_id, 0)
+        except Forbidden:
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+            return None
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Telegram UI edit timed out chat_id=%s; keeping existing control", chat_id)
+            return None
+        except BadRequest:
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
     return await replace_active_ui(update, context, text, reply_markup, parse_mode)
 
 
@@ -808,11 +873,11 @@ async def adopt_active_ui(query):
         return
     chat_id = query.message.chat_id
     message_id = query.message.message_id
-    previous_id = active_ui_message_id(chat_id)
+    previous_id = await asyncio.to_thread(active_ui_message_id, chat_id)
     if previous_id and previous_id != message_id:
         with contextlib.suppress(Exception):
             await query.get_bot().delete_message(chat_id=chat_id, message_id=previous_id)
-    set_active_ui_message_id(chat_id, message_id)
+    await asyncio.to_thread(set_active_ui_message_id, chat_id, message_id)
 
 
 async def delete_ephemeral_job(context):
@@ -1067,12 +1132,15 @@ class LiveMessage:
         return getattr(self._message, name)
 
     async def reply_text(self, text, *args, **kwargs):
-        rendered = live_ui_text(text)
+        rendered = await asyncio.to_thread(live_ui_text, text)
         if rendered != str(text) and not kwargs.get("parse_mode"):
             kwargs["parse_mode"] = "HTML"
         if kwargs.get("reply_markup") is not None:
-            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
-        return await self._message.reply_text(rendered, *args, **kwargs)
+            kwargs["reply_markup"] = await asyncio.to_thread(live_markup, kwargs["reply_markup"])
+        started = time.perf_counter()
+        result = await self._message.reply_text(rendered, *args, **kwargs)
+        record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source="reply_text")
+        return result
 
 
 class LiveCallbackQuery:
@@ -1089,14 +1157,16 @@ class LiveCallbackQuery:
         return self._message
 
     async def edit_message_text(self, text, *args, **kwargs):
-        rendered = live_ui_text(text)
+        rendered = await asyncio.to_thread(live_ui_text, text)
         if rendered != str(text) and not kwargs.get("parse_mode"):
             kwargs["parse_mode"] = "HTML"
         if kwargs.get("reply_markup") is not None:
-            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
+            kwargs["reply_markup"] = await asyncio.to_thread(live_markup, kwargs["reply_markup"])
+        started = time.perf_counter()
         result = await self._query.edit_message_text(rendered, *args, **kwargs)
+        record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source="edit_message_text")
         if kwargs.get("reply_markup") is not None and self._query.message:
-            set_active_ui_message_id(self._query.message.chat_id, self._query.message.message_id)
+            await asyncio.to_thread(set_active_ui_message_id, self._query.message.chat_id, self._query.message.message_id)
         return result
 
 
@@ -4030,7 +4100,11 @@ async def today_plan(update,context, day=None):
 
 async def callback(update,context):
 
+    callback_started=time.perf_counter()
     raw_query=update.callback_query; await raw_query.answer()
+    callback_ack_ms=(time.perf_counter()-callback_started)*1000
+    record_runtime_metric("callback_ack_ms", callback_ack_ms)
+    LOGGER.debug("telemetry callback_ack_ms=%.1f", callback_ack_ms)
     if not str(raw_query.data or "").startswith("ackrem:"):
         await adopt_active_ui(raw_query)
     q=LiveCallbackQuery(raw_query)
@@ -5387,50 +5461,74 @@ async def image_handler(update,context):
 
 
 
-async def reminder_tick(context):
-
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
+def due_reminder_rows(now_iso):
     with conn() as c:
-        initial = c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50", (now_iso,)).fetchall()
-        followups = c.execute("""SELECT id,chat_id,text,followup_count FROM reminders
-                               WHERE sent=1 AND acknowledged=0 AND followup_count<3
-                               AND next_followup_at<>'' AND next_followup_at<=?
-                               ORDER BY next_followup_at LIMIT 50""", (now_iso,)).fetchall()
+        initial = [dict(row) for row in c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50", (now_iso,)).fetchall()]
+        followups = [dict(row) for row in c.execute("""SELECT id,chat_id,text,followup_count FROM reminders
+                                      WHERE sent=1 AND acknowledged=0 AND followup_count<3
+                                      AND next_followup_at<>'' AND next_followup_at<=?
+                                      ORDER BY next_followup_at LIMIT 50""", (now_iso,)).fetchall()]
+    return initial, followups
+
+
+def mark_reminder_delivered(reminder_id, message_id, is_followup):
+    next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    with conn() as c:
+        c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
+                  (1 if is_followup else 0, next_at, message_id, reminder_id))
+
+
+def mark_reminder_unavailable(row, is_followup):
+    set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
+    with conn() as c:
+        if is_followup:
+            c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='' WHERE id=?", (row["id"],))
+        else:
+            c.execute("UPDATE reminders SET sent=1,next_followup_at='' WHERE id=?", (row["id"],))
+
+
+def reminder_delivery_payload(row, is_followup):
+    prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
+    return (
+        live_ui_text(prefix + row["text"]),
+        live_markup(InlineKeyboardMarkup([[
+            interface_inline_button("reminders", "⏰", "Выполнено", f"ackrem:{row['id']}")
+        ]])),
+    )
+
+
+async def reminder_tick(context):
+    started = time.perf_counter()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    initial, followups = await asyncio.to_thread(due_reminder_rows, now_iso)
+    semaphore = asyncio.Semaphore(4)
 
     async def deliver(row, is_followup=False):
-        prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
-        sent_message = await context.bot.send_message(
-            chat_id=row["chat_id"], text=live_ui_text(prefix + row["text"]), parse_mode="HTML",
-            reply_markup=live_markup(InlineKeyboardMarkup([[
-                interface_inline_button("reminders", "⏰", "Выполнено", f"ackrem:{row['id']}")
-            ]])),
-        )
-        next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-        with conn() as c:
-            c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
-                      (1 if is_followup else 0, next_at, sent_message.message_id, row["id"]))
+        async with semaphore:
+            rendered_text, rendered_markup = await asyncio.to_thread(reminder_delivery_payload, row, is_followup)
+            sent_message = await telegram_send_with_retry(
+                context.bot, source="reminder_followup" if is_followup else "reminder",
+                chat_id=row["chat_id"], text=rendered_text, parse_mode="HTML",
+                reply_markup=rendered_markup,
+            )
+            await asyncio.to_thread(mark_reminder_delivered, row["id"], sent_message.message_id, is_followup)
 
-    for row in initial:
+    async def guarded_deliver(row, is_followup=False):
         try:
-            await deliver(row)
+            await deliver(row, is_followup)
         except Forbidden:
-            set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
-            LOGGER.warning("Telegram destination unavailable chat_id=%s source=reminder", row["chat_id"])
-            with conn() as c:
-                c.execute("UPDATE reminders SET sent=1,next_followup_at='' WHERE id=?", (row["id"],))
+            await asyncio.to_thread(mark_reminder_unavailable, row, is_followup)
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Reminder delivery deferred chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
         except Exception:
             LOGGER.exception("Reminder delivery failed chat_id=%s", row["chat_id"])
-    for row in followups:
-        try:
-            await deliver(row, is_followup=True)
-        except Forbidden:
-            set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
-            LOGGER.warning("Telegram destination unavailable chat_id=%s source=reminder_followup", row["chat_id"])
-            with conn() as c:
-                c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='' WHERE id=?", (row["id"],))
-        except Exception:
-            LOGGER.exception("Reminder follow-up failed chat_id=%s", row["chat_id"])
+
+    await asyncio.gather(
+        *(guarded_deliver(row, False) for row in initial),
+        *(guarded_deliver(row, True) for row in followups),
+    )
+    record_runtime_metric("reminder_tick_ms", (time.perf_counter() - started) * 1000, delivered=len(initial) + len(followups))
 
 
 
@@ -5449,11 +5547,15 @@ def initialize_briefing(chat_id):
 
 
 async def briefing_tick(context):
-    with conn() as c: rows=c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()
+    def load_enabled():
+        with conn() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()]
+
+    rows = await asyncio.to_thread(load_enabled)
 
     for row in rows:
 
-        cfg=dict(row)
+        cfg=row
         now = datetime.now(timezone_for(cfg["chat_id"])); today = now.date().isoformat()
 
         welcome_key = f'briefing_welcome:{cfg["chat_id"]}'
@@ -5475,9 +5577,16 @@ async def briefing_tick(context):
                          f"Пока буду приходить в {cfg.get('time') or '08:30'} по твоему часовому поясу. "
                          "Рассылку можно отключить в любой момент.")
 
-            await context.bot.send_message(chat_id=cfg["chat_id"], text=live_ui_text(text), parse_mode="HTML")
+            rendered_text = await asyncio.to_thread(live_ui_text, text)
+            await telegram_send_with_retry(
+                context.bot, source="briefing", chat_id=cfg["chat_id"],
+                text=rendered_text, parse_mode="HTML",
+            )
 
-            with conn() as c: c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?",(today,cfg["chat_id"]))
+            def mark_sent():
+                with conn() as c:
+                    c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?", (today, cfg["chat_id"]))
+            await asyncio.to_thread(mark_sent)
             if first:
                 set_app_setting(welcome_key, "done")
 
@@ -5485,8 +5594,20 @@ async def briefing_tick(context):
             set_app_setting(f'telegram_destination_unavailable:{cfg["chat_id"]}', datetime.now(timezone.utc).isoformat())
             set_briefing_preferences(cfg["chat_id"], enabled=False)
             LOGGER.warning("Telegram destination unavailable chat_id=%s source=briefing", cfg["chat_id"])
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Briefing delivery deferred chat_id=%s", cfg["chat_id"])
         except Exception:
             LOGGER.exception("Briefing delivery failed chat_id=%s", cfg["chat_id"])
+
+
+async def event_loop_lag_tick(context):
+    loop = asyncio.get_running_loop()
+    expected = context.job.data.get("expected", loop.time())
+    lag_ms = max(0.0, (loop.time() - expected) * 1000)
+    context.job.data["expected"] = loop.time() + 1.0
+    record_runtime_metric("event_loop_lag_ms", lag_ms)
+    if lag_ms > 500:
+        LOGGER.warning("telemetry event_loop_lag_ms=%.1f", lag_ms)
 
 
 
@@ -5550,8 +5671,10 @@ def ingest_from_iphone(chat_id, text="", attachment=None):
 async def send_quick_action_feedback(request, chat_id, ok, message):
     try:
         telegram_app = request.app["telegram_app"]
-        sent = await telegram_app.bot.send_message(
-            chat_id=chat_id, text=live_ui_text(message), parse_mode="HTML")
+        rendered_text = await asyncio.to_thread(live_ui_text, message)
+        sent = await telegram_send_with_retry(
+            telegram_app.bot, source="quick_action_feedback",
+            chat_id=chat_id, text=rendered_text, parse_mode="HTML")
         if is_ephemeral_confirmation(message):
             schedule_ephemeral_delete(telegram_app, sent)
     except Exception:
@@ -5575,10 +5698,11 @@ async def show_iphone_input(request, chat_id, text="", attachment=None):
             LOGGER.warning("Unable to mirror iPhone attachment into chat %s", chat_id)
     visible = str(text or "").strip()
     if visible:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=live_ui_text(f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}"),
-            parse_mode="HTML")
+        rendered_text = await asyncio.to_thread(
+            live_ui_text, f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}")
+        await telegram_send_with_retry(
+            bot, source="iphone_input", chat_id=chat_id,
+            text=rendered_text, parse_mode="HTML")
 
 
 async def quick_actions_run(request):
@@ -5752,7 +5876,18 @@ async def main_async():
 
     print("="*60)
 
-    app=Application.builder().token(TG).build()
+    app=(Application.builder().token(TG)
+         .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+         .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+         .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+         .read_timeout(TELEGRAM_READ_TIMEOUT)
+         .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+         .get_updates_connection_pool_size(2)
+         .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT)
+         .get_updates_connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+         .get_updates_read_timeout(30)
+         .get_updates_write_timeout(TELEGRAM_WRITE_TIMEOUT)
+         .build())
 
     app.add_error_handler(telegram_error_handler)
 
@@ -5772,19 +5907,29 @@ async def main_async():
 
     app.add_handler(CommandHandler("clearreplyemojis", clear_reply_emojis))
 
-    app.add_handler(CallbackQueryHandler(callback))
+    # Long-running voice/image work and a slow Telegram send must not delay the
+    # acknowledgement of the next inline button.
+    app.add_handler(CallbackQueryHandler(callback, block=False))
 
-    app.add_handler(MessageHandler(filters.VOICE,voice_handler))
+    app.add_handler(MessageHandler(filters.VOICE,voice_handler, block=False))
 
     # block=False is required so a stopped_message_generation update can cancel
     # a still-running draft instead of waiting behind the text handler.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler, block=False))
 
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,image_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,image_handler, block=False))
 
-    app.job_queue.run_repeating(reminder_tick,interval=5,first=2)
+    app.job_queue.run_repeating(
+        reminder_tick, interval=REMINDER_TICK_SECONDS, first=2,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": REMINDER_TICK_SECONDS},
+    )
 
     app.job_queue.run_repeating(briefing_tick,interval=30,first=10)
+    app.job_queue.run_repeating(
+        event_loop_lag_tick, interval=1, first=1,
+        data={"expected": asyncio.get_running_loop().time() + 1},
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+    )
 
     await app.initialize()
     await app.start()

@@ -43,6 +43,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_signed_owner_used(self):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "mode", "args": {"mode": "text"}})
         self.assertEqual(response.status, 200)
+        self.assertRegex(response.headers.get("Server-Timing", ""), r"ui_action;dur=\d")
         self.core.set_mode.assert_called_once_with(42, 'text')
 
     async def test_invalid_mode_rejected(self):

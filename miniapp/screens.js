@@ -76,8 +76,8 @@ render=function(){
  if(page==='chat'){
   content.querySelector('.subtle')?.remove();
   const form=content.querySelector('.composer');
-  const ambient=document.createElement('div');ambient.className='chat-ambient';ambient.innerHTML='<canvas class="membrane" width="360" height="360" aria-hidden="true"></canvas>';content.prepend(ambient);
-  form.insertAdjacentHTML('beforebegin','<button class="conversation-toggle secondary" type="button" data-conversation><span>Разговор</span><small data-conversation-status>Спит</small></button>');
+  const ambient=document.createElement('div');ambient.className='chat-ambient';ambient.innerHTML='<canvas class="membrane" width="360" height="360" aria-hidden="true"></canvas>';form.before(ambient);
+  form.insertAdjacentHTML('beforebegin','<button class="conversation-toggle secondary" type="button" data-conversation><span>Разговор</span><small data-conversation-status></small></button>');
   form.insertAdjacentHTML('afterbegin',iconButton('mic','Записать голосовое сообщение','type="button" id="record"'));
   form.querySelector('[type=submit]').innerHTML=icon('arrow');
  }

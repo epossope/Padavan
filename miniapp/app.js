@@ -7,15 +7,21 @@ const defaultWidgets=['tasks','next_event','notes','reminders','budget','recent_
 const widgetNames={tasks:'Задачи',next_event:'Ближайшее',notes:'Заметки',reminders:'Напоминания',budget:'Бюджет',recent_saved:'Недавно сохранено',people:'Люди'};
 let weatherData=null,monthBudget=null,taskTab='today',navHistory=[],layoutDraft=[],archiveResults=null;
 const preview=!tg?.initData;
+const telemetry=window.NoemaTelemetry=window.NoemaTelemetry||{events:[],latest:{}};
+telemetry.record=telemetry.record||function(name,value,detail={}){const sample={name,value:Math.max(0,Math.round(Number(value)||0)),at:Date.now(),...detail};this.latest[name]=sample;this.events.push(sample);if(this.events.length>80)this.events.splice(0,this.events.length-80);return sample};
+let lagExpected=performance.now()+2000;
+setInterval(()=>{const current=performance.now(),lag=Math.max(0,current-lagExpected);lagExpected=current+2000;if(!document.hidden)telemetry.record('event_loop_lag_ms',lag)},2000);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=v=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:0}).format(Number(v)||0);
 const date=v=>v?new Date(v).toLocaleDateString('ru-RU',{day:'numeric',month:'long'}):'Без даты';
 function say(message){notice.textContent=message;notice.classList.toggle('visible',!!message)}
 async function api(action,args={}){
   if(preview)throw Error('Для сохранения открой Noema через Telegram. Здесь доступен только просмотр оформления.');
-  const response=await fetch('/api/v1/miniapp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:tg.initData,action,args})});
-  if(response.status===401)throw Error('Сессия закончилась. Закрой и снова открой приложение в Telegram.');
-  const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Нет соединения с Noema.');return result.data;
+  const started=performance.now();
+  try{const response=await fetch('/api/v1/miniapp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:tg.initData,action,args})});
+   if(response.status===401)throw Error('Сессия закончилась. Закрой и снова открой приложение в Telegram.');
+   const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Нет соединения с Noema.');return result.data}
+  finally{telemetry.record('ui_action_ms',performance.now()-started,{action})}
 }
 async function load(){data=await api('state');render()}
 function empty(text='Здесь пока тихо. Добавь первую запись.'){return `<div class="empty">${text}</div>`}

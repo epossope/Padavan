@@ -7,12 +7,24 @@ const path=require('path');
   const page=await browser.newPage({viewport:{width,height},deviceScaleFactor:1});
   page.on('pageerror',e=>errors.push(e.message));
   await page.goto('http://127.0.0.1:8091/app');await page.locator('#splash.hidden').waitFor();await page.waitForTimeout(500);
+  const viewport=await page.locator('meta[name=viewport]').getAttribute('content');
+  if(!/maximum-scale=1/.test(viewport)||!/user-scalable=no/.test(viewport)||!/viewport-fit=cover/.test(viewport))errors.push('Viewport zoom hardening missing');
+  if(await page.evaluate(()=>window.visualViewport&&window.visualViewport.scale!==1))errors.push(`Unexpected initial zoom ${width}`);
   for(const route of ['home','tasks','archive','people','settings','chat','budget','reminders']){
    await page.evaluate(route=>go(route),route);
    if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))errors.push(`${route} overflows ${width}`);
    if(route==='settings'&&await page.locator('#dock').isVisible())errors.push('Membrane visible in settings');
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
+    const sphere=await page.locator('.chat-ambient').boundingBox();if(Math.abs(sphere.x+sphere.width/2-width/2)>3)errors.push(`Chat sphere not centered ${width}`);
+    const sphereStyle=await page.locator('.chat-ambient').evaluate(el=>({position:getComputedStyle(el).position,opacity:Number(getComputedStyle(el).opacity),beforeComposer:Boolean(el.compareDocumentPosition(document.querySelector('.composer'))&Node.DOCUMENT_POSITION_FOLLOWING)}));
+    if(sphereStyle.position!=='relative'||sphereStyle.opacity<.7||!sphereStyle.beforeComposer)errors.push(`Chat sphere is not foreground content ${width}`);
+    if(Number.parseFloat(await page.locator('#chat-input').evaluate(el=>getComputedStyle(el).fontSize))<16)errors.push(`Chat input can trigger iPhone zoom ${width}`);
+   }
+   if(route==='home'){
+    const dockStyle=await page.locator('#dock').evaluate(el=>({position:getComputedStyle(el).position,background:getComputedStyle(el,'::before').backgroundImage}));
+    const boxes=await Promise.all(['.focus-pill','.orb-button','.keyboard-button'].map(selector=>page.locator(`#dock ${selector}`).boundingBox()));
+    const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
    }
    if(width===390)await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:true});
   }
@@ -34,5 +46,5 @@ const path=require('path');
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
- await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('6 viewports × 8 screens + direct mouse/touch sorting + bottom chat + sphere route: passed');
+ await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('6 viewports × 8 screens + zoom guard + overlay dock + centered chat sphere + direct mouse/touch sorting: passed');
 })().catch(e=>{console.error(e);process.exitCode=1});
