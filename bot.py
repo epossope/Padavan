@@ -104,6 +104,12 @@ VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 VISION_FALLBACK_MODELS = [x.strip() for x in os.getenv("VISION_FALLBACK_MODELS", "google/gemini-2.5-flash-lite").split(",") if x.strip()]
 
 STT_MODEL = os.getenv("STT_MODEL", "mistralai/voxtral-mini-transcribe").strip()
+VOICE_CONVERSATION_ENABLED = os.getenv("VOICE_CONVERSATION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+VOICE_MODE = os.getenv("VOICE_MODE", "push_to_talk").strip().lower()
+VOICE_SESSION_TIMEOUT_SEC = max(5, int(os.getenv("VOICE_SESSION_TIMEOUT_SEC", "25")))
+VAD_SPEECH_THRESHOLD = float(os.getenv("VAD_SPEECH_THRESHOLD", "0.035"))
+VAD_END_SILENCE_MS = max(250, int(os.getenv("VAD_END_SILENCE_MS", "450")))
+VAD_MIN_SPEECH_MS = max(100, int(os.getenv("VAD_MIN_SPEECH_MS", "300")))
 
 VOICE = os.getenv("EDGE_VOICE", "ru-RU-DmitryNeural").strip()
 
@@ -1122,6 +1128,12 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
 
+        CREATE TABLE IF NOT EXISTS conversation_summaries(
+            chat_id INTEGER PRIMARY KEY, summary TEXT NOT NULL DEFAULT '',
+            through_message_id INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0,
             acknowledged INTEGER NOT NULL DEFAULT 0, followup_count INTEGER NOT NULL DEFAULT 0,
             next_followup_at TEXT NOT NULL DEFAULT '', last_sent_message_id INTEGER);
@@ -1299,9 +1311,28 @@ def add_message(chat_id, role, content):
 
                   (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
 
-        c.execute("""DELETE FROM messages WHERE chat_id=? AND id NOT IN(
 
-        SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 60)""",(chat_id,chat_id))
+def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_chars=5000):
+    """Keep raw history immutable while the prompt stays bounded and inspectable."""
+    with conn() as c:
+        rows = c.execute("SELECT id,role,content FROM messages WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()
+        summary_row = c.execute("SELECT summary,through_message_id FROM conversation_summaries WHERE chat_id=?", (chat_id,)).fetchone()
+        cutoff = max(0, len(rows) - recent_limit)
+        older = rows[:cutoff]
+        existing_through = int(summary_row["through_message_id"]) if summary_row else 0
+        if len(rows) > summary_after and older and older[-1]["id"] > existing_through:
+            # Deterministic compacting is deliberately conservative: exact state is still read through tools/DB.
+            transcript = "\n".join(f'{r["role"]}: {str(r["content"] or "")[:500]}' for r in older)
+            compact = transcript[-summary_chars:]
+            c.execute("INSERT INTO conversation_summaries(chat_id,summary,through_message_id,version,updated_at) VALUES(?,?,?,?,?) "
+                      "ON CONFLICT(chat_id) DO UPDATE SET summary=excluded.summary,through_message_id=excluded.through_message_id,version=excluded.version,updated_at=excluded.updated_at",
+                      (chat_id, compact, older[-1]["id"], 1, datetime.now(timezone.utc).isoformat()))
+            summary_row = {"summary": compact, "through_message_id": older[-1]["id"]}
+    result = []
+    if summary_row and summary_row["summary"]:
+        result.append({"role": "system", "content": "Краткий контекст прошлой беседы (не источник точных данных):\n" + str(summary_row["summary"])})
+    result.extend({"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in rows[-recent_limit:])
+    return result
 
 
 
@@ -3033,7 +3064,7 @@ def ask(chat_id,text):
               "Если пользователь спрашивает «его/её/то/про неё/его id», опирайся на этот элемент (можно knowledge_get/knowledge_files по id).")
         msgs.append({"role":"system","content":note})
 
-    msgs+=history(chat_id)+[{"role":"user","content":text}]
+    msgs+=conversation_context(chat_id)+[{"role":"user","content":text}]
 
     writes=[]
 
@@ -3188,6 +3219,9 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
 def transcribe(chat_id, path):
 
     b64=base64.b64encode(Path(path).read_bytes()).decode()
+    suffix = Path(path).suffix.lower().lstrip(".")
+    # Mini App records WebM/MP4 while Telegram voice notes are OGG. Never mislabel audio to STT.
+    audio_format = {"ogg": "ogg", "oga": "ogg", "webm": "webm", "mp4": "mp4", "m4a": "m4a", "wav": "wav"}.get(suffix, "webm")
 
     # A Noema-managed key is a complete private balance: speech-to-text,
     # chat and Vision all belong to the same Telegram user.
@@ -3196,7 +3230,7 @@ def transcribe(chat_id, path):
     for attempt in range(2):
         key, source = api_key_for_chat(chat_id)
         r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=180)
         if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
             break
 
