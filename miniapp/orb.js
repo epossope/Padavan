@@ -20,7 +20,7 @@
       if(!c)continue;c.globalAlpha=opacity;
       c.clearRect(0,0,w,w);
       const halo=c.createRadialGradient(mid,mid,r*.4,mid,mid,r*1.7);
-      halo.addColorStop(0,'#f5f5f500');halo.addColorStop(.55,state==='idle'?'#f5f5f50a':state==='listening'?'#f5f5f51b':'#f5f5f516');halo.addColorStop(1,'#f5f5f500');c.fillStyle=halo;c.fillRect(0,0,w,w);
+      halo.addColorStop(0,'#f5f5f500');halo.addColorStop(.55,state==='idle'?'#f5f5f518':state==='listening'?'#ffffff32':'#f8f8f82a');halo.addColorStop(1,'#f5f5f500');c.fillStyle=halo;c.fillRect(0,0,w,w);
       c.save();c.translate(mid,mid+r*1.17);c.scale(1,.16);
       const reflection=c.createRadialGradient(0,0,0,0,0,r);reflection.addColorStop(0,'#f5f5f522');reflection.addColorStop(1,'#f5f5f500');c.fillStyle=reflection;c.fillRect(-r,-r,r*2,r*2);c.restore();
       for(let layer=0;layer<7;layer++){
@@ -34,15 +34,15 @@
         }
         c.closePath();
         const surface=c.createRadialGradient(mid-r*.6,mid-r*.7,r*.05,mid,mid,r*1.05);
-        surface.addColorStop(0,'#f5f5f509');surface.addColorStop(.38,'#a6a7aa03');surface.addColorStop(.78,'#15151701');surface.addColorStop(.93,'#f5f5f509');surface.addColorStop(1,'#f5f5f51b');
+        surface.addColorStop(0,'#ffffff14');surface.addColorStop(.38,'#c8c9cc08');surface.addColorStop(.78,'#15151701');surface.addColorStop(.93,'#ffffff12');surface.addColorStop(1,'#ffffff32');
         c.fillStyle=surface;c.fill();
-        const rim=c.createLinearGradient(mid-r,mid-r,mid+r,mid+r);rim.addColorStop(0,'#f7f7f7b0');rim.addColorStop(.27,'#a6a7aa18');rim.addColorStop(.5,'#f5f5f570');rim.addColorStop(.75,'#a6a7aa10');rim.addColorStop(1,'#f5f5f585');
-        c.strokeStyle=rim;c.lineWidth=w/650;c.shadowColor='#f5f5f5';c.shadowBlur=layer===0?10:3;c.stroke();c.shadowBlur=0;
+        const rim=c.createLinearGradient(mid-r,mid-r,mid+r,mid+r);rim.addColorStop(0,'#ffffffe6');rim.addColorStop(.27,'#d7d8dc38');rim.addColorStop(.5,'#ffffffb8');rim.addColorStop(.75,'#c2c3c728');rim.addColorStop(1,'#ffffffd0');
+        c.strokeStyle=rim;c.lineWidth=w/520;c.shadowColor='#ffffff';c.shadowBlur=layer===0?15:5;c.stroke();c.shadowBlur=0;
       }
       // Refractive folds are translucent ribbons, not latitude/longitude lines.
       for(let fold=0;fold<5;fold++){
         c.save();c.translate(mid,mid);c.rotate(fold*1.23+Math.sin(t*.35+fold)*.22);
-        const sheen=c.createLinearGradient(-r,0,r,0);sheen.addColorStop(0,'#f5f5f500');sheen.addColorStop(.22,'#f5f5f520');sheen.addColorStop(.5,'#f5f5f50b');sheen.addColorStop(.82,'#f5f5f56a');sheen.addColorStop(1,'#f5f5f500');
+        const sheen=c.createLinearGradient(-r,0,r,0);sheen.addColorStop(0,'#f5f5f500');sheen.addColorStop(.22,'#ffffff36');sheen.addColorStop(.5,'#ffffff12');sheen.addColorStop(.82,'#ffffff94');sheen.addColorStop(1,'#f5f5f500');
         c.beginPath();c.moveTo(-r*.88,-r*.3);c.bezierCurveTo(-r*.15,-r*1.18,r*1.02,-r*.68,r*.86,r*.38);c.bezierCurveTo(r*.98,-r*.55,-r*.08,-r*.97,-r*.88,-r*.3);c.fillStyle=sheen;c.fill();c.strokeStyle=sheen;c.lineWidth=w/900;c.stroke();c.restore();
       }
     }

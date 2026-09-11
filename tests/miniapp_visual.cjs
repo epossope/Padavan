@@ -22,9 +22,9 @@ const path=require('path');
     if(Number.parseFloat(await page.locator('#chat-input').evaluate(el=>getComputedStyle(el).fontSize))<16)errors.push(`Chat input can trigger iPhone zoom ${width}`);
    }
    if(route==='home'){
-    const dockStyle=await page.locator('#dock').evaluate(el=>({position:getComputedStyle(el).position,background:getComputedStyle(el,'::before').backgroundImage}));
+    const dockStyle=await page.locator('#dock').evaluate(el=>({position:getComputedStyle(el).position,background:getComputedStyle(el).backgroundImage,frame:getComputedStyle(el,'::before').display}));
     const boxes=await Promise.all(['.focus-pill','.orb-button','.keyboard-button'].map(selector=>page.locator(`#dock ${selector}`).boundingBox()));
-    const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
+    const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||dockStyle.frame!=='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
    }
    if(width===390)await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:true});
   }
