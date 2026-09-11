@@ -1,0 +1,10 @@
+/emojihelp
+Он покажет все варианты:
+- Главное меню: today, briefing, settings, more
+- «Ещё»: tasks, reminders, people, notes, budget
+- Задачи: open, done, failed
+Пример: напиши /setemoji budget , затем в этом же сообщении выбери живой эмодзи из своего набора и отправь. Так же для каждого нужного слота.
+
+
+  для Noema 
+/replyemoji — можно 20–48 живых эмодзи одним сообщением.

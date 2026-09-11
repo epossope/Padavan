@@ -514,7 +514,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -740,6 +740,97 @@ def set_app_setting(key, value):
                   (key, value, datetime.now(timezone.utc).isoformat()))
 
 
+def active_ui_message_id(chat_id):
+    value = app_setting(f"active_ui_message:{chat_id}")
+    return int(value) if str(value).isdigit() else 0
+
+
+def set_active_ui_message_id(chat_id, message_id=0):
+    set_app_setting(f"active_ui_message:{chat_id}", str(int(message_id or 0)))
+
+
+async def replace_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
+    """Keep exactly one persistent inline control window per private chat."""
+    chat_id = update.effective_chat.id
+    previous_id = active_ui_message_id(chat_id)
+    if previous_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=live_ui_text(text),
+        reply_markup=live_markup(reply_markup),
+        parse_mode=parse_mode,
+    )
+    set_active_ui_message_id(chat_id, sent.message_id)
+    return sent
+
+
+async def refresh_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
+    """Edit the current control window after a form-style text response."""
+    chat_id = update.effective_chat.id
+    message_id = active_ui_message_id(chat_id)
+    if message_id:
+        try:
+            return await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=live_ui_text(text),
+                reply_markup=live_markup(reply_markup),
+                parse_mode=parse_mode,
+            )
+        except Exception:
+            set_active_ui_message_id(chat_id, 0)
+    return await replace_active_ui(update, context, text, reply_markup, parse_mode)
+
+
+async def adopt_active_ui(query):
+    """Make a clicked legacy inline screen the sole active window."""
+    if not query.message:
+        return
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+    previous_id = active_ui_message_id(chat_id)
+    if previous_id and previous_id != message_id:
+        with contextlib.suppress(Exception):
+            await query.get_bot().delete_message(chat_id=chat_id, message_id=previous_id)
+    set_active_ui_message_id(chat_id, message_id)
+
+
+async def delete_ephemeral_job(context):
+    data = context.job.data or {}
+    with contextlib.suppress(Exception):
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+
+
+def schedule_ephemeral_delete(context, message, delay=240):
+    """Remove momentary confirmations without blocking the update handler."""
+    job_queue = getattr(context, "job_queue", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    if job_queue and chat_id and message_id:
+        job_queue.run_once(
+            delete_ephemeral_job,
+            when=delay,
+            data={"chat_id": int(chat_id), "message_id": int(message_id)},
+            name=f"ephemeral:{chat_id}:{message_id}",
+        )
+
+
+EPHEMERAL_CONFIRMATION_PREFIXES = (
+    "Напоминание поставлено", "Задача добавлена", "Заметка сохранена",
+    "Записала расход", "Записала поступление", "Обновила расход",
+    "Сохранила данные", "Записала взаимодействие", "Правило добавлено",
+    "Правило обновлено", "Правило удалено", "Часовой пояс изменён",
+)
+
+
+def is_ephemeral_confirmation(text):
+    compact = str(text or "").strip()
+    return bool(compact) and any(compact.startswith(prefix) for prefix in EPHEMERAL_CONFIRMATION_PREFIXES)
+
+
 EMOJI_SLOT_GROUPS = {
     "main": [("today", "Сегодня"), ("briefing", "Брифинг"), ("settings", "Настройки"), ("more", "Ещё")],
     "more": [("tasks", "Задачи"), ("reminders", "Напоминания"), ("people", "Люди"), ("notes", "Заметки"), ("budget", "Бюджет")],
@@ -754,7 +845,7 @@ EMOJI_SLOT_NAMES = {slot: label for group in EMOJI_SLOT_GROUPS.values() for slot
 # configured menu icon animate the same symbol in headings and notices.
 EMOJI_SLOT_BY_FALLBACK = {
     "📅": "today", "🌅": "briefing", "⚙️": "settings", "☰": "more",
-    "✅": "done", "◻️": "open", "❌": "failed", "⏰": "reminders",
+    "✅": "tasks", "◻️": "open", "❌": "failed", "⏰": "reminders",
     "👥": "people", "📝": "notes", "💳": "budget", "🧠": "model",
     "👁": "vision", "🔊": "replymode", "📜": "rules", "📱": "iphone",
     "🔐": "keys", "🧹": "clear",
@@ -819,8 +910,8 @@ def interface_inline_button(slot, fallback, text, callback_data):
 def main_keyboard():
     """Build the persistent keyboard with optional Telegram custom-emoji icons."""
     return ReplyKeyboardMarkup([
-        [interface_button("briefing", "🌅", "Брифинг"), interface_button("today", "📅", "Сегодня")],
-        [interface_button("settings", "⚙️", "Настройки"), interface_button("more", "☰", "Ещё")],
+        [interface_button("today", "📅", "Сегодня"), interface_button("more", "☰", "Ещё"),
+         interface_button("settings", "⚙️", "Настройки")],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -908,7 +999,9 @@ def animate_configured_emojis(rendered_html, limit):
 
 def live_ui_text(text):
     """Apply the user's live emoji palette to fixed Noema screens too."""
-    rendered, _ = animate_configured_emojis(str(text or ""), 7)
+    # Interface screens must be consistent from top to bottom.  The 1/3/5/7
+    # limit is only for conversational answers, never for lists and menus.
+    rendered, _ = animate_configured_emojis(str(text or ""), 10_000)
     return rendered
 
 
@@ -983,7 +1076,10 @@ class LiveCallbackQuery:
             kwargs["parse_mode"] = "HTML"
         if kwargs.get("reply_markup") is not None:
             kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
-        return await self._query.edit_message_text(rendered, *args, **kwargs)
+        result = await self._query.edit_message_text(rendered, *args, **kwargs)
+        if kwargs.get("reply_markup") is not None and self._query.message:
+            set_active_ui_message_id(self._query.message.chat_id, self._query.message.message_id)
+        return result
 
 
 
@@ -1068,7 +1164,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS briefings(
 
-            chat_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,time TEXT NOT NULL DEFAULT '08:00',
+            chat_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,time TEXT NOT NULL DEFAULT '08:30',
 
             city TEXT NOT NULL DEFAULT '',topics TEXT NOT NULL DEFAULT 'главные новости, ИИ, бизнес',
 
@@ -1771,6 +1867,24 @@ def save_reminder(chat_id, text, remind_at):
     return {"ok":True,"tool":"set_reminder","id":cur.lastrowid,"text":text,"local_time":dt.strftime("%d.%m.%Y %H:%M")}
 
 
+def update_reminder(chat_id, reminder_id, text="", remind_at=""):
+    text = str(text or "").strip()[:1000]
+    if not text or not remind_at:
+        return {"ok": False, "tool": "update_reminder", "error": "invalid_reminder"}
+    try:
+        dt = datetime.fromisoformat(str(remind_at))
+    except ValueError:
+        return {"ok": False, "tool": "update_reminder", "error": "invalid_time"}
+    chat_tz = timezone_for(chat_id)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=chat_tz)
+    utc_time = dt.astimezone(timezone.utc).isoformat()
+    with conn() as c:
+        cur = c.execute("UPDATE reminders SET text=?,remind_at_utc=?,sent=0,acknowledged=0,next_followup_at='' WHERE id=? AND chat_id=?",
+                        (text, utc_time, int(reminder_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_reminder", "updated": cur.rowcount}
+
+
 
 def save_image_to_db(chat_id, original_name, mime_type, local_path, kind, summary=None, telegram_file_id=""):
 
@@ -1872,6 +1986,16 @@ def add_task(chat_id, text, due_date="", priority="normal"):
         VALUES(?,?,?,?,?,?)""",(chat_id,text,due_date or "",priority or "normal","open",datetime.now(timezone.utc).isoformat()))
 
     return {"ok":True,"tool":"add_task","id":cur.lastrowid,"text":text,"due_date":due_date or ""}
+
+
+def update_task(chat_id, task_id, text="", due_date="", priority="normal"):
+    text = str(text or "").strip()[:1000]
+    if not text:
+        return {"ok": False, "tool": "update_task", "error": "empty_task"}
+    with conn() as c:
+        cur = c.execute("UPDATE tasks SET text=?,due_date=?,priority=? WHERE id=? AND chat_id=?",
+                        (text, str(due_date or "")[:32], str(priority or "normal")[:32], int(task_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_task", "updated": cur.rowcount}
 
 
 
@@ -2144,6 +2268,44 @@ def save_note(chat_id, text, title=""):
     return {"ok":True,"tool":"save_note","id":cur.lastrowid,"title":title or ""}
 
 
+def update_note(chat_id, note_id, text="", title=""):
+    text = str(text or "").strip()[:12000]
+    if not text:
+        return {"ok": False, "tool": "update_note", "error": "empty_note"}
+    with conn() as c:
+        cur = c.execute("UPDATE notes SET title=?,text=? WHERE id=? AND chat_id=?",
+                        (str(title or "").strip()[:240], text, int(note_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_note", "updated": cur.rowcount}
+
+
+def update_expense(chat_id, expense_id, amount, description="", category="прочее", currency="RUB", spent_at=""):
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "update_expense", "error": "invalid_amount"}
+    if amount <= 0:
+        return {"ok": False, "tool": "update_expense", "error": "invalid_amount"}
+    with conn() as c:
+        row = c.execute("SELECT spent_at FROM expenses WHERE id=? AND chat_id=?", (int(expense_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "update_expense", "error": "not_found"}
+        cur = c.execute("UPDATE expenses SET amount=?,description=?,category=?,currency=?,spent_at=? WHERE id=? AND chat_id=?",
+                        (amount, str(description or "").strip()[:500], str(category or "прочее").strip()[:120],
+                         str(currency or "RUB").strip()[:8], normalize_spent_at(str(spent_at)) if spent_at else row["spent_at"], int(expense_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_expense", "updated": cur.rowcount}
+
+
+def update_person(chat_id, person_id, name="", relationship="", birthday="", projects="", notes=""):
+    name = str(name or "").strip()[:160]
+    if not name:
+        return {"ok": False, "tool": "update_person", "error": "empty_name"}
+    with conn() as c:
+        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,projects=?,notes=?,updated_at=? WHERE id=? AND chat_id=?",
+                        (name, str(relationship or "")[:160], str(birthday or "")[:32], str(projects or "")[:1000],
+                         str(notes or "")[:3000], datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_person", "updated": cur.rowcount}
+
+
 def delete_note(chat_id,note_id):
 
     with conn() as c:
@@ -2219,7 +2381,17 @@ def execute_tool(chat_id,name,args):
 
         "save_note":save_note,
 
+        "update_note":update_note,
+
         "add_task":add_task,
+
+        "update_task":update_task,
+
+        "update_reminder":update_reminder,
+
+        "update_expense":update_expense,
+
+        "update_person":update_person,
 
         "person_upsert":person_upsert,
 
@@ -3074,7 +3246,7 @@ def wants_voice(text):
 
 
 
-async def send_answer(update,answer,voice_in=False,force_voice=False):
+async def send_answer(update,answer,context=None,voice_in=False,force_voice=False):
 
     mode=get_mode(update.effective_chat.id)
 
@@ -3094,7 +3266,9 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
                 kwargs["reply_markup"] = main_keyboard()
                 chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
                 total_emoji_limit -= 1
-            await update.effective_message.reply_text(chunk, **kwargs)
+            sent = await update.effective_message.reply_text(chunk, **kwargs)
+            if context and is_ephemeral_confirmation(answer):
+                schedule_ephemeral_delete(context, sent)
 
     if eff in ("voice","voice_and_text"):
 
@@ -3176,13 +3350,22 @@ async def end_activity(card, stopped, task):
 async def start(update,context):
     chat_id = update.effective_chat.id
     register_bot_user(chat_id, getattr(update, "effective_user", None))
+    previous_id = active_ui_message_id(chat_id)
+    if previous_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+        set_active_ui_message_id(chat_id, 0)
     # Provisioning happens in the background: /start remains instant even if
     # OpenRouter is temporarily slow.
     if OR_MANAGEMENT_KEY:
         asyncio.create_task(asyncio.to_thread(provision_managed_api_key, chat_id))
     await update.effective_message.reply_text(
-        f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
+        "<b>Привет, я Noema — твой личный ассистент.</b>\n\n"
+        "Напиши или скажи голосом, что нужно: напомнить о деле, сохранить мысль, "
+        "записать расход или найти ответ. Фото и файлы тоже можно присылать сюда.\n\n"
+        "Я помогу держать важное под рукой. Начнём?",
         reply_markup=main_keyboard(), parse_mode="HTML")
+    initialize_briefing(chat_id)
 
 
 async def set_today_emoji(update, context):
@@ -3266,14 +3449,12 @@ async def clear_reply_emojis(update, context):
 
 
 
-async def list_people(update,context):
-
-    d=get_people(update.effective_chat.id)
+def people_page(chat_id):
+    d=get_people(chat_id)
+    lines=["👥 Люди:"]
 
     if not d["people"]:
-        return await update.effective_message.reply_text(live_ui_text("👥 Людей пока нет."), parse_mode="HTML")
-
-    lines=["👥 Люди:"]
+        lines.append("Людей пока нет.")
 
     for p in d["people"][:20]:
 
@@ -3295,7 +3476,13 @@ async def list_people(update,context):
 
         for x in p.get("recent_interactions",[])[:3]: lines.append(f'  ↳ {x["interaction_date"]}: {x["interaction"]}')
 
-    await update.effective_message.reply_text(live_ui_text("\n".join(lines)), parse_mode="HTML")
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="menu:more")]])
+    return "\n".join(lines), live_markup(markup)
+
+
+async def list_people(update,context):
+    text, markup = people_page(update.effective_chat.id)
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3364,13 +3551,14 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="budget:noop"))
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"budget:range:{date_from}:{date_to}:{page+1}"))
         controls.append(nav)
+    controls.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(controls))
 
 
 async def list_expenses(update,context):
     today = datetime.now(timezone_for(update.effective_chat.id)).date()
     text, markup = budget_page(update.effective_chat.id, today.replace(day=1).isoformat(), today.isoformat())
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3384,7 +3572,9 @@ def reminders_page(chat_id, page=0, page_size=6):
         rs = c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",
                        (chat_id,)).fetchall()
     if not rs:
-        return "⏰ Активных напоминаний нет.", InlineKeyboardMarkup([])
+        return "⏰ Активных напоминаний нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")]
+        ]))
     pages = max(1, (len(rs) + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
     rs = rs[page * page_size:(page + 1) * page_size]
@@ -3393,7 +3583,7 @@ def reminders_page(chat_id, page=0, page_size=6):
     for r in rs[:20]:
         dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(chat_tz)
         suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
-        lines.append(f'<code>#{r["id"]}</code> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
+        lines.append(f'⏰ <code>#{r["id"]}</code> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
         buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}:{page}'))
     rows = button_rows(buttons)
     if pages > 1:
@@ -3402,12 +3592,13 @@ def reminders_page(chat_id, page=0, page_size=6):
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="reminders:noop"))
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"reminders:page:{page+1}"))
         rows.append(nav)
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(rows))
 
 
 async def reminders(update,context):
     text, markup = reminders_page(update.effective_chat.id)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3420,7 +3611,10 @@ def tasks_page(chat_id, page=0, page_size=8):
                          ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END, due_date, id DESC
                          LIMIT ? OFFSET ?""", (chat_id, page_size, page * page_size)).fetchall()
     if not rows:
-        return "✅ Задач пока нет.", InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")]])
+        return "✅ Задач пока нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")],
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")],
+        ]))
     lines = [f"✅ Задачи · {page + 1}/{pages}"]
     delete_buttons = []
     for row in rows:
@@ -3436,12 +3630,13 @@ def tasks_page(chat_id, page=0, page_size=8):
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"tasks:page:{page + 1}"))
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")])
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def tasks(update, context, page=0):
     text, markup = tasks_page(update.effective_chat.id, page)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 def notes_page(chat_id, page=0, page_size=6):
@@ -3452,7 +3647,9 @@ def notes_page(chat_id, page=0, page_size=6):
         rows = c.execute("SELECT id,title,text FROM notes WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
                          (chat_id, page_size, page * page_size)).fetchall()
     if not rows:
-        return "📝 Заметок пока нет.", InlineKeyboardMarkup([])
+        return "📝 Заметок пока нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")]
+        ]))
     lines = [f"📝 Заметки · {page + 1}/{pages}"]
     delete_buttons = []
     for row in rows:
@@ -3463,12 +3660,13 @@ def notes_page(chat_id, page=0, page_size=6):
     if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"notes:page:{page-1}"))
     if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"notes:page:{page+1}"))
     if nav: buttons.append(nav)
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def notes(update,context, page=0):
     text, markup = notes_page(update.effective_chat.id, page)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3507,7 +3705,10 @@ def plan_page(chat_id, day, page=0, page_size=12):
             late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
             lines.append(f'{marker} <code>#{task["id"]}</code> · задача — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
-            emoji_id = app_setting(f"task_{'done' if status == 'done' else 'open'}_custom_emoji_id")
+            if status == "done":
+                emoji_id = app_setting("interface_tasks_custom_emoji_id") or emoji_id_for("✅")
+            else:
+                emoji_id = app_setting("task_open_custom_emoji_id") or emoji_id_for("◻️")
             task_toggle_buttons.append(InlineKeyboardButton(
                 f"#{task['id']}" if emoji_id else f"{toggle_icon} #{task['id']}",
                 callback_data=f"tasktoggle:{task['id']}:{day}:{page}", icon_custom_emoji_id=emoji_id or None))
@@ -3520,7 +3721,9 @@ def plan_page(chat_id, day, page=0, page_size=12):
             elif not is_completed and not active_heading_added:
                 lines.append("\n<b>Предстоящие</b>")
                 active_heading_added = True
-            marker = "✅" if reminder["acknowledged"] else "◻️"
+            # Reminders always use the reminder icon. Their completion state is
+            # represented by the section, while tasks keep their own checkmark.
+            marker = "⏰"
             lines.append(f'{marker} {reminder["time"]} — {html.escape(reminder["text"])}')
     if task_toggle_buttons:
         buttons.extend(button_rows(task_toggle_buttons, 4))
@@ -3534,24 +3737,37 @@ def plan_page(chat_id, day, page=0, page_size=12):
         page_nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="plan:noop"))
         if page + 1 < pages: page_nav.append(InlineKeyboardButton("›", callback_data=f"plan:{day}:{page+1}"))
         buttons.append(page_nav)
-    buttons.append([InlineKeyboardButton("‹ Назад", callback_data=f"plan:{previous}:0"),
+    buttons.append([InlineKeyboardButton("‹ День", callback_data=f"plan:{previous}:0"),
                     InlineKeyboardButton("🔎 Дата", callback_data="plan:pick"),
                     InlineKeyboardButton("Вперёд ›", callback_data=f"plan:{following}:0")])
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="ui:close")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def today_plan(update,context, day=None):
     day = day or datetime.now(timezone_for(update.effective_chat.id)).date().isoformat()
     text, markup = plan_page(update.effective_chat.id, day)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
 async def callback(update,context):
 
     raw_query=update.callback_query; await raw_query.answer()
+    if not str(raw_query.data or "").startswith("ackrem:"):
+        await adopt_active_ui(raw_query)
     q=LiveCallbackQuery(raw_query)
     register_bot_user(q.message.chat_id, getattr(update, "effective_user", None))
+
+    if q.data == "ui:close":
+        with contextlib.suppress(Exception):
+            await raw_query.message.delete()
+        set_active_ui_message_id(q.message.chat_id, 0)
+        return
+
+    if q.data == "menu:more":
+        text, markup = more_page()
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
     # Model and key management is a platform setting now. Older inline
     # messages may still contain these buttons, so protect those too.
@@ -3604,7 +3820,7 @@ async def callback(update,context):
         context.user_data["awaiting_vision_model"] = "personal"
         return await q.edit_message_text(
             "Пришлите точный ID Vision-модели OpenRouter, например:\n<code>google/gemini-2.5-flash</code>",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:vision")]]))
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:vision")]]))
 
     if q.data == "vision:shared:add":
         if q.message.chat_id not in ADMIN_CHAT_IDS:
@@ -3612,7 +3828,7 @@ async def callback(update,context):
         context.user_data["awaiting_vision_model"] = "shared"
         return await q.edit_message_text(
             "Пришлите точный ID общей Vision-модели. Она будет использоваться всеми, у кого нет личного ключа.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:vision")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:vision")]]))
 
     if q.data == "vision:personal:reset":
         model_router().set_vision(q.message.chat_id, "")
@@ -3623,12 +3839,17 @@ async def callback(update,context):
     if q.data.startswith("model:set:"):
         model = q.data.split(":", 2)[2]
         if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель недоступна.")
+            return await q.edit_message_text("Модель недоступна.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
+            ]))
         model_router().set_primary(q.message.chat_id, model)
         await q.edit_message_text(
             f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n\nСледующее сообщение сразу будет обработано этой моделью.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Изменить", callback_data="settings:model")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Изменить", callback_data="settings:model")],
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
+            ]),
         )
         return
 
@@ -3637,7 +3858,7 @@ async def callback(update,context):
         await q.edit_message_text(
             "Пришлите точный ID модели OpenRouter, например:\n<code>deepseek/deepseek-v4-flash-0731</code>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:model")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:model")]]),
         )
         return
 
@@ -3651,7 +3872,9 @@ async def callback(update,context):
     if q.data.startswith("model:delete:"):
         model = q.data.split(":", 2)[2]
         if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель уже удалена.")
+            return await q.edit_message_text("Модель уже удалена.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
+            ]))
         set_chat_model(q.message.chat_id, model, enabled=False)
         if model_router().resolve(q.message.chat_id, "chat")["primary"] == model:
             model_router().set_primary(q.message.chat_id, "")
@@ -3670,19 +3893,25 @@ async def callback(update,context):
     if q.data.startswith("mode:set:"):
         mode = q.data.split(":", 2)[2]
         if mode not in ("text", "voice", "voice_and_text"):
-            return await q.edit_message_text("Неизвестный режим.")
+            return await q.edit_message_text("Неизвестный режим.", reply_markup=mode_keyboard(q.message.chat_id))
         set_mode(q.message.chat_id, mode)
         labels = {"text": "💬 Текст", "voice": "🎙 Голос", "voice_and_text": "🔊 Голос + текст"}
         await q.edit_message_text(f"Режим: {labels[mode]}.", reply_markup=mode_keyboard(q.message.chat_id))
         return
 
     if q.data == "menu:reminders":
-        return await reminders(update, context)
+        text, markup = reminders_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:tasks":
-        return await tasks(update, context)
+        text, markup = tasks_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "tasks:add":
         context.user_data["awaiting_task_text"] = True
-        return await q.message.reply_text("Напишите задачу. Можно добавить дату: <code>12.09 — позвонить врачу</code>. Без даты поставлю на сегодня.", parse_mode="HTML")
+        return await q.edit_message_text(
+            "Напишите задачу. Можно добавить дату: <code>12.09 — позвонить врачу</code>. Без даты поставлю на сегодня.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="menu:tasks")]
+            ]))
     if q.data.startswith("tasks:page:"):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = tasks_page(q.message.chat_id, page)
@@ -3691,7 +3920,7 @@ async def callback(update,context):
         _, task_id, page = q.data.split(":")
         return await q.edit_message_text(f"Удалить задачу #{task_id}?", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Удалить", callback_data=f"deltask:{task_id}:{page}"),
-             InlineKeyboardButton("Отмена", callback_data=f"tasks:page:{page}")],
+             InlineKeyboardButton("‹ Назад", callback_data=f"tasks:page:{page}")],
         ]))
     if q.data.startswith("deltask:"):
         _, task_id, page = q.data.split(":")
@@ -3699,7 +3928,9 @@ async def callback(update,context):
         text, markup = tasks_page(q.message.chat_id, int(page))
         return await q.edit_message_text(live_ui_text(text), reply_markup=markup, parse_mode="HTML")
     if q.data in ("menu:expenses", "menu:budget"):
-        return await list_expenses(update, context)
+        today = datetime.now(timezone_for(q.message.chat_id)).date()
+        text, markup = budget_page(q.message.chat_id, today.replace(day=1).isoformat(), today.isoformat())
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("budget:"):
         action = q.data.split(":", 1)[1]
         today = datetime.now(timezone_for(q.message.chat_id)).date()
@@ -3707,7 +3938,11 @@ async def callback(update,context):
             return
         if action == "pick":
             context.user_data["awaiting_budget_range"] = True
-            return await q.message.reply_text("Напишите период: 01.09.2026–07.09.2026. Можно указать и одну дату.")
+            return await q.edit_message_text(
+                "Напишите период: 01.09.2026–07.09.2026. Можно указать и одну дату.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("‹ Назад", callback_data="budget:month")]
+                ]))
         if action == "today":
             date_from = date_to = today.isoformat(); page = 0
         elif action == "yesterday":
@@ -3731,14 +3966,21 @@ async def callback(update,context):
                 return
             raise
     if q.data == "menu:briefing":
-        return await q.edit_message_text(live_ui_text(build_briefing(q.message.chat_id)), parse_mode="HTML")
+        return await q.edit_message_text(
+            live_ui_text(build_briefing(q.message.chat_id)), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="menu:more")]]))
     if q.data.startswith("plan:"):
         value = q.data.split(":", 1)[1]
         if value == "noop":
             return
         if value == "pick":
             context.user_data["awaiting_plan_date"] = True
-            return await q.message.reply_text("Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.")
+            today = datetime.now(timezone_for(q.message.chat_id)).date().isoformat()
+            return await q.edit_message_text(
+                "Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("‹ Назад", callback_data=f"plan:{today}:0")]
+                ]))
         try:
             day, page = value.split(":") if ":" in value else (value, "0")
             text, markup = plan_page(q.message.chat_id, day, int(page))
@@ -3776,9 +4018,11 @@ async def callback(update,context):
         text, markup = plan_page(q.message.chat_id, day, int(page))
         return await q.edit_message_text(live_ui_text(text), reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:people":
-        return await list_people(update, context)
+        text, markup = people_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:notes":
-        return await notes(update, context)
+        text, markup = notes_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("notes:page:"):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = notes_page(q.message.chat_id, page)
@@ -3788,7 +4032,7 @@ async def callback(update,context):
         return await q.edit_message_text(
             f"Удалить заметку #{note_id}? Это действие нельзя отменить.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delnote:{note_id}:{page}"),
-                                                InlineKeyboardButton("Отмена", callback_data=f"notes:page:{page}")]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f"notes:page:{page}")]]))
     if q.data.startswith("delnote:"):
         _, note_id, page = q.data.split(":")
         delete_note(q.message.chat_id, int(note_id))
@@ -3800,13 +4044,15 @@ async def callback(update,context):
     if q.data.startswith("rule:edit:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
         if not any(rule["id"] == rule_id for rule in behavior_rules_for(q.message.chat_id)):
-            return await q.edit_message_text("Правило не найдено.")
+            return await q.edit_message_text("Правило не найдено.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:rules")]
+            ]))
         context.user_data["awaiting_rule_edit"] = rule_id
-        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:rules")]]))
+        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:rules")]]))
     if q.data.startswith("rule:deleteask:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
         return await q.edit_message_text(f"Удалить правило <code>#{rule_id}</code>?", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("‹ Назад", callback_data="settings:rules")],
         ]))
     if q.data.startswith("rule:delete:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
@@ -3815,7 +4061,7 @@ async def callback(update,context):
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "rule:deleteallask":
         return await q.edit_message_text("Удалить все правила? Напоминания и другие данные не затрону.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("‹ Назад", callback_data="settings:rules")],
         ]))
     if q.data == "rule:deleteall":
         delete_behavior_rule(q.message.chat_id, all=True)
@@ -3850,7 +4096,9 @@ async def callback(update,context):
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
         if not secret:
-            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         token = quick_action_token(device_id, "action", secret)
         text = (
             "⚡ <b>Быстрая команда</b>\n\n"
@@ -3867,7 +4115,9 @@ async def callback(update,context):
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
         if not secret:
-            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         text = (
             "📤 <b>Поделиться в Noema</b>\n\n"
             "Эта команда появляется в системном меню «Поделиться». Через неё можно отправить в Noema фото, скриншот, PDF, файл, ссылку или выделенный текст. Материал попадёт в тот же чат и обработается как обычное вложение Telegram.\n\n"
@@ -3881,7 +4131,9 @@ async def callback(update,context):
         device_id = q.data.split(":", 2)[2]
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         if not device:
-            return await q.edit_message_text("Устройство не найдено или отключено.")
+            return await q.edit_message_text("Устройство не найдено или отключено.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         text = (
             '<b>iPhone и Noema</b>\n\n'
             '1. Подключите одну голосовую команду к кнопке iPhone или Back Tap.\n'
@@ -3908,19 +4160,23 @@ async def callback(update,context):
     if q.data.startswith("iphone:set:"):
         _, _, device_id, trigger, action = q.data.split(":")
         if not set_quick_action_binding(q.message.chat_id, device_id, trigger, action):
-            return await q.edit_message_text("Не удалось изменить действие.")
+            return await q.edit_message_text("Не удалось изменить действие.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:device:{device_id}")]
+            ]))
         text, markup = iphone_device_page(q.message.chat_id, device_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("iphone:rotateask:"):
         device_id = q.data.split(":", 2)[2]
         return await q.edit_message_text("Выпустить новый ключ? Старые команды Shortcut сразу перестанут работать.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Выпустить", callback_data=f"iphone:rotate:{device_id}")],
-                                                [InlineKeyboardButton("Отмена", callback_data=f"iphone:shortcut:{device_id}")]]))
+                                                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:shortcut:{device_id}")]]))
     if q.data.startswith("iphone:rotate:"):
         device_id = q.data.split(":", 2)[2]
         secret = rotate_quick_action_secret(q.message.chat_id, device_id)
         if not secret:
-            return await q.edit_message_text("Не удалось выпустить ключ. Проверьте USER_SECRETS_MASTER_KEY.")
+            return await q.edit_message_text("Не удалось выпустить ключ. Проверьте USER_SECRETS_MASTER_KEY.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:shortcut:{device_id}")]
+            ]))
         return await q.edit_message_text("🔑 <b>Новый ключ выпущен</b>\nСтарые быстрые команды сразу отключены. Откройте нужную команду ниже и вставьте новый ключ в Shortcut.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 Открыть подключение", callback_data=f"iphone:shortcut:{device_id}")],
                                                                     [InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]]))
@@ -3928,7 +4184,7 @@ async def callback(update,context):
         device_id = q.data.split(":", 2)[2]
         return await q.edit_message_text("Отключить iPhone? Команды с этого устройства сразу перестанут работать.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Отключить", callback_data=f'iphone:revoke:{device_id}'),
-                                                InlineKeyboardButton("Отмена", callback_data=f'iphone:device:{device_id}')]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f'iphone:device:{device_id}')]]))
     if q.data.startswith("iphone:revoke:"):
         device_id = q.data.split(":", 2)[2]
         revoke_quick_action_device(q.message.chat_id, device_id)
@@ -3939,9 +4195,15 @@ async def callback(update,context):
         with conn() as c:
             c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
                       (reminder_id, q.message.chat_id))
-        return await q.edit_message_text("✅ Отмечено как выполненное.")
+        sent = await raw_query.edit_message_text(
+            live_ui_text("⏰ Напоминание выполнено."),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
+        schedule_ephemeral_delete(context, raw_query.message)
+        return sent
     if q.data == "settings:status":
-        return await q.edit_message_text(status_text(q.message.chat_id), parse_mode="HTML")
+        return await q.edit_message_text(
+            status_text(q.message.chat_id), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:back")]]))
     if q.data == "settings:keys":
         text, markup = api_keys_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -3971,7 +4233,7 @@ async def callback(update,context):
         context.user_data["awaiting_interface_emoji"] = slot
         return await q.edit_message_text(
             f"Выбрано: <b>{html.escape(EMOJI_SLOT_NAMES[slot])}</b>.\n\nТеперь просто отправь один живой эмодзи из Premium-панели.",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="emoji:slots")]]))
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="emoji:slots")]]))
     if q.data.startswith("emoji:page:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
@@ -3983,7 +4245,7 @@ async def callback(update,context):
     if q.data == "emoji:clearask":
         return await q.edit_message_text("Очистить всю палитру живых эмодзи для ответов?", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Очистить", callback_data="emoji:clear")],
-            [InlineKeyboardButton("Отмена", callback_data="settings:emoji")],
+            [InlineKeyboardButton("‹ Назад", callback_data="settings:emoji")],
         ]))
     if q.data == "emoji:clear":
         set_app_setting("reply_custom_emoji_palette", "[]")
@@ -3994,7 +4256,7 @@ async def callback(update,context):
             return await q.answer("Сначала нужен USER_SECRETS_MASTER_KEY на сервере.", show_alert=True)
         context.user_data["awaiting_personal_api_key"] = True
         return await q.edit_message_text("🔐 Пришлите личный ключ OpenRouter одним сообщением. После сохранения я удалю это сообщение из чата.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:keys")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:keys")]]))
     if q.data == "keys:remove":
         remove_user_api_key(q.message.chat_id)
         text, markup = api_keys_page(q.message.chat_id)
@@ -4033,7 +4295,9 @@ async def callback(update,context):
         with conn() as c:
             user = c.execute("SELECT user_number,chat_id,username,display_name FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
         if not user:
-            return await q.edit_message_text("Пользователь не найден.")
+            return await q.edit_message_text("Пользователь не найден.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="keys:admin_usage")]
+            ]))
         user = dict(user)
         rows = [row for row in usage_summary(user["chat_id"])
                 if row.get("source") in {"shared", "managed"}]
@@ -4045,14 +4309,16 @@ async def callback(update,context):
         ]))
     if q.data == "settings:clear":
         clear_history(q.message.chat_id)
-        return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
+        return await q.edit_message_text(
+            "Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:back")]]))
 
     if q.data.startswith("delremask:"):
         _, rid, page = q.data.split(":")
         return await q.edit_message_text(
             f"Удалить напоминание #{rid}? Это действие нельзя отменить.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delrem:{rid}:{page}"),
-                                                InlineKeyboardButton("Отмена", callback_data=f"reminders:page:{page}")]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f"reminders:page:{page}")]]))
     if q.data == "reminders:noop":
         return
     if q.data.startswith("reminders:page:"):
@@ -4068,6 +4334,22 @@ async def callback(update,context):
             c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
         text, markup = reminders_page(q.message.chat_id, int(page))
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+def more_page():
+    markup = InlineKeyboardMarkup([
+        [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"),
+         interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
+        [interface_inline_button("people", "👥", "Люди", "menu:people"),
+         interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
+        [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
+        [InlineKeyboardButton("‹ Назад", callback_data="ui:close")],
+    ])
+    if QUICK_ACTIONS_BASE_URL:
+        rows = list(markup.inline_keyboard)
+        rows.insert(0, [InlineKeyboardButton("Открыть Noema", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app"))])
+        markup = InlineKeyboardMarkup(rows)
+    return "✨ Дополнительно:", live_markup(markup)
 
 
 def settings_keyboard(chat_id=None):
@@ -4087,6 +4369,7 @@ def settings_keyboard(chat_id=None):
         ]
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="ui:close")])
     return live_markup(InlineKeyboardMarkup(rows))
 
 
@@ -4270,11 +4553,13 @@ def shared_usage_users_page(page=0, page_size=8):
 def mode_keyboard(chat_id):
     current = get_mode(chat_id)
     choices = [("text", "💬 Текст"), ("voice", "🎙 Голос"), ("voice_and_text", "🔊 Голос + текст")]
-    return live_markup(InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(("● " if current == value else "○ ") + label,
                               callback_data=f"mode:set:{value}")]
         for value, label in choices
-    ]))
+    ]
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="settings:back")])
+    return live_markup(InlineKeyboardMarkup(rows))
 
 
 def status_text(chat_id):
@@ -4289,7 +4574,7 @@ def status_text(chat_id):
 
 
 
-def set_briefing(chat_id,enabled,time_="08:00",city="",topics=""):
+def set_briefing(chat_id,enabled,time_="08:30",city="",topics=""):
 
     with conn() as c:
 
@@ -4297,7 +4582,7 @@ def set_briefing(chat_id,enabled,time_="08:00",city="",topics=""):
 
         use_city=city or (old["city"] if old else "") or DEFAULT_CITY
 
-        use_topics=topics or (old["topics"] if old else "") or "главные новости, ИИ, бизнес"
+        use_topics=topics or (old["topics"] if old else "") or "главные новости мира"
 
         c.execute("""INSERT INTO briefings(chat_id,enabled,time,city,topics,last_sent_date)
 
@@ -4313,7 +4598,7 @@ def set_briefing_preferences(chat_id, city="", topics="", time="", enabled=None)
     with conn() as c:
         old = c.execute("SELECT * FROM briefings WHERE chat_id=?", (chat_id,)).fetchone()
     old = dict(old) if old else {}
-    use_time = time or old.get("time") or "08:00"
+    use_time = time or old.get("time") or "08:30"
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", use_time):
         return {"ok": False, "tool": "set_briefing_preferences", "error": "time_format"}
     result = set_briefing(chat_id, old.get("enabled", False) if enabled is None else bool(enabled),
@@ -4436,15 +4721,20 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text("Нужен именно живой эмодзи из Premium-панели. Попробуй ещё раз.")
         key = f"task_{emoji_slot}_custom_emoji_id" if emoji_slot in {"open", "done", "failed"} else f"interface_{emoji_slot}_custom_emoji_id"
         set_app_setting(key, entity.custom_emoji_id)
-        return await update.effective_message.reply_text(
-            f"Готово — кнопка «{EMOJI_SLOT_NAMES[emoji_slot]}» обновлена.", reply_markup=main_keyboard())
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = emoji_palette_page()
+        return await refresh_active_ui(update, context, text, markup)
 
     rule_id = context.user_data.pop("awaiting_rule_edit", None)
     if rule_id is not None:
         result = update_behavior_rule(cid, int(rule_id), t)
         if not result.get("ok"):
             return await update.effective_message.reply_text("Не удалось обновить правило.")
-        return await update.effective_message.reply_text(f'📜 Правило <code>#{rule_id}</code> обновлено.', parse_mode="HTML")
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = rules_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_task_text", False):
         raw = t.strip()
@@ -4462,8 +4752,11 @@ async def text_handler(update,context):
                 return await update.effective_message.reply_text("Не поняла дату. Пример: <code>12.09 — позвонить врачу</code>.", parse_mode="HTML")
         if not raw:
             return await update.effective_message.reply_text("Напишите текст задачи.")
-        result = add_task(cid, raw, due_date)
-        return await update.effective_message.reply_text(f"✅ Задача <code>#{result['id']}</code> добавлена на {due_date[8:10]}.{due_date[5:7]}.", parse_mode="HTML")
+        add_task(cid, raw, due_date)
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = tasks_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_personal_api_key", False):
         if not t.startswith("sk-or-") or len(t) < 24:
@@ -4473,7 +4766,8 @@ async def text_handler(update,context):
             await update.effective_message.delete()
         if not ok:
             return await update.effective_message.reply_text("Не удалось включить личный ключ: администратор не настроил master key.")
-        return await update.effective_message.reply_text(f"🔐 Личный ключ {result} сохранён и теперь имеет приоритет.", reply_markup=settings_keyboard(cid))
+        text, markup = api_keys_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     vision_scope = context.user_data.pop("awaiting_vision_model", "")
     if vision_scope:
@@ -4504,7 +4798,9 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text("Не поняла дату. Пример: 01.09.2026–07.09.2026.")
         date_from = min(parsed).isoformat(); date_to = max(parsed).isoformat()
         text, markup = budget_page(cid, date_from, date_to)
-        return await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_plan_date", False):
         parsed = None
@@ -4516,7 +4812,10 @@ async def text_handler(update,context):
                 pass
         if not parsed:
             return await update.effective_message.reply_text("Не поняла дату. Пример: 15.09.2026.")
-        return await today_plan(update, context, parsed.isoformat())
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = plan_page(cid, parsed.isoformat())
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_model", False):
         model = t.strip()
@@ -4530,16 +4829,12 @@ async def text_handler(update,context):
 
     if t in ("⚙️ Настройки", "Настройки"):
         await consume_menu_tap()
-        return await update.effective_message.reply_text(live_ui_text("⚙️ Настройки"), reply_markup=settings_keyboard(cid), parse_mode="HTML")
+        return await replace_active_ui(update, context, "⚙️ Настройки", settings_keyboard(cid))
 
     if t in ("☰ Ещё", "Ещё"):
         await consume_menu_tap()
-        return await update.effective_message.reply_text(
-            live_ui_text("✨ Дополнительно:"), parse_mode="HTML", reply_markup=live_markup(InlineKeyboardMarkup([
-                [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"), interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
-                [interface_inline_button("people", "👥", "Люди", "menu:people"), interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
-                [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
-            ])))
+        text, markup = more_page()
+        return await replace_active_ui(update, context, text, markup)
 
     if t=="📚 Знания":
         return await update.effective_message.reply_text("📚 Знания\nНапишите, что найти: проект, человека, ресурс или тему. Например: «где Узел задеплоен?»")
@@ -4598,7 +4893,7 @@ async def text_handler(update,context):
 
         m=re.search(r"(\d{1,2}):(\d{2})",t)
 
-        time_=f"{int(m.group(1)):02d}:{m.group(2)}" if m else "08:00"
+        time_=f"{int(m.group(1)):02d}:{m.group(2)}" if m else "08:30"
 
         city=DEFAULT_CITY
 
@@ -4653,7 +4948,8 @@ async def text_handler(update,context):
 
     activity = await begin_activity(update.effective_message, activity_labels(t))
     try:
-        a=await asyncio.to_thread(ask,cid,t); await send_answer(update,a,False,wants_voice(t))
+        a=await asyncio.to_thread(ask,cid,t)
+        await send_answer(update, a, context=context, voice_in=False, force_voice=wants_voice(t))
         await drain_media_outbox(update, context)
     except Exception as e:
         await safe_error(update,e)
@@ -4672,9 +4968,8 @@ async def voice_handler(update,context):
     try:
         f=await context.bot.get_file(update.effective_message.voice.file_id); await f.download_to_drive(custom_path=str(p))
         txt=await asyncio.to_thread(transcribe, update.effective_chat.id, p)
-        transcript = "🎤 " + html.escape(txt)
-        await update.effective_message.reply_text(live_ui_text(transcript), parse_mode="HTML")
-        a=await asyncio.to_thread(ask,update.effective_chat.id,txt); await send_answer(update,a,True,wants_voice(txt))
+        a=await asyncio.to_thread(ask,update.effective_chat.id,txt)
+        await send_answer(update, a, context=context, voice_in=True, force_voice=wants_voice(txt))
         await drain_media_outbox(update, context)
     except Exception as e:
         await safe_error(update,e)
@@ -4821,7 +5116,9 @@ async def reminder_tick(context):
         prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
         sent_message = await context.bot.send_message(
             chat_id=row["chat_id"], text=live_ui_text(prefix + row["text"]), parse_mode="HTML",
-            reply_markup=live_markup(InlineKeyboardMarkup([[InlineKeyboardButton("✅ Выполнено", callback_data=f"ackrem:{row['id']}")]])),
+            reply_markup=live_markup(InlineKeyboardMarkup([[
+                interface_inline_button("reminders", "⏰", "Выполнено", f"ackrem:{row['id']}")
+            ]])),
         )
         next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
         with conn() as c:
@@ -4841,6 +5138,20 @@ async def reminder_tick(context):
 
 
 
+def initialize_briefing(chat_id):
+    """Persist first-run scheduling so restarts and repeated /start are harmless."""
+    key = f"briefing_welcome:{chat_id}"
+    if app_setting(key):
+        return
+    with conn() as c:
+        existing = c.execute("SELECT 1 FROM briefings WHERE chat_id=?", (chat_id,)).fetchone()
+    if existing:
+        set_app_setting(key, "done")
+        return
+    set_briefing(chat_id, True)
+    set_app_setting(key, str(int(time.time()) + 150))
+
+
 async def briefing_tick(context):
     with conn() as c: rows=c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()
 
@@ -4849,17 +5160,30 @@ async def briefing_tick(context):
         cfg=dict(row)
         now = datetime.now(timezone_for(cfg["chat_id"])); today = now.date().isoformat()
 
-        if cfg.get("last_sent_date")==today: continue
+        welcome_key = f'briefing_welcome:{cfg["chat_id"]}'
+        welcome = app_setting(welcome_key)
+        first = welcome.isdigit()
+        if first and time.time() < int(welcome):
+            continue
 
-        if now.strftime("%H:%M") < (cfg.get("time") or "08:00"): continue
+        if not first and cfg.get("last_sent_date")==today: continue
+
+        if not first and now.strftime("%H:%M") < (cfg.get("time") or "08:30"): continue
 
         try:
 
             text=await asyncio.to_thread(build_briefing,cfg["chat_id"])
+            if first:
+                text += ("\n\nЭто твой первый брифинг. Если что-то не подходит, смело поменяем: "
+                         "скажи, какие темы тебе интересны и во сколько присылать. "
+                         f"Пока буду приходить в {cfg.get('time') or '08:30'} по твоему часовому поясу. "
+                         "Рассылку можно отключить в любой момент.")
 
             await context.bot.send_message(chat_id=cfg["chat_id"], text=live_ui_text(text), parse_mode="HTML")
 
             with conn() as c: c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?",(today,cfg["chat_id"]))
+            if first:
+                set_app_setting(welcome_key, "done")
 
         except Exception: pass
 
@@ -4924,8 +5248,11 @@ def ingest_from_iphone(chat_id, text="", attachment=None):
 
 async def send_quick_action_feedback(request, chat_id, ok, message):
     try:
-        await request.app["telegram_app"].bot.send_message(
+        telegram_app = request.app["telegram_app"]
+        sent = await telegram_app.bot.send_message(
             chat_id=chat_id, text=live_ui_text(message), parse_mode="HTML")
+        if is_ephemeral_confirmation(message):
+            schedule_ephemeral_delete(telegram_app, sent)
     except Exception:
         return web.json_response({"ok": False, "error": "telegram_delivery_failed"}, status=502)
     return web.json_response({"ok": ok, "message": message})
@@ -5079,6 +5406,9 @@ async def telegram_error_handler(update, context):
 async def start_quick_actions_server(telegram_app):
     server = web.Application(client_max_size=MAX_FILE_MB * 1024 * 1024)
     server["telegram_app"] = telegram_app
+    import sys
+    from miniapp_api import register_miniapp
+    register_miniapp(server, sys.modules[__name__])
     server.router.add_get("/healthz", health_check)
     server.router.add_get("/timezone", timezone_page)
     server.router.add_post("/api/v1/timezone", save_webapp_timezone)
@@ -5141,7 +5471,7 @@ async def main_async():
 
     app.job_queue.run_repeating(reminder_tick,interval=5,first=2)
 
-    app.job_queue.run_repeating(briefing_tick,interval=60,first=10)
+    app.job_queue.run_repeating(briefing_tick,interval=30,first=10)
 
     await app.initialize()
     await app.start()
