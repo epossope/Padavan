@@ -132,6 +132,12 @@ def register_miniapp(app, core):
             clean[name] = value
         return clean
 
+    async def register_signed_user(user):
+        """Register a verified Mini App profile without blocking request UI."""
+        register = getattr(core, "register_bot_user", None)
+        if callable(register):
+            await asyncio.to_thread(register, user["id"], user)
+
     def widgets_for(cid):
         try:
             value = json.loads(core.app_setting(f"miniapp_home_widgets:{cid}", "null"))
@@ -178,6 +184,10 @@ def register_miniapp(app, core):
             if not user or not isinstance(user.get("id"), int):
                 raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
             cid = user["id"]
+            # A Mini App can be a person's first Noema interaction. Register
+            # the signed Telegram profile before any state/LLM work so admin
+            # accounting never depends on a separate API-key row.
+            await register_signed_user(user)
             action = payload.get("action", "state")
             args = payload.get("args", {})
             if not isinstance(args, dict):
@@ -350,6 +360,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(form.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         upload = form.get("audio")
         if not getattr(upload, "file", None):
             raise web.HTTPBadRequest()
@@ -378,6 +389,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(form.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         upload = form.get("audio")
         if not getattr(upload, "file", None):
             raise web.HTTPBadRequest()
@@ -406,6 +418,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 2000:
             raise web.HTTPBadRequest(text="Некорректный текст")
@@ -431,6 +444,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        await register_signed_user(user)
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 12000:
             raise web.HTTPBadRequest(text="Некорректное сообщение")
@@ -516,6 +530,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        await register_signed_user(user)
         if user["id"] not in getattr(core, "ADMIN_CHAT_IDS", set()):
             raise web.HTTPForbidden(text="Недостаточно прав")
         try:

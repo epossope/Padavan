@@ -14,7 +14,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.core = SimpleNamespace(
             valid_webapp_user=lambda value: {"id": 42} if value == "signed" else None,
-            set_mode=Mock(), set_app_setting=Mock(), LOGGER=Mock(),
+            set_mode=Mock(), set_app_setting=Mock(), register_bot_user=Mock(), LOGGER=Mock(),
             TELEMETRY_ENABLED=True, ADMIN_CHAT_IDS={42},
             set_admin_runtime_config=Mock(return_value={"fields": {}}),
             reset_admin_runtime_config=Mock(return_value={"fields": {}}),
@@ -54,6 +54,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "mode", "args": {"mode": "text"}})
         self.assertEqual(response.status, 200)
         self.assertRegex(response.headers.get("Server-Timing", ""), r"ui_action;dur=\d")
+        self.core.register_bot_user.assert_called_once_with(42, {"id": 42})
         self.core.set_mode.assert_called_once_with(42, 'text')
 
     async def test_invalid_mode_rejected(self):

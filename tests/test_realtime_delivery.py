@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -10,6 +11,42 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_new_canonical_user_is_visible_before_and_after_usage(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript("""
+            CREATE TABLE bot_users(user_number INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER UNIQUE,username TEXT NOT NULL DEFAULT '',display_name TEXT NOT NULL DEFAULT '',first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL);
+            CREATE TABLE usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,cost REAL NOT NULL DEFAULT 0,provider TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
+            CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '');
+            CREATE TABLE user_api_keys(chat_id INTEGER PRIMARY KEY,encrypted_key TEXT NOT NULL,key_hint TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL);
+            CREATE TABLE managed_api_keys(chat_id INTEGER PRIMARY KEY,encrypted_key TEXT NOT NULL,key_hash TEXT NOT NULL DEFAULT '',key_hint TEXT NOT NULL DEFAULT '',limit_usd REAL NOT NULL DEFAULT 2,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE app_settings(setting_key TEXT PRIMARY KEY,setting_value TEXT NOT NULL,updated_at TEXT NOT NULL,updated_by INTEGER);
+        """)
+        config = {"fast_model": "qwen/test", "fast_model_providers": [], "fast_model_allow_provider_fallback": False,
+                  "strong_model": "deepseek/test", "strong_model_providers": [], "strong_model_allow_provider_fallback": True}
+        with patch.object(bot, "conn", return_value=database), patch.object(bot, "runtime_config_values", return_value=config):
+            bot.register_bot_user(6999, SimpleNamespace(username="existing", first_name="Старый", last_name="Пользователь"))
+            bot.record_usage(6999, "shared", "qwen/test", {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.001}})
+            bot.register_bot_user(7001, SimpleNamespace(username="new_user", first_name="Новый", last_name="Пользователь"))
+            before = bot.admin_usage_users()
+            fresh = next(row for row in before if row["chat_id"] == 7001)
+            self.assertEqual(fresh["requests"], 0)
+            self.assertEqual(fresh["cost"], 0)
+            self.assertEqual(fresh["effective_model"], "qwen/test")
+            self.assertEqual(next(row for row in before if row["chat_id"] == 6999)["requests"], 1)
+
+            bot.record_usage(7001, "shared", "qwen/test", {"usage": {"prompt_tokens": 12, "completion_tokens": 8, "cost": 0.004}})
+            bot.record_usage(7001, "managed", "deepseek/test", {"usage": {"prompt_tokens": 5, "completion_tokens": 3, "cost": 0.002}})
+            after = bot.admin_usage_users()
+            accounted = next(row for row in after if row["chat_id"] == 7001)
+            self.assertEqual((accounted["input_tokens"], accounted["output_tokens"], accounted["requests"]), (17, 11, 2))
+            self.assertAlmostEqual(accounted["cost"], 0.006)
+            self.assertEqual(next(row for row in after if row["chat_id"] == 6999)["requests"], 1)
+            rows = bot.admin_user_usage_rows(7001)
+            self.assertEqual({row["provider"] for row in rows}, {"openrouter"})
+            self.assertEqual({row["source"] for row in rows}, {"shared", "managed"})
+        database.close()
+
     def test_admin_runtime_config_has_admin_precedence_and_safe_metadata(self):
         defaults = {"fast_model": ("env/model", "ENV")}
         with patch.object(bot, "_runtime_env_defaults", return_value=defaults), \

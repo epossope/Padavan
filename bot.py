@@ -1537,6 +1537,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
             source TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0,
+            provider TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -1571,7 +1572,8 @@ def init_db():
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
             ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
-            ("app_settings","updated_by","INTEGER")
+            ("app_settings","updated_by","INTEGER"),
+            ("usage_events","provider","TEXT NOT NULL DEFAULT ''")
 
         ]:
 
@@ -2105,27 +2107,60 @@ def vision_models_for(chat_id):
     return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
 
 
+def usage_provider(payload, model):
+    """Persist a safe provider label when OpenRouter returned one.
+
+    A provider route is not necessarily the provider that ultimately served a
+    fallback request, so we only store a configured provider when it is the
+    single allowed choice. Otherwise ``openrouter`` is the truthful label.
+    """
+    payload = payload or {}
+    details = payload.get("usage") or {}
+    for candidate in (payload.get("provider"), payload.get("provider_name"),
+                      payload.get("model_provider"), details.get("provider"),
+                      details.get("provider_name")):
+        if isinstance(candidate, dict):
+            candidate = candidate.get("name") or candidate.get("id")
+        value = str(candidate or "").strip()
+        if value:
+            return re.sub(r"[^A-Za-z0-9._:/+\-]", "", value)[:120] or "openrouter"
+    route = provider_preferences_for(model)
+    choices = list((route or {}).get("only") or [])
+    return choices[0] if len(choices) == 1 else "openrouter"
+
+
 def record_usage(chat_id, source, model, payload):
+    """Record billing on the canonical Telegram user for every key source."""
     usage = (payload or {}).get("usage") or {}
     input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     cost = float(usage.get("cost") or usage.get("total_cost") or 0)
+    # A request can arrive through Mini App or a legacy endpoint before a
+    # Telegram update handler had a chance to register its profile. Keep that
+    # event attached to a canonical user row instead of creating an orphan.
+    register_bot_user(chat_id, None)
     with conn() as c:
-        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,created_at) VALUES(?,?,?,?,?,?,?)",
-                  (chat_id, source, model, input_tokens, output_tokens, cost, datetime.now(timezone.utc).isoformat()))
+        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,provider,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  (chat_id, source, model, input_tokens, output_tokens, cost,
+                   usage_provider(payload, model), datetime.now(timezone.utc).isoformat()))
 
 
 def register_bot_user(chat_id, user):
     """Assign a stable, non-sensitive sequential number to every chat user."""
-    if not chat_id or not user:
+    if not chat_id:
         return None
-    username = (getattr(user, "username", "") or "").strip().lstrip("@")[:64]
+    def field(name):
+        return user.get(name, "") if isinstance(user, dict) else getattr(user, name, "")
+    username = (field("username") or "").strip().lstrip("@")[:64]
     display_name = " ".join(part for part in (
-        getattr(user, "first_name", "") or "", getattr(user, "last_name", "") or "") if part).strip()[:120]
+        field("first_name") or "", field("last_name") or "") if part).strip()[:120]
     now = datetime.now(timezone.utc).isoformat()
     with conn() as c:
         c.execute("INSERT INTO bot_users(chat_id,username,display_name,first_seen_at,last_seen_at) VALUES(?,?,?,?,?) "
-                  "ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,last_seen_at=excluded.last_seen_at",
+                  "ON CONFLICT(chat_id) DO UPDATE SET "
+                  "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE bot_users.username END,"
+                  "display_name=CASE WHEN excluded.display_name<>'' THEN excluded.display_name ELSE bot_users.display_name END,"
+                  "last_seen_at=excluded.last_seen_at",
                   (chat_id, username, display_name, now, now))
         row = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
     return row["user_number"] if row else None
@@ -2139,7 +2174,7 @@ def usage_summary(chat_id=None, days=30, source=None):
     if source:
         where += " AND source=?"; args.append(source)
     with conn() as c:
-        rows = c.execute(f"SELECT chat_id,source,model,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model ORDER BY cost DESC,requests DESC", args).fetchall()
+        rows = c.execute(f"SELECT chat_id,source,model,provider,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model,provider ORDER BY cost DESC,requests DESC", args).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -2167,6 +2202,64 @@ def shared_usage_users(days=30):
             GROUP BY e.chat_id
             ORDER BY cost DESC, requests DESC, e.chat_id
         """, (since,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_usage_users():
+    """Canonical admin list: every registered Noema user, including zero use.
+
+    ``bot_users`` is intentionally the driving table. API-key tables and
+    usage tables are optional attributes of a person, never membership gates.
+    """
+    month_start = datetime.now(TZ).date().replace(day=1).isoformat()
+    config = runtime_config_values()
+    with conn() as c:
+        # Repair historical orphan events once, including personal-key usage.
+        missing = c.execute("""SELECT DISTINCT e.chat_id FROM usage_events e
+                             LEFT JOIN bot_users u ON u.chat_id=e.chat_id
+                             WHERE u.chat_id IS NULL""").fetchall()
+        now = datetime.now(timezone.utc).isoformat()
+        for row in missing:
+            c.execute("INSERT OR IGNORE INTO bot_users(chat_id,username,display_name,first_seen_at,last_seen_at) VALUES(?,?,?,?,?)",
+                      (row["chat_id"], "", "", now, now))
+        rows = c.execute("""
+            SELECT u.user_number,u.chat_id,u.username,u.display_name,u.first_seen_at,u.last_seen_at,
+                   COALESCE(NULLIF(s.primary_model,''), ?) AS effective_model,
+                   CASE WHEN p.chat_id IS NULL THEN 0 ELSE 1 END AS has_personal_key,
+                   CASE WHEN m.chat_id IS NULL THEN 0 ELSE 1 END AS has_managed_key,
+                   COALESCE(m.limit_usd, 0) AS monthly_limit_usd,
+                   COUNT(e.id) AS requests,
+                   COALESCE(SUM(e.input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(e.output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(e.cost),0) AS cost,
+                   (SELECT MAX(last_event.created_at) FROM usage_events last_event
+                    WHERE last_event.chat_id=u.chat_id) AS last_llm_activity
+            FROM bot_users u
+            LEFT JOIN user_settings s ON s.chat_id=u.chat_id
+            LEFT JOIN user_api_keys p ON p.chat_id=u.chat_id AND p.active=1
+            LEFT JOIN managed_api_keys m ON m.chat_id=u.chat_id AND m.active=1
+            LEFT JOIN usage_events e ON e.chat_id=u.chat_id AND substr(e.created_at,1,10)>=?
+            GROUP BY u.chat_id
+            ORDER BY CASE WHEN MAX(e.created_at) IS NULL THEN 1 ELSE 0 END,
+                     MAX(e.created_at) DESC,last_llm_activity DESC,u.user_number DESC
+        """, (config["fast_model"], month_start)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_user_usage_rows(chat_id):
+    """Calendar-month model/provider breakdown for one canonical user."""
+    month_start = datetime.now(TZ).date().replace(day=1).isoformat()
+    with conn() as c:
+        rows = c.execute("""
+            SELECT source,model,provider,COUNT(*) AS requests,
+                   COALESCE(SUM(input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(cost),0) AS cost,MAX(created_at) AS last_activity
+            FROM usage_events
+            WHERE chat_id=? AND substr(created_at,1,10)>=?
+            GROUP BY source,model,provider
+            ORDER BY cost DESC,requests DESC,model
+        """, (chat_id, month_start)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -5039,15 +5132,26 @@ async def callback(update,context):
             return await q.answer("Нет доступа.", show_alert=True)
         _, _, user_number, page = q.data.split(":")
         with conn() as c:
-            user = c.execute("SELECT user_number,chat_id,username,display_name FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
+            user = c.execute("SELECT user_number,chat_id,username,display_name,first_seen_at,last_seen_at FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
         if not user:
             return await q.edit_message_text("Пользователь не найден.", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("‹ Назад", callback_data="keys:admin_usage")]
             ]))
         user = dict(user)
-        rows = [row for row in usage_summary(user["chat_id"])
-                if row.get("source") in {"shared", "managed"}]
-        text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        summary = next((item for item in admin_usage_users() if item["chat_id"] == user["chat_id"]), None)
+        rows = admin_user_usage_rows(user["chat_id"])
+        text = usage_text(rows, f'📊 <b>Пользователь Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        if summary:
+            source = "user key" if summary["has_personal_key"] else "нет"
+            managed = "да" if summary["has_managed_key"] else "нет"
+            limit = f"${float(summary['monthly_limit_usd']):.2f}/мес." if summary["has_managed_key"] else "общий ключ · без отдельного лимита"
+            last = str(summary.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
+            text += ("\n\n<b>Профиль и учёт</b>\n"
+                     f"Telegram ID: <code>{int(user['chat_id'])}</code>\n"
+                     f"Personal API key: {source} · managed key: {managed}\n"
+                     f"Effective model: <code>{html.escape(str(summary['effective_model']))}</code>\n"
+                     f"Лимит: {limit}\n"
+                     f"Последняя LLM-активность: {html.escape(last)}")
         text += managed_key_lifecycle_text(user["chat_id"])
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
@@ -5206,8 +5310,10 @@ def api_keys_page(chat_id):
         return "Ключи и модели настроены Noema.", InlineKeyboardMarkup([[InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]])
     with conn() as c:
         count = c.execute("SELECT COUNT(*) AS total FROM managed_api_keys WHERE active=1").fetchone()["total"]
+        user_count = c.execute("SELECT COUNT(*) AS total FROM bot_users").fetchone()["total"]
     if OR_MANAGEMENT_KEY and secrets_cipher():
-        state = f"Автовыдача включена · лимит <b>${USER_MONTHLY_LIMIT_USD:.2f}</b> на пользователя в месяц.\nВыдано ключей: <b>{count}</b>."
+        state = (f"Автовыдача включена · лимит <b>${USER_MONTHLY_LIMIT_USD:.2f}</b> на пользователя в месяц.\n"
+                 f"Зарегистрировано пользователей: <b>{user_count}</b> · выдано ключей: <b>{count}</b>.")
     elif not OR_MANAGEMENT_KEY:
         state = "Автовыдача выключена: добавьте <code>OPENROUTER_MANAGEMENT_API_KEY</code> в Secrets Amvera. До этого используется общий ключ."
     else:
@@ -5215,7 +5321,7 @@ def api_keys_page(chat_id):
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
                [InlineKeyboardButton("↻ Создать и синхронизировать ключи", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
-    return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", live_markup(InlineKeyboardMarkup(buttons))
+    return "🔐 <b>Управление AI</b>\n" + state + "\n\nРасходы показывают всех зарегистрированных пользователей, включая usage = 0. Пользователи не видят модели или API-ключи.", live_markup(InlineKeyboardMarkup(buttons))
 
 
 def usage_text(rows, title, show_chats=False):
@@ -5224,17 +5330,17 @@ def usage_text(rows, title, show_chats=False):
     total_cost = sum(float(row["cost"] or 0) for row in rows)
     total_requests = sum(int(row["requests"] or 0) for row in rows)
     total_tokens = sum(int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in rows)
-    lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", "",
-             "<pre>Модель                    Запр.   Токены        $</pre>"]
+    lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Estimated cost: <b>${total_cost:.4f}</b>", "",
+             "<pre>Модель                    Запр.  In / Out       $</pre>"]
     for row in rows[:8]:
         source = {"personal": "личный", "managed": "отдельный"}.get(row["source"], "общий")
         chat = f'чат <code>{row["chat_id"]}</code> · ' if show_chats else ""
         model = str(row["model"] or "—")
         model = (model[:23] + "…") if len(model) > 24 else model
-        tokens = int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0)
-        lines.append(f'{chat}<pre>{html.escape(model):<25}{int(row["requests"] or 0):>5,}{tokens:>9,}  ${float(row["cost"] or 0):>8.4f}</pre>')
+        input_tokens, output_tokens = int(row["input_tokens"] or 0), int(row["output_tokens"] or 0)
+        lines.append(f'{chat}<pre>{html.escape(model):<25}{int(row["requests"] or 0):>5,}{input_tokens:>5,}/{output_tokens:<5,} ${float(row["cost"] or 0):>8.4f}</pre>')
         if not show_chats:
-            lines.append(f"  {source} ключ")
+            lines.append(f"  {source} ключ · provider: {html.escape(str(row.get('provider') or 'openrouter'))}")
     if len(rows) > 8:
         lines.append(f"\nПоказаны 8 из {len(rows)} моделей.")
     return "\n".join(lines)
@@ -5266,22 +5372,24 @@ def user_caption(row):
 
 
 def shared_usage_users_page(page=0, page_size=8):
-    users = shared_usage_users()
+    users = admin_usage_users()
     pages = max(1, (len(users) + page_size - 1) // page_size)
     page = max(0, min(int(page), pages - 1))
     shown = users[page * page_size:(page + 1) * page_size]
     if not users:
-        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
+        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗарегистрированных пользователей пока нет.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")]]))
     total_cost = sum(float(row["cost"] or 0) for row in users)
     total_requests = sum(int(row["requests"] or 0) for row in users)
     lines = ["📈 <b>Ключи Noema · пользователи</b>",
-             f"Пользователей: <b>{len(users)}</b> · Запросов: <b>{total_requests:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", ""]
+             f"Текущий месяц · пользователей: <b>{len(users)}</b> · запросов: <b>{total_requests:,}</b> · estimated cost: <b>${total_cost:.4f}</b>", ""]
     buttons = []
     for row in shown:
         number = int(row["user_number"])
         caption = user_caption(row)
-        lines.append(f'<code>#{number:03d}</code> {html.escape(caption)} · {int(row["requests"]):,} запр. · ${float(row["cost"] or 0):.4f}')
+        total_tokens = int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0)
+        activity = str(row.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
+        lines.append(f'<code>#{number:03d}</code> {html.escape(caption)} · {int(row["requests"]):,} запр. · {total_tokens:,} ток. · ${float(row["cost"] or 0):.4f} · {activity}')
         buttons.append(InlineKeyboardButton(f"#{number:03d} {caption}"[:60], callback_data=f"keys:admin_user:{number}:{page}"))
     markup_rows = button_rows(buttons, 2)
     if pages > 1:
@@ -6214,6 +6322,7 @@ async def save_webapp_timezone(request):
     user = valid_webapp_user(payload.get("init_data"))
     if not user or not user.get("id"):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    register_bot_user(int(user["id"]), user)
     result = set_user_timezone(int(user["id"]), payload.get("timezone"))
     return web.json_response({"ok": bool(result.get("ok")), "timezone": result.get("timezone", "")}, status=200 if result.get("ok") else 400)
 
