@@ -19,17 +19,23 @@ def register_miniapp(app, core):
     default_widgets = ["tasks", "next_event", "notes", "reminders", "budget", "recent_saved"]
     widget_types = set(default_widgets) | {"people"}
     client_latency_metrics = {
-        "wake_ms", "stt_first_partial_ms", "stt_final_ms",
+        "wake_ms", "stt_first_partial_ms", "stt_final_ms", "llm_ttft_ms",
         "tts_first_start_ms", "total_response_start_ms", "total_ms",
     }
+    client_voice_robustness_metrics = {
+        "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
+        "barge_in_rms", "barge_in_vad_probability", "audio_capture_sample_rate_hz",
+        "stt_stream_sample_rate_hz",
+    }
+    client_telemetry_metrics = client_latency_metrics | client_voice_robustness_metrics
 
     def telemetry_values(args):
         values = args.get("metrics")
-        if not isinstance(values, dict) or len(values) > len(client_latency_metrics):
+        if not isinstance(values, dict) or len(values) > len(client_telemetry_metrics):
             raise ValueError("Некорректная телеметрия")
         clean = {}
         for name, value in values.items():
-            if name not in client_latency_metrics or isinstance(value, bool) or not isinstance(value, (int, float)):
+            if name not in client_telemetry_metrics or isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError("Некорректная телеметрия")
             value = float(value)
             if not 0 <= value <= 900000:
