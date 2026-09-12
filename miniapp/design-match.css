@@ -189,7 +189,8 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
 .chat-screen header{flex:0 0 auto;margin-bottom:12px}
 .chat-screen #notice{display:none!important}
 .chat-screen #content{min-height:0;flex:1;display:flex;flex-direction:column;padding-bottom:var(--app-safe-bottom,env(safe-area-inset-bottom))}
-.chat-screen .chat{min-height:0;flex:1;gap:9px;padding:4px 0 12px;overflow-y:auto;overscroll-behavior:contain;scroll-behavior:smooth}
+.chat-screen .chat{min-height:0;flex:1;gap:9px;padding:4px 0 12px;overflow-y:auto;overscroll-behavior:contain;overflow-anchor:none}
+.chat-screen .chat:not(.chat-scroll-ready){visibility:hidden}
 .chat-screen .chat>.empty{margin:auto;max-width:270px;line-height:1.75;text-align:center}
 .chat-screen .bubble{
   max-width:86%;padding:10px 13px;border:1px solid rgba(244,244,242,.13);border-radius:18px;
@@ -199,10 +200,9 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
 .chat-screen .bubble.user{max-width:80%;padding:9px 12px;background:rgba(255,255,255,.075)}
 .chat-screen .composer{
   position:relative;bottom:auto;min-height:64px;flex:0 0 auto;margin:8px 0 max(10px,var(--app-safe-bottom,env(safe-area-inset-bottom)));
-  padding:5px 6px 5px 15px;gap:8px;border:1px solid rgba(244,244,242,.22);border-radius:23px;
-  background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.018));
-  box-shadow:inset 0 1px rgba(255,255,255,.045),0 14px 34px rgba(0,0,0,.3);backdrop-filter:blur(22px);
+  padding:5px 6px 5px 15px;gap:8px;border:0;border-radius:23px;background:transparent;box-shadow:none;isolation:isolate;
 }
+.chat-screen .composer:before{content:'';position:absolute;z-index:-1;inset:0 48px 0 0;border:1px solid rgba(244,244,242,.22);border-right:0;border-radius:23px 0 0 23px;background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.018));box-shadow:inset 0 1px rgba(255,255,255,.045),0 14px 34px rgba(0,0,0,.3);backdrop-filter:blur(22px)}
 .chat-screen .composer input{min-height:52px;padding:8px 0;border:0;background:none;font-size:16px;line-height:1.2;outline:0}
 .chat-screen .composer-status{
   position:absolute;z-index:2;left:15px;right:69px;top:9px;color:rgba(226,226,223,.66);
@@ -212,9 +212,13 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
 .chat-voice-orb{
   order:2;flex:0 0 56px;width:56px;height:56px;min-height:56px;padding:0;border:0!important;border-radius:50%!important;
   background:radial-gradient(circle at 36% 30%,rgba(255,255,255,.13),rgba(255,255,255,.015) 64%,transparent 66%)!important;
-  filter:brightness(1.75) contrast(1.07) drop-shadow(0 0 10px rgba(255,255,255,.17));
+  transform:translateY(5px);filter:brightness(1.75) contrast(1.07) drop-shadow(0 0 10px rgba(255,255,255,.17));overflow:visible;
 }
 .chat-voice-orb canvas{display:block;width:100%;height:100%}
+.chat-screen .chat-latest{position:absolute;z-index:4;right:12px;bottom:82px;width:34px;height:34px;min-height:34px;padding:0;border:1px solid rgba(244,244,242,.24);border-radius:50%;background:rgba(20,20,20,.88);box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:20px;line-height:1;color:var(--ink)}
+.chat-screen .chat-latest[hidden]{display:none}
+#shell.edge-swipe-active,#shell.edge-swipe-settling{will-change:transform;transform:translate3d(var(--edge-swipe-x,0),0,0)}
+#shell.edge-swipe-settling{transition:transform 180ms cubic-bezier(.2,.8,.2,1)}
 @keyframes bubble-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
 /* 5. Tasks and reminders */
