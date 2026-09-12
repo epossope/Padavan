@@ -127,6 +127,29 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, [{"type": "cancelled"}])
         request.assert_not_called()
 
+    def test_reasoning_never_reaches_shared_stream_or_canonical_history(self):
+        response = Mock(ok=True, status_code=200)
+        response.iter_lines.return_value = [
+            b'data: {"choices":[{"delta":{"reasoning":"private","content":"<thi"}}]}',
+            b'data: {"choices":[{"delta":{"content":"nk>Need answer</think>Visible "}}]}',
+            b'data: {"choices":[{"delta":{"content":"answer."},"finish_reason":"stop"}]}',
+            b'data: [DONE]',
+        ]
+        router = SimpleNamespace(resolve=lambda *_: {"primary": "test-model", "fallback": ""})
+        with patch.object(bot, "direct_live_request", return_value=None), \
+             patch.object(bot, "conversation_context", return_value=[]), \
+             patch.object(bot, "system_prompt", return_value="system"), \
+             patch.object(bot, "model_router", return_value=router), \
+             patch.object(bot, "runtime_config_values", return_value={"strong_model": "", "model_catalog": []}), \
+             patch.object(bot, "request_chat_stream", return_value=response), \
+             patch.object(bot, "add_message") as add:
+            events = list(bot.stream_agent_response(42, "test"))
+        deltas = "".join(event["text"] for event in events if event["type"] == "delta")
+        self.assertEqual(deltas, "Visible answer.")
+        self.assertEqual(events[-1]["text"], "Visible answer.")
+        add.assert_any_call(42, "assistant", "Visible answer.")
+        self.assertNotIn("think", repr(events).lower())
+
     def test_stop_during_partial_tool_call_never_executes_tool(self):
         cancel = threading.Event()
         response = Mock(ok=True, status_code=200)
@@ -205,6 +228,46 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 await bot.send_answer(update, "Готово.")
             self.assertEqual(message.reply_text.await_count, text_count, mode)
             self.assertEqual(message.reply_voice.await_count, voice_count, mode)
+
+    def test_effective_model_user_override_and_auto_share_one_setting(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.execute("CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '')")
+        router = bot.ModelRouter(lambda: database, "admin-fast", ["admin-strong"], "admin-vision")
+        fields = {
+            "fast_model": {"value": "admin-fast", "source": "ADMIN"},
+            "strong_model": {"value": "env-strong", "source": "ENV"},
+            "vision_model": {"value": "env-vision", "source": "ENV"},
+            "tts_provider": {"value": "edge", "source": "ENV"},
+            "tts_voice": {"value": "ru-RU-DmitryNeural", "source": "ENV"},
+        }
+        with patch.object(bot, "conn", return_value=database), \
+             patch.object(bot, "runtime_config_snapshot", return_value={"fields": fields}), \
+             patch.object(bot, "vision_models_for", return_value=["env-vision"]), \
+             patch.object(bot, "has_personal_api_key", return_value=False):
+            router.set_primary(42, "user-model")
+            selected = bot.effective_user_ai_config(42)
+            self.assertEqual(selected["effective_model"], {"value": "user-model", "source": "USER"})
+            self.assertEqual(selected["fast_default"], {"value": "admin-fast", "source": "ADMIN"})
+            self.assertEqual(selected["strong_fallback"], {"value": "env-strong", "source": "ENV"})
+            router.set_primary(42, "")
+            automatic = bot.effective_user_ai_config(42)
+            self.assertEqual(automatic["effective_model"], {"value": "admin-fast", "source": "ADMIN"})
+        database.close()
+
+    def test_canonical_history_never_stores_or_returns_reasoning(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript("""
+            CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
+            CREATE TABLE conversation_summaries(chat_id INTEGER PRIMARY KEY,summary TEXT,through_message_id INTEGER,version INTEGER,updated_at TEXT);
+        """)
+        with patch.object(bot, "conn", return_value=database):
+            bot.add_message(42, "assistant", "<think>Нужно ответить</think>Готово")
+            stored = database.execute("SELECT content FROM messages").fetchone()["content"]
+            self.assertEqual(stored, "Готово")
+            self.assertEqual(bot.history(42), [{"role": "assistant", "content": "Готово"}])
+        database.close()
 
 
 if __name__ == "__main__":

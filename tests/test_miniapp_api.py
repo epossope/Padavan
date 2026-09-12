@@ -260,6 +260,28 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("data-conversation", screen_source)
         self.assertIn("realtime_beta=1", realtime_source)
 
+    def test_boot_requests_fullscreen_with_expand_fallback_and_safe_area(self):
+        root = Path(__file__).parent.parent / "miniapp"
+        source = (root / "screens.js").read_text(encoding="utf-8")
+        css = (root / "design-match.css").read_text(encoding="utf-8")
+        self.assertLess(source.index("tg.ready()"), source.index("tg.expand()"))
+        self.assertIn("typeof tg.requestFullscreen==='function'", source)
+        self.assertIn("tg.requestFullscreen()", source)
+        self.assertIn("tg.safeAreaInset", source)
+        self.assertIn("tg.contentSafeAreaInset", source)
+        self.assertIn("--app-safe-top", css)
+        self.assertIn("--app-safe-bottom", css)
+
+    def test_effective_ai_snapshot_and_collapsed_admin_sections_are_wired(self):
+        api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")
+        app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("effective_user_ai_config(cid)", api_source)
+        self.assertIn('"effective_ai": effective_ai', api_source)
+        self.assertIn("Сейчас для меня", app_source)
+        self.assertIn("effective.effective_model", app_source)
+        self.assertIn("FAST default и STRONG fallback", app_source)
+        self.assertEqual(app_source.count("runtimeSection('"), 6)
+
     async def test_production_tts_metrics_are_numeric_allowlisted(self):
         response = await self.client.post('/api/v1/miniapp', json={
             "init_data": "signed", "action": "telemetry_record",

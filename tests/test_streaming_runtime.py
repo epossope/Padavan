@@ -1,10 +1,36 @@
 import json
 import unittest
 
-from streaming_runtime import AdaptiveDraftThrottle, SentenceChunker, StreamAccumulator, ToolPackResolver, iter_sse_json
+from streaming_runtime import (AdaptiveDraftThrottle, SentenceChunker, StreamAccumulator,
+                               ToolPackResolver, iter_sse_json,
+                               sanitize_assistant_message, sanitize_visible_content)
 
 
 class StreamingRuntimeTests(unittest.TestCase):
+    def test_streamed_reasoning_is_never_emitted_or_persisted(self):
+        acc = StreamAccumulator()
+        chunks = [
+            {"choices": [{"delta": {"reasoning": "internal only", "content": "<thi"}}]},
+            {"choices": [{"delta": {"content": "nk>Пользователь спрашивает. Нужно ответить.</think>Го"}}]},
+            {"choices": [{"delta": {"content": "тово."}}]},
+        ]
+        visible = []
+        for chunk in chunks:
+            visible.extend(acc.add(chunk))
+        visible.append(acc.finish())
+        self.assertEqual("".join(visible), "Готово.")
+        self.assertEqual(acc.message()["content"], "Готово.")
+        self.assertNotIn("reasoning", acc.message())
+
+    def test_final_message_sanitizer_drops_reasoning_fields_and_tags(self):
+        message = sanitize_assistant_message({
+            "role": "assistant", "reasoning": "secret",
+            "reasoning_details": [{"text": "secret"}],
+            "content": "<think>Нужно ответить</think>Только ответ",
+        })
+        self.assertEqual(message, {"role": "assistant", "content": "Только ответ"})
+        self.assertEqual(sanitize_visible_content("До <b>обычного</b> текста"), "До <b>обычного</b> текста")
+
     def test_streamed_tool_arguments_are_assembled_once(self):
         acc = StreamAccumulator()
         chunks = [

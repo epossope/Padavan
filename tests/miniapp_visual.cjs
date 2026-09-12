@@ -39,7 +39,7 @@ const visualFixture={
    {role:'assistant',content:'Напомню перед встречей по продуктовой стратегии.'}
   ],
   rules:[{id:1,description:'Отвечать кратко и по существу'}],
-  settings:{mode:'text',timezone:'Europe/Moscow',home_widgets:['tasks','next_event','notes','reminders','budget','recent_saved'],experimental_realtime:false,experimental_realtime_available:false,experimental_wake_enabled:false,admin_runtime_config:null,voice_runtime:{tts_provider:'edge',tts_fallback_provider:'browser',tts_voice:'ru-RU-DmitryNeural'},telemetry_enabled:false,briefing:{enabled:true,time:'08:30',topics:'главные новости мира',city:'Санкт-Петербург'}}
+  settings:{mode:'text',timezone:'Europe/Moscow',home_widgets:['tasks','next_event','notes','reminders','budget','recent_saved'],experimental_realtime:false,experimental_realtime_available:true,experimental_wake_enabled:false,effective_ai:{effective_model:{value:'deepseek/deepseek-v4-flash-0731',source:'USER'},fast_default:{value:'qwen/qwen3.5-flash-02-23',source:'ENV'},strong_fallback:{value:'deepseek/deepseek-v3.2',source:'ENV'},vision:{value:'qwen/qwen-vision',source:'ENV'},tts:{provider:'edge',provider_source:'ENV',voice:'ru-RU-DmitryNeural',voice_source:'ENV'}},admin_runtime_config:{updated_at:'2026-09-12T08:00:00Z',updated_by:42,fields:{fast_model:{value:'qwen/qwen3.5-flash-02-23',source:'ENV'},fast_model_providers:{value:['Alibaba'],source:'ENV'},fast_model_allow_provider_fallback:{value:false,source:'ENV'},strong_model:{value:'deepseek/deepseek-v3.2',source:'ENV'},strong_model_providers:{value:['StreamLake','DeepInfra'],source:'ENV'},strong_model_allow_provider_fallback:{value:true,source:'ENV'},vision_model:{value:'qwen/qwen-vision',source:'ENV'},vision_fallback_models:{value:[],source:'DEFAULT'},batch_stt_model:{value:'mistralai/voxtral-mini-transcribe',source:'ENV'},tts_provider:{value:'edge',source:'ENV'},tts_fallback_provider:{value:'browser',source:'ENV'},tts_voice:{value:'ru-RU-DmitryNeural',source:'ENV'},default_voice_reply_mode:{value:'text',source:'DEFAULT'},realtime_model:{value:'voxtral-realtime',source:'DEFAULT'},model_catalog:{value:['qwen/qwen3.5-flash-02-23','deepseek/deepseek-v3.2'],source:'ENV'}}},voice_runtime:{tts_provider:'edge',tts_fallback_provider:'browser',tts_voice:'ru-RU-DmitryNeural'},telemetry_enabled:false,briefing:{enabled:true,time:'08:30',topics:'главные новости мира',city:'Санкт-Петербург'}}
  },
  weather:{city:'Санкт-Петербург',current:{condition:'ясно',temperature:14,feels_like:11}},
  budget:{currency_totals:{RUB:{expense:5750,income:0,balance:-5750}},items:[
@@ -62,6 +62,13 @@ const visualFixture={
    if(route==='tasks')await page.locator('.task-card details').first().evaluate(element=>element.open=true);
    if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))errors.push(`${route} overflows ${width}`);
    if(route==='settings'&&await page.locator('#dock').isVisible())errors.push('Membrane visible in settings');
+   if(route==='settings'){
+    const sections=page.locator('.admin-ai .runtime-section');
+    if(await sections.count()!==6||await page.locator('.admin-ai .runtime-section[open]').count()!==1)errors.push(`AI & Voice sections are not collapsed ${width}`);
+    if(!await page.locator('.admin-ai').getByText('Сейчас для меня',{exact:true}).count())errors.push(`Effective user model summary missing ${width}`);
+    const adminText=await page.locator('.admin-ai').innerText();
+    if(!adminText.includes('deepseek/deepseek-v4-flash-0731')||!adminText.includes('USER'))errors.push(`Effective USER model is not distinct ${width}`);
+   }
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
     const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x+sphere.width>box.x+box.width+1||sphere.x<sphere.width)errors.push(`Chat sphere is not docked on composer right ${width}`);
@@ -99,5 +106,31 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
+ const fullscreen=await browser.newPage({viewport:{width:390,height:844}});
+ await fullscreen.route('https://telegram.org/**',route=>route.abort());
+ await fullscreen.addInitScript(()=>{
+  window.__telegramBoot={ready:0,expand:0,fullscreen:0};
+  window.Telegram={WebApp:{
+   initData:'',safeAreaInset:{top:11,right:2,bottom:7,left:3},contentSafeAreaInset:{top:19,right:4,bottom:13,left:5},
+   ready(){window.__telegramBoot.ready++},expand(){window.__telegramBoot.expand++},requestFullscreen(){window.__telegramBoot.fullscreen++},
+   isVersionAtLeast(){return true},onEvent(){},setHeaderColor(){},setBackgroundColor(){},
+   BackButton:{onClick(){},hide(){},show(){}}
+  }}
+ });
+ await fullscreen.goto('http://127.0.0.1:8091/app');await fullscreen.locator('#splash.hidden').waitFor();
+ const fullscreenBoot=await fullscreen.evaluate(()=>({calls:window.__telegramBoot,safeTop:getComputedStyle(document.documentElement).getPropertyValue('--app-safe-top').trim(),safeBottom:getComputedStyle(document.documentElement).getPropertyValue('--app-safe-bottom').trim()}));
+ if(fullscreenBoot.calls.ready!==1||fullscreenBoot.calls.expand!==1||fullscreenBoot.calls.fullscreen!==1)errors.push('Telegram fullscreen boot sequence failed');
+ if(fullscreenBoot.safeTop!=='19px'||fullscreenBoot.safeBottom!=='13px')errors.push('Telegram safe area was not applied');
+ await fullscreen.close();
+ const fallback=await browser.newPage({viewport:{width:390,height:844}});
+ await fallback.route('https://telegram.org/**',route=>route.abort());
+ await fallback.addInitScript(()=>{
+  window.__telegramBoot={ready:0,expand:0};
+  window.Telegram={WebApp:{initData:'',ready(){window.__telegramBoot.ready++},expand(){window.__telegramBoot.expand++},onEvent(){},setHeaderColor(){},setBackgroundColor(){},BackButton:{onClick(){},hide(){},show(){}}}}
+ });
+ await fallback.goto('http://127.0.0.1:8091/app');await fallback.locator('#splash.hidden').waitFor();
+ const fallbackBoot=await fallback.evaluate(()=>window.__telegramBoot);
+ if(fallbackBoot.ready!==1||fallbackBoot.expand!==1)errors.push('Telegram expand fallback failed');
+ await fallback.close();
  await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('7 viewports × 9 screens + zoom guard + overlay dock + compact composer sphere + direct mouse/touch sorting: passed');
 })().catch(e=>{console.error(e);process.exitCode=1});

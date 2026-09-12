@@ -137,5 +137,26 @@ document.addEventListener('click',async e=>{
 });
 document.addEventListener('change',e=>{if(e.target.id==='budget-month'){budgetMonth=e.target.value;loadBudget()}});
 async function loadBudget(){if(preview){render();return}budgetLoading=true;if(page==='budget')render();try{const result=await api('budget',page==='budget'?budgetRange():{});if(page==='budget')budgetData=result;else monthBudget=result}catch(e){say(e.message)}finally{budgetLoading=false;if(['home','budget'].includes(page))render()}}
-async function init(){try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.expand();tg?.BackButton.onClick(back);render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}}catch(e){say(e.message)}finally{tg?.ready();document.querySelector('#splash').classList.add('hidden')}}
+function applyTelegramSafeArea(){
+ if(!tg)return;
+ const safe=tg.safeAreaInset||{},contentSafe=tg.contentSafeAreaInset||{},root=document.documentElement;
+ for(const side of ['top','right','bottom','left']){
+  const values=[safe[side],contentSafe[side]].map(Number).filter(Number.isFinite);
+  if(values.length)root.style.setProperty(`--app-safe-${side}`,`${Math.max(0,...values)}px`)
+ }
+}
+function prepareTelegramViewport(){
+ if(!tg)return;
+ tg.ready();
+ tg.expand();
+ applyTelegramSafeArea();
+ tg.onEvent?.('safeAreaChanged',applyTelegramSafeArea);
+ tg.onEvent?.('contentSafeAreaChanged',applyTelegramSafeArea);
+ try{
+  if(typeof tg.requestFullscreen==='function'&&(!tg.isVersionAtLeast||tg.isVersionAtLeast('8.0')))tg.requestFullscreen()
+ }catch{}
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshStateOnResume()});
+window.addEventListener('focus',refreshStateOnResume);
+async function init(){prepareTelegramViewport();try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.BackButton.onClick(back);render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}}catch(e){say(e.message)}finally{document.querySelector('#splash').classList.add('hidden')}}
 init();
