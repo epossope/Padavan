@@ -14,10 +14,14 @@ import imageio_ffmpeg
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
-BRAND_VARIANTS = ["ноэма", "ноема", "наэма", "наема", "наэмо", "ноэмо"]
+WAKE_VARIANTS = [
+    "Эма",
+    "Эмма",
+    "Эма, ты тут?",
+    "Эма, какие у меня задачи?",
+]
 FALLBACK_VARIANTS = ["слушай", "привет", "помощник"]
-RECOGNIZED_BRAND_ALIASES = ["но эмо", "найма", "наем"]
-PHRASE = "Ноэма, какие у меня задачи сегодня?"
+RECOGNIZED_WAKE_ALIASES = ["эма", "эмма"]
 
 
 async def synthesize(text: str, output: Path) -> None:
@@ -30,12 +34,20 @@ async def synthesize(text: str, output: Path) -> None:
     )
 
 
-def recognize(model: Model, path: Path, grammar: list[str] | None = None) -> str:
+def recognize(model: Model, path: Path, grammar: list[str] | None = None) -> dict[str, object]:
     with wave.open(str(path), "rb") as audio:
         recognizer = KaldiRecognizer(model, 16000, json.dumps(grammar, ensure_ascii=False)) if grammar else KaldiRecognizer(model, 16000)
+        detected_at_ms = None
+        aliases = set(RECOGNIZED_WAKE_ALIASES)
         while chunk := audio.readframes(4000):
             recognizer.AcceptWaveform(chunk)
-        return json.loads(recognizer.FinalResult()).get("text", "")
+            partial = json.loads(recognizer.PartialResult()).get("partial", "")
+            if detected_at_ms is None and any(alias in partial.split() for alias in aliases):
+                detected_at_ms = round(audio.tell() * 1000 / audio.getframerate())
+        text = json.loads(recognizer.FinalResult()).get("text", "")
+        if detected_at_ms is None and any(alias in text.split() for alias in aliases):
+            detected_at_ms = round(audio.tell() * 1000 / audio.getframerate())
+        return {"text": text, "wake_detected_at_audio_ms": detected_at_ms}
 
 
 async def main() -> None:
@@ -44,12 +56,12 @@ async def main() -> None:
     args = parser.parse_args()
     SetLogLevel(-1)
     model = Model(str(args.model))
-    vocabulary = {word: model.vosk_model_find_word(word) >= 0 for word in BRAND_VARIANTS + FALLBACK_VARIANTS + RECOGNIZED_BRAND_ALIASES}
-    restricted_grammar = [phrase for phrase in RECOGNIZED_BRAND_ALIASES if all(model.vosk_model_find_word(word) >= 0 for word in phrase.split())] + ["[unk]"]
+    vocabulary = {word: model.vosk_model_find_word(word) >= 0 for word in ["эма", "эмма", "ты", "тут", "какие", "у", "меня", "задачи"] + FALLBACK_VARIANTS}
+    restricted_grammar = [phrase for phrase in RECOGNIZED_WAKE_ALIASES if all(model.vosk_model_find_word(word) >= 0 for word in phrase.split())] + ["[unk]"]
     results = {}
     with tempfile.TemporaryDirectory(prefix="noema-vosk-probe-") as directory:
         root = Path(directory)
-        for index, text in enumerate(BRAND_VARIANTS + FALLBACK_VARIANTS + [PHRASE]):
+        for index, text in enumerate(WAKE_VARIANTS + FALLBACK_VARIANTS):
             wav = root / f"sample-{index}.wav"
             await synthesize(text, wav)
             results[text] = {

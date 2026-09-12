@@ -8,8 +8,8 @@
   endSilence:620,minSpeech:320,listenStableMs:150,bargeStableMs:250,
   ringMs:2000,preRollMs:400,sessionMs:25000,targetDelay:480,
  };
- const wakeWords=['но эмо','найма','наем'];
- const wakeAliases=['ноэма','ноема','наэма','наема','наэмо','ноэмо','но эмо','найма','наем'];
+ const wakeWords=['эма','эмма'];
+ const wakeAliases=['эма','эмма'];
  const wakeGrammar=[...wakeWords,'[unk]'];
  const latencyMetrics=['wake_ms','stt_first_partial_ms','stt_final_ms','llm_ttft_ms','tts_first_start_ms','total_response_start_ms','total_ms'];
  const voiceRobustnessMetrics=['barge_in_reason_code','barge_in_duration_ms','barge_in_peak_rms','barge_in_rms','barge_in_vad_probability','audio_capture_sample_rate_hz','stt_stream_sample_rate_hz','vad_engine','vad_fallback_reason_code','noise_floor_rms','speech_start_probability','speech_start_rms','realtime_empty_final_count','realtime_fallback_batch_count','batch_fallback_success_count','stt_ws_connect_ms'];
@@ -70,10 +70,12 @@
   close(){this.ready=false;this.instance?.destroy?.().catch(()=>{});this.instance=null}
  }
  class WakeWordProvider{
-  constructor(onWake){this.onWake=onWake;this.ready=false}
-  async load(){await loadVoskRuntime();this.model=await Vosk.createModel('/app/assets/models/vosk-model-small-ru-0.22.tar.gz');this.recognizer=new this.model.KaldiRecognizer(16000,JSON.stringify(wakeGrammar));const read=event=>{const value=(event.result?.partial||event.result?.text||'').toLowerCase().trim();if(wakeWords.some(word=>value.includes(word)))this.onWake(value)};this.recognizer.on('partialresult',read);this.recognizer.on('result',read);this.ready=true}
+  constructor(onWake){this.onWake=onWake;this.ready=false;this.status('loading')}
+  status(engine,reason=''){const wake={modelLoaded:Boolean(this.model),recognizerReady:Boolean(this.recognizer&&this.ready),engine,reason};diagnostics.wake=wake;console.info('[Noema voice] wake runtime',wake)}
+  fail(reason){this.status('fallback',reason);console.warn('[Noema voice] Vosk wake fallback:',reason);throw Error(`VOSK_${reason.toUpperCase()}`)}
+  async load(){try{await loadVoskRuntime()}catch{this.fail('runtime_load_failed')}try{this.model=await Vosk.createModel('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')}catch{this.fail('model_load_failed')}this.status('vosk');try{this.recognizer=new this.model.KaldiRecognizer(16000,JSON.stringify(wakeGrammar));const read=event=>{const value=(event.result?.partial||event.result?.text||'').toLowerCase().trim();if(wakeWords.some(word=>value.includes(word)))this.onWake()};this.recognizer.on('partialresult',read);this.recognizer.on('result',read);this.ready=true;this.status('vosk')}catch{this.fail('recognizer_init_failed')}}
   feed(floatSamples,sampleRate){if(this.ready)this.recognizer.acceptWaveformFloat(floatSamples,sampleRate)}
-  close(){this.recognizer?.remove();this.model?.terminate();this.ready=false}
+  close(){this.recognizer?.remove();this.model?.terminate();this.recognizer=null;this.model=null;this.ready=false;this.status('stopped')}
  }
  class VoxtralRealtimeSTTProvider{
   constructor({onPartial,onConnected}={}){this.onPartial=onPartial;this.onConnected=onConnected;this.queue=[];this.ready=false;this.closed=false;this.turn=null;this.connecting=null}
@@ -96,7 +98,7 @@
   preRollPcm(milliseconds=cfg.preRollMs){let need=Math.round(16000*2*milliseconds/1000),out=[];for(let index=this.pcmRing.length-1;index>=0&&need>0;index--){const chunk=this.pcmRing[index];if(chunk.length<=need){out.unshift(chunk.slice());need-=chunk.length}else out.unshift(chunk.slice(chunk.length-need)),need=0}return out}
   beginUtterance(startedAt,blobPreRoll=true){this.speechAt=startedAt;this.silentAt=0;this.utterance=blobPreRoll?[...this.ring]:[];this.utterancePcm=this.preRollPcm();this.utterancePcmBytes=this.utterancePcm.reduce((total,chunk)=>total+chunk.length,0);this.startRealtime(this.utterancePcm)}
   signal(){const energy=this.energy.sample(),probability=this.silero?.probability(),speaking=this.state==='SPEAKING',usesSilero=Number.isFinite(probability),vadThreshold=speaking?cfg.speakingVadProbability:cfg.listeningVadProbability,previousThreshold=this.noiseFloor.threshold(speaking),likelySpeech=usesSilero?probability>=vadThreshold:energy.rms>=previousThreshold,noiseFloor=this.noiseFloor.observe(energy.rms,{speech:likelySpeech,active:Boolean(this.speechAt)}),rmsThreshold=this.noiseFloor.threshold(speaking),speech=usesSilero?probability>=vadThreshold&&energy.rms>=rmsThreshold:energy.rms>=rmsThreshold;if(usesSilero&&this.vadStaleReported){this.vadStaleReported=false;diagnostics.vad='silero_active';diagnostics.vadFallbackReason='';publishVoiceDiagnostics({vad_engine:1,vad_fallback_reason_code:0})}if(this.silero&&!usesSilero&&!this.vadStaleReported){this.vadStaleReported=true;diagnostics.vad='rms_fallback';diagnostics.vadFallbackReason='silero_stale_probability';publishVoiceDiagnostics({vad_engine:0,vad_fallback_reason_code:2})}return {...energy,probability:usesSilero?probability:null,usesSilero,noiseFloor,rmsThreshold,speech}}
-  activateWake(){if(!this.active||this.state!=='SLEEPING')return;const activated=now();this.currentMetrics={started_at:this.wakeSpeechAt||activated};this.metric('wake_ms');this.wakeSpeechAt=0;this.setState('LISTENING');this.beginUtterance(activated)}
+  activateWake(){if(!this.active||this.state!=='SLEEPING')return;const activated=now(),detectionMs=Math.round(activated-(this.wakeSpeechAt||activated));diagnostics.wake={...diagnostics.wake,lastDetectionMs:detectionMs};console.info('[Noema voice] Vosk wake detected',{detectionMs});this.currentMetrics={started_at:this.wakeSpeechAt||activated};this.metric('wake_ms');this.wakeSpeechAt=0;this.setState('LISTENING');this.beginUtterance(activated)}
   prepareRealtime(){if(this.realtime?.reusable()||this.realtime?.connecting)return this.realtime;const provider=new VoxtralRealtimeSTTProvider({onPartial:()=>this.metric('stt_first_partial_ms'),onConnected:milliseconds=>publishVoiceDiagnostics({stt_ws_connect_ms:milliseconds})});this.realtime=provider;provider.connect().catch(()=>{});return provider}
   startRealtime(initial=this.preRollPcm()){const provider=this.prepareRealtime();if(provider.turn)provider.cancel();provider.connection=provider.start(initial);provider.connection.catch(()=>{});return provider}
   beginListeningSpeech(startedAt){this.listeningCandidate=null;this.currentMetrics={started_at:startedAt};this.beginUtterance(startedAt)}

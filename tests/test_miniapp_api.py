@@ -59,6 +59,12 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn('Noema', await response.text())
 
+    async def test_vosk_wake_model_is_served_at_runtime_asset_path(self):
+        response = await self.client.get('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get('Content-Type'), 'application/gzip')
+        self.assertEqual(await response.content.read(2), b'\x1f\x8b')
+
     async def test_home_layout_is_saved_for_signed_user(self):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "home_layout", "args": {"widgets": ["tasks", "people"]}})
         self.assertEqual(response.status, 200)
@@ -140,6 +146,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("speakingVadProbability:.82", source)
         self.assertIn("echoCancellation:true,noiseSuppression:true,autoGainControl:true", source)
         self.assertIn("barge_in_reason_code", source)
+        self.assertIn("wakeWords=['эма','эмма']", source)
+        self.assertIn("model_load_failed", source)
+        self.assertIn("recognizerReady", source)
         self.assertIn("AdaptiveNoiseFloor", source)
         self.assertIn("preRollMs:400", source)
         self.assertIn("realtime_fallback_batch_count", source)
