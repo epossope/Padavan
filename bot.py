@@ -163,12 +163,18 @@ LATENCY_METRICS = (
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
     "llm_total_ms", "tts_first_start_ms", "total_response_start_ms", "total_ms",
 )
+VOICE_ROBUSTNESS_METRICS = (
+    "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
+    "barge_in_rms", "barge_in_vad_probability", "audio_capture_sample_rate_hz",
+    "stt_stream_sample_rate_hz",
+)
+TELEMETRY_METRICS = LATENCY_METRICS + VOICE_ROBUSTNESS_METRICS
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 try:
     TELEMETRY_SERIES_LIMIT = min(10000, max(50, int(os.getenv("TELEMETRY_SERIES_LIMIT", "2048"))))
 except ValueError:
     TELEMETRY_SERIES_LIMIT = 2048
-RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in LATENCY_METRICS}
+RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in TELEMETRY_METRICS}
 RUNTIME_METRICS_LOCK = threading.Lock()
 # This is deliberately process-local: benchmark metadata must not create or
 # mutate user records in SQLite. A restart simply requires a new reset.
@@ -832,6 +838,10 @@ def runtime_metric_export():
         "enabled": TELEMETRY_ENABLED,
         "series_limit": TELEMETRY_SERIES_LIMIT,
         "started_at": started_at,
+        "groups": {
+            "latency": list(LATENCY_METRICS),
+            "voice_robustness": list(VOICE_ROBUSTNESS_METRICS),
+        },
         "metrics": {
             name: {
                 "count": len(values),
@@ -3817,8 +3827,11 @@ def telemetry_command_allowed(update):
 
 def telemetry_counts_text(exported):
     return "\n".join(
-        f"<code>{name}</code>: {metric['count']}"
-        for name, metric in exported["metrics"].items()
+        f"<b>{heading}</b>\n" + "\n".join(
+            f"<code>{name}</code>: {exported['metrics'][name]['count']}"
+            for name in exported["groups"][group]
+        )
+        for heading, group in (("Latency", "latency"), ("Voice robustness", "voice_robustness"))
     )
 
 
@@ -3829,11 +3842,14 @@ def telemetry_report_text(exported):
         f"Started: <code>{exported['started_at'] or 'not reset in this process'}</code>",
         "",
     ]
-    for name, metric in exported["metrics"].items():
-        lines.append(
-            f"<code>{name}</code> — count {metric['count']} · avg {metric['avg']} ms · "
-            f"p50 {metric['p50']} ms · p95 {metric['p95']} ms · max {metric['max']} ms"
-        )
+    for heading, group in (("Latency", "latency"), ("Voice robustness", "voice_robustness")):
+        lines.extend((f"<b>{heading}</b>",))
+        for name in exported["groups"][group]:
+            metric = exported["metrics"][name]
+            lines.append(
+                f"<code>{name}</code> — count {metric['count']} · avg {metric['avg']} ms · "
+                f"p50 {metric['p50']} ms · p95 {metric['p95']} ms · max {metric['max']} ms"
+            )
     return "\n".join(lines)
 
 
