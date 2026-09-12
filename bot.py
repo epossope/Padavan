@@ -166,7 +166,10 @@ LATENCY_METRICS = (
 VOICE_ROBUSTNESS_METRICS = (
     "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
     "barge_in_rms", "barge_in_vad_probability", "audio_capture_sample_rate_hz",
-    "stt_stream_sample_rate_hz",
+    "stt_stream_sample_rate_hz", "vad_engine", "vad_fallback_reason_code",
+    "noise_floor_rms", "speech_start_probability", "speech_start_rms",
+    "realtime_empty_final_count", "realtime_fallback_batch_count",
+    "batch_fallback_success_count", "stt_ws_connect_ms",
 )
 TELEMETRY_METRICS = LATENCY_METRICS + VOICE_ROBUSTNESS_METRICS
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "false").strip().lower() in {"1", "true", "yes"}

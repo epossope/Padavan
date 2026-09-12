@@ -140,6 +140,25 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("speakingVadProbability:.82", source)
         self.assertIn("echoCancellation:true,noiseSuppression:true,autoGainControl:true", source)
         self.assertIn("barge_in_reason_code", source)
+        self.assertIn("AdaptiveNoiseFloor", source)
+        self.assertIn("preRollMs:400", source)
+        self.assertIn("realtime_fallback_batch_count", source)
+        self.assertIn("batch_fallback_success_count", source)
+        self.assertIn("vad_fallback_reason_code", source)
         self.assertIn("audio_format:{encoding:'pcm_s16le',sample_rate:16000}", source)
         self.assertNotIn("алёна", source.lower())
         self.assertNotIn("нина", source.lower())
+
+    async def test_telemetry_accepts_voice_reliability_measurements(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "telemetry_record",
+            "args": {"metrics": {
+                "vad_engine": 1, "noise_floor_rms": 0.013,
+                "realtime_fallback_batch_count": 1, "stt_ws_connect_ms": 245,
+            }},
+        })
+        self.assertEqual(response.status, 200)
+        self.core.record_runtime_metric.assert_any_call("vad_engine", 1.0)
+        self.core.record_runtime_metric.assert_any_call("noise_floor_rms", 0.013)
+        self.core.record_runtime_metric.assert_any_call("realtime_fallback_batch_count", 1.0)
+        self.core.record_runtime_metric.assert_any_call("stt_ws_connect_ms", 245.0)
