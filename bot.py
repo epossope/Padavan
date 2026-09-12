@@ -97,11 +97,26 @@ try:
 except ValueError:
     USER_MONTHLY_LIMIT_USD = 2.0
 
-FAST_CHAT_MODEL = os.getenv("FAST_CHAT_MODEL", "qwen/qwen3.5-flash-02-23").strip()
-STRONG_CHAT_MODEL = os.getenv("STRONG_CHAT_MODEL", "deepseek/deepseek-v3.2").strip()
-MODEL = os.getenv("MODEL", FAST_CHAT_MODEL).strip()
+def csv_env(name):
+    return tuple(value.strip() for value in os.getenv(name, "").split(",") if value.strip())
 
-FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", STRONG_CHAT_MODEL).split(",") if x.strip()]
+
+def bool_env(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+FAST_MODEL = os.getenv("FAST_MODEL", "qwen/qwen3.5-flash-02-23").strip()
+STRONG_MODEL = os.getenv("STRONG_MODEL", "deepseek/deepseek-v3.2").strip()
+FAST_MODEL_PROVIDERS = csv_env("FAST_MODEL_PROVIDERS")
+STRONG_MODEL_PROVIDERS = csv_env("STRONG_MODEL_PROVIDERS")
+FAST_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("FAST_MODEL_ALLOW_PROVIDER_FALLBACK", False)
+STRONG_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK", True)
+MODEL = os.getenv("MODEL", FAST_MODEL).strip()
+
+FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", STRONG_MODEL).split(",") if x.strip()]
 
 VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 
@@ -1433,17 +1448,16 @@ def provider_preferences_for(model):
     models. The payload contains no credentials and does not alter any user
     model preference.
     """
-    if model == FAST_CHAT_MODEL:
-        return {
-            "only": ["alibaba"], "order": ["alibaba"],
-            "allow_fallbacks": False, "require_parameters": True,
-        }
-    if model == STRONG_CHAT_MODEL:
-        return {
-            "only": ["streamlake", "deepinfra"],
-            "order": ["streamlake", "deepinfra"],
-            "allow_fallbacks": True, "require_parameters": True,
-        }
+    for configured_model, providers, allow_fallbacks in (
+        (FAST_MODEL, FAST_MODEL_PROVIDERS, FAST_MODEL_ALLOW_PROVIDER_FALLBACK),
+        (STRONG_MODEL, STRONG_MODEL_PROVIDERS, STRONG_MODEL_ALLOW_PROVIDER_FALLBACK),
+    ):
+        if model == configured_model and providers:
+            configured = list(providers)
+            return {
+                "only": configured, "order": configured,
+                "allow_fallbacks": allow_fallbacks, "require_parameters": True,
+            }
     return None
 
 
