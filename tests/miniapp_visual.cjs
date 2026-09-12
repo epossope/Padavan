@@ -95,18 +95,23 @@ const visualFixture={
    if(width<=430&&route==='people'){
     const expanded=await page.locator('.person-profile').first().boundingBox(),collapsed=await page.locator('.person-profile').nth(1).boundingBox();
     if(expanded.height>350||collapsed.height>68)errors.push(`People density regressed ${width}`);
+    if(await page.locator('#header [data-page="people"][aria-current="page"]').count()!==1)errors.push(`People navigation entry is not visible ${width}`);
    }
    if(width<=430&&route==='budget'){
     const picker=await page.locator('.period-picker').boundingBox(),periods=await page.locator('.budget-controls .segments').boundingBox(),total=await page.locator('.budget-totals .card').first().boundingBox();
     const charts=await Promise.all([0,1].map(index=>page.locator('.budget-dashboard>.card').nth(index).boundingBox()));
     if(Math.abs(picker.y-periods.y)>3||picker.x<=periods.x||picker.height>36||periods.height>36||total.height>84||charts[1].y<charts[0].y+charts[0].height)errors.push(`Budget proportions regressed ${width}`);
+    const barFill=await page.locator('.bar-group i').first().evaluate(el=>getComputedStyle(el).backgroundImage);
+    if(!barFill.includes('repeating-linear-gradient'))errors.push(`Daily budget bars lost their hatched finish ${width}`);
+    await page.locator('[data-currency-toggle]').click();
+    if(await page.locator('.currency-widget-panel').count()!==1)errors.push(`Inline currency widget did not expand ${width}`);
    }
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x+sphere.width>box.x+box.width+1||sphere.x<sphere.width)errors.push(`Chat sphere is not docked on composer right ${width}`);
-    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild}));
-    if(Number.parseFloat(sphereStyle.width)<80||Number.parseFloat(sphereStyle.width)>94||box.height>62||!sphereStyle.hasCanvas||!sphereStyle.isLast)errors.push(`Chat voice sphere is not the prominent right-side action ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>4||sphere.x<box.x+box.width-60||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not bottom-aligned on composer right ${width}`);
+    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild,borderRight:getComputedStyle(el.parentElement).borderRightWidth}));
+    if(Number.parseFloat(sphereStyle.width)<96||Number.parseFloat(sphereStyle.width)>106||box.height>62||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/open composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
     await page.evaluate(()=>say('Слушаю…'));
     if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);
@@ -140,6 +145,7 @@ const visualFixture={
   const stable=await page.evaluate(()=>{const canvas=document.querySelector('#dock canvas');render();render();return canvas===document.querySelector('#dock canvas')});if(!stable)errors.push('Dock canvas recreated on render');
   if(await page.locator('.all-sections').count()||await page.locator('#header [data-layout]').count())errors.push('Removed layout controls still present');
   if(await page.locator('#header [aria-label="Напоминания"]').count()!==1)errors.push('Notification shortcut missing');
+  if(await page.locator('#header [aria-label="Люди"]').count()!==1)errors.push('People shortcut missing');
   await page.locator('#dock [data-voice]').click();
   if(await page.evaluate(()=>page!=='home'))errors.push('Sphere navigated to chat');
   const first=await page.locator('[data-widget=tasks]').boundingBox(),second=await page.locator('[data-widget=next_event]').boundingBox();

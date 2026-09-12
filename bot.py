@@ -1318,12 +1318,55 @@ def animate_configured_emojis(rendered_html, limit):
     return "".join(parts), used
 
 
+_TELEGRAM_HTML_FRAGMENT = re.compile(r"<\s*/?\s*[^<>]+>")
+_TELEGRAM_HTML_TAG_NAME = re.compile(r"<\s*/?\s*([^\s/>]+)")
+_TELEGRAM_HTML_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "span", "tg-spoiler", "a", "code", "pre", "blockquote", "tg-emoji",
+}
+
+
+def safe_telegram_html(text):
+    """Escape tag-looking dynamic text while preserving Telegram's supported markup."""
+    def replace(match):
+        fragment = match.group(0)
+        name = _TELEGRAM_HTML_TAG_NAME.match(fragment)
+        if name and name.group(1).lower() in _TELEGRAM_HTML_TAGS:
+            return fragment
+        return html.escape(fragment, quote=False)
+
+    return _TELEGRAM_HTML_FRAGMENT.sub(replace, str(text or ""))
+
+
 def live_ui_text(text):
     """Apply the user's live emoji palette to fixed Noema screens too."""
     # Interface screens must be consistent from top to bottom.  The 1/3/5/7
     # limit is only for conversational answers, never for lists and menus.
     rendered, _ = animate_configured_emojis(str(text or ""), 10_000)
-    return rendered
+    return safe_telegram_html(rendered)
+
+
+def _is_stale_callback_error(error):
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "query is too old", "response timeout expired", "query id is invalid",
+    ))
+
+
+async def safe_callback_answer(query, *args, **kwargs):
+    """Acknowledge a callback without turning an expired query into a handler crash."""
+    started = time.perf_counter()
+    try:
+        return await query.answer(*args, **kwargs)
+    except BadRequest as error:
+        if not _is_stale_callback_error(error):
+            raise
+        LOGGER.warning("Telegram callback acknowledgement expired; continuing")
+        return None
+    finally:
+        callback_ack_ms = (time.perf_counter() - started) * 1000
+        record_runtime_metric("callback_ack_ms", callback_ack_ms)
+        LOGGER.debug("telemetry callback_ack_ms=%.1f", callback_ack_ms)
 
 
 def live_markup(markup):
@@ -1393,6 +1436,9 @@ class LiveCallbackQuery:
     @property
     def message(self):
         return self._message
+
+    async def answer(self, *args, **kwargs):
+        return await safe_callback_answer(self._query, *args, **kwargs)
 
     async def edit_message_text(self, text, *args, **kwargs):
         rendered = await asyncio.to_thread(live_ui_text, text)
@@ -4654,11 +4700,7 @@ async def today_plan(update,context, day=None):
 
 async def callback(update,context):
 
-    callback_started=time.perf_counter()
-    raw_query=update.callback_query; await raw_query.answer()
-    callback_ack_ms=(time.perf_counter()-callback_started)*1000
-    record_runtime_metric("callback_ack_ms", callback_ack_ms)
-    LOGGER.debug("telemetry callback_ack_ms=%.1f", callback_ack_ms)
+    raw_query=update.callback_query; await safe_callback_answer(raw_query)
     if not str(raw_query.data or "").startswith("ackrem:"):
         await adopt_active_ui(raw_query)
     q=LiveCallbackQuery(raw_query)
@@ -5723,7 +5765,7 @@ async def text_handler(update,context):
         model = t.strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.:-]+", model):
             return await update.effective_message.reply_text(
-                "Не похож на ID модели. Формат: <провайдер>/<модель>, например <code>google/gemini-2.5-flash</code>.",
+                "Не похож на ID модели. Формат: &lt;провайдер&gt;/&lt;модель&gt;, например <code>google/gemini-2.5-flash</code>.",
                 parse_mode="HTML")
         if vision_scope == "shared":
             if cid not in ADMIN_CHAT_IDS:

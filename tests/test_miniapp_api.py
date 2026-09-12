@@ -20,6 +20,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             reset_admin_runtime_config=Mock(return_value={"fields": {}}),
             record_runtime_metric=Mock(), reset_runtime_metric_series=Mock(),
             runtime_metric_export=Mock(return_value={"enabled": True, "metrics": {}}),
+            get_exchange_rate_live=Mock(return_value={
+                "ok": True, "base": "RUB", "quote": "USD", "rate": 0.011,
+            }),
             mint_mistral_realtime_session=Mock(return_value={
                 "token": "rt_scoped", "expires_at": "soon",
                 "model": "voxtral-mini-transcribe-realtime-2602",
@@ -76,6 +79,24 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "home_layout", "args": {"widgets": ["tasks", "people"]}})
         self.assertEqual(response.status, 200)
         self.core.set_app_setting.assert_called_once_with('miniapp_home_widgets:42', '["tasks", "people"]')
+
+    async def test_inline_currency_widget_uses_server_side_live_rate(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "exchange_rate",
+            "args": {"base": "rub", "quote": "usd"},
+        })
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["data"]["rate"], 0.011)
+        self.core.get_exchange_rate_live.assert_called_once_with("RUB", "USD")
+
+    async def test_inline_currency_widget_rejects_invalid_codes(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "exchange_rate",
+            "args": {"base": "RUB<script>", "quote": "USD"},
+        })
+        self.assertEqual(response.status, 400)
+        self.core.get_exchange_rate_live.assert_not_called()
 
     async def test_duplicate_or_unknown_widgets_rejected(self):
         for widgets in [["tasks", "tasks"], ["unknown"], "tasks"]:

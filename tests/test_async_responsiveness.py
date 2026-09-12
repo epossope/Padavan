@@ -6,12 +6,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from telegram.error import Forbidden, TimedOut
+from telegram.error import BadRequest, Forbidden, TimedOut
 
 import bot
 
 
 class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_callback_ack_is_a_soft_failure(self):
+        query = SimpleNamespace(answer=AsyncMock(side_effect=BadRequest(
+            "Query is too old and response timeout expired or query id is invalid"
+        )))
+        result = await bot.safe_callback_answer(query)
+        self.assertIsNone(result)
+        query.answer.assert_awaited_once()
+
+    async def test_unrelated_callback_bad_request_is_not_hidden(self):
+        query = SimpleNamespace(answer=AsyncMock(side_effect=BadRequest("Other bad request")))
+        with self.assertRaises(BadRequest):
+            await bot.safe_callback_answer(query)
+
     async def test_telegram_auto_clears_the_user_model_override(self):
         query = SimpleNamespace(
             answer=AsyncMock(), data="model:auto", edit_message_text=AsyncMock(),
@@ -115,6 +128,13 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
     def test_reminder_tick_is_not_hot_loop(self):
         self.assertGreaterEqual(bot.REMINDER_TICK_SECONDS, 15)
         self.assertLessEqual(bot.REMINDER_TICK_SECONDS, 30)
+
+    def test_dynamic_angle_brackets_are_safe_for_telegram_html(self):
+        rendered = bot.live_ui_text(
+            "Формат: <провайдер>/<модель>; пример: <code>vendor/model</code>."
+        )
+        self.assertIn("&lt;провайдер&gt;/&lt;модель&gt;", rendered)
+        self.assertIn("<code>vendor/model</code>", rendered)
 
 
 class TelemetrySeriesTests(unittest.TestCase):

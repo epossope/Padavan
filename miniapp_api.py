@@ -17,6 +17,7 @@ def register_miniapp(app, core):
     root = Path(__file__).parent / "miniapp"
     locks = {}
     weather_cache = {}
+    exchange_cache = {}
     default_widgets = ["tasks", "next_event", "notes", "reminders", "budget", "recent_saved"]
     widget_types = set(default_widgets) | {"people"}
     client_latency_metrics = {
@@ -218,6 +219,25 @@ def register_miniapp(app, core):
                 result = {"widgets": widgets}
             elif action == "budget":
                 result = await asyncio.to_thread(budget_for, cid, args)
+            elif action == "exchange_rate":
+                base = str(args.get("base", "")).strip().upper()
+                quote = str(args.get("quote", "")).strip().upper()
+                if not (len(base) == len(quote) == 3 and base.isascii() and quote.isascii() and base.isalpha() and quote.isalpha()):
+                    raise ValueError("Некорректная валюта")
+                if base == quote:
+                    result = {"ok": True, "base": base, "quote": quote, "rate": 1.0}
+                else:
+                    key = (base, quote)
+                    cached = exchange_cache.get(key)
+                    if cached and time.monotonic() - cached[0] < 600:
+                        result = cached[1]
+                    else:
+                        result = await asyncio.to_thread(core.get_exchange_rate_live, base, quote)
+                        if not isinstance(result, dict) or not result.get("ok") or not isinstance(result.get("rate"), (int, float)):
+                            raise RuntimeError("Курс временно недоступен")
+                        if len(exchange_cache) >= 64:
+                            exchange_cache.clear()
+                        exchange_cache[key] = (time.monotonic(), result)
             elif action == "weather":
                 city = args.get("city", "")
                 if not isinstance(city, str) or len(city) > 120:
