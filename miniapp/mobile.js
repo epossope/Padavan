@@ -3,6 +3,7 @@
  let pending=null,drag=null,timer=null,frame=null,saving=false;
  const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
  function animatePositions(before){for(const node of document.querySelectorAll('.grid>[data-widget]')){const old=before.get(node),now=node.getBoundingClientRect();if(old&&node!==drag?.node&&!reduced){node.getAnimations().forEach(a=>a.cancel());node.animate([{transform:`translate(${old.left-now.left}px,${old.top-now.top}px)`},{transform:'none'}],{duration:220,easing:'cubic-bezier(.2,.8,.2,1)'})}}}
+ function beginDrag(node,sample){const rect=node.getBoundingClientRect(),ghost=node.cloneNode(true);ghost.removeAttribute('data-widget');ghost.removeAttribute('id');ghost.querySelectorAll('[id]').forEach(n=>n.removeAttribute('id'));ghost.querySelectorAll('button').forEach(n=>n.remove());ghost.className='widget-ghost';ghost.setAttribute('aria-hidden','true');ghost.style.width=rect.width+'px';ghost.style.height=rect.height+'px';document.body.append(ghost);drag={...sample,node,ghost,offsetX:sample.x-rect.left,offsetY:sample.y-rect.top,lastSwap:0};held=true;node.classList.add('widget-placeholder');document.body.classList.add('sorting');tg?.HapticFeedback?.impactOccurred('light');tick()}
  function tick(){if(!drag)return;const d=drag;d.ghost.style.transform=`translate3d(${d.x-d.offsetX}px,${d.y-d.offsetY}px,0) scale(1.025)`;
   const other=document.elementsFromPoint(d.x,d.y).map(n=>n.closest?.('.grid>[data-widget]')).find(n=>n&&n!==d.node);
   if(other&&performance.now()-d.lastSwap>170){const r=other.getBoundingClientRect();if(d.x>r.left+12&&d.x<r.right-12&&d.y>r.top+12&&d.y<r.bottom-12){const nodes=[...d.node.parentNode.children],before=new Map(nodes.map(n=>[n,n.getBoundingClientRect()]));if(nodes.indexOf(d.node)<nodes.indexOf(other))other.after(d.node);else other.before(d.node);animatePositions(before);d.lastSwap=performance.now()}}
@@ -15,15 +16,29 @@
   try{if(cancel){render();return}if(!preview)await api('home_layout',{widgets});data.settings.home_widgets=widgets}
   catch(e){say('Не удалось сохранить порядок. Попробуй ещё раз.');render()}finally{saving=false}
  }
- document.addEventListener('pointerdown',e=>{const node=e.target.closest('.grid>[data-widget]');if(!node||busy||saving||e.button!==0)return;pending={node,id:e.pointerId,x:e.clientX,y:e.clientY};timer=setTimeout(()=>{if(!pending)return;const rect=node.getBoundingClientRect(),ghost=node.cloneNode(true);ghost.removeAttribute('data-widget');ghost.removeAttribute('id');ghost.querySelectorAll('[id]').forEach(n=>n.removeAttribute('id'));ghost.className='widget-ghost';ghost.setAttribute('aria-hidden','true');ghost.style.width=rect.width+'px';ghost.style.height=rect.height+'px';document.body.append(ghost);drag={...pending,ghost,offsetX:pending.x-rect.left,offsetY:pending.y-rect.top,lastSwap:0};held=true;node.classList.add('widget-placeholder');document.body.classList.add('sorting');node.setPointerCapture?.(drag.id);tg?.HapticFeedback?.impactOccurred('light');tick()},420)});
+ document.addEventListener('pointerdown',e=>{const node=e.target.closest('.grid>[data-widget]');if(!node||busy||saving||e.button!==0||e.target.closest('.home-widget-hide'))return;pending={node,id:e.pointerId,x:e.clientX,y:e.clientY,widget:node.dataset.widget};if(window.homeEditing){beginDrag(node,pending);return}timer=setTimeout(()=>{if(!pending)return;pending=null;window.homeEditing=true;held=true;render();tg?.HapticFeedback?.impactOccurred('light');setTimeout(()=>held=false,350)},420)});
  document.addEventListener('pointermove',e=>{if(!pending)return;if(!drag){if(Math.hypot(e.clientX-pending.x,e.clientY-pending.y)>10){clearTimeout(timer);pending=null}return}e.preventDefault();drag.x=e.clientX;drag.y=e.clientY},{passive:false});
  document.addEventListener('pointerup',()=>finish());document.addEventListener('pointercancel',()=>finish(true));document.addEventListener('touchmove',e=>{if(drag)e.preventDefault()},{passive:false});document.addEventListener('contextmenu',e=>{if(e.target.closest('[data-widget]'))e.preventDefault()});
  function viewport(){const v=window.visualViewport;document.documentElement.style.setProperty('--visible-height',(v?.height||innerHeight)+'px');document.documentElement.style.setProperty('--keyboard-inset',Math.max(0,innerHeight-(v?.height||innerHeight)-(v?.offsetTop||0))+'px')}
  window.visualViewport?.addEventListener('resize',viewport);window.visualViewport?.addEventListener('scroll',viewport);window.addEventListener('resize',viewport);viewport();
 
- /* Deliberate edge swipe returns to the preceding screen without stealing ordinary scrolls. */
+ /* iPhone-like edge swipe: lock only after a clear horizontal move and never
+    consume a vertical scroll or a horizontal control gesture. */
  let edgeSwipe=null;
- document.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'||page==='home'||e.clientX>28||e.target.closest('input,textarea,select,dialog,.grid'))return;edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId}}, {passive:true});
- document.addEventListener('pointerup',e=>{if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;const dx=e.clientX-edgeSwipe.x,dy=e.clientY-edgeSwipe.y;edgeSwipe=null;if(dx>92&&Math.abs(dy)<Math.abs(dx)*.55){tg?.HapticFeedback?.impactOccurred('light');back()}}, {passive:true});
+ document.addEventListener('pointerdown',e=>{
+  if(e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>26||e.target.closest('input,textarea,select,dialog,.grid,.chip-row,.segments,.bars'))return;
+  edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,dx:0,dy:0};
+ },{passive:true});
+ document.addEventListener('pointermove',e=>{
+  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
+  edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;
+  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>12)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.18&&edgeSwipe.dx>0?'x':'cancel';
+  if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0)edgeSwipe=null;
+ },{passive:true});
+ document.addEventListener('pointerup',e=>{
+  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
+  const {dx,dy,axis}=edgeSwipe;edgeSwipe=null;
+  if(axis==='x'&&dx>Math.min(82,innerWidth*.21)&&Math.abs(dy)<44){tg?.HapticFeedback?.impactOccurred('light');back()}
+ },{passive:true});
  document.addEventListener('pointercancel',()=>edgeSwipe=null,{passive:true});
 })();

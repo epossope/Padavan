@@ -8,10 +8,16 @@
 
 1. Создайте проект Python в Amvera и подключите этот Git-репозиторий.
 2. В разделе переменных окружения задайте `TELEGRAM_BOT_TOKEN` и
-   `OPENROUTER_API_KEY`. Не загружайте `.env` и не коммитьте ключи.
-3. При желании задайте `MODEL`, `FALLBACK_MODELS`, `VISION_MODEL`,
-   `AVAILABLE_MODELS`, `TIMEZONE`, `DEFAULT_CITY` и `CHAT_MAX_TOKENS`.
-4. Разверните проект. После первого успешного запуска, если переносится
+   `OPENROUTER_API_KEY`. Для Mini App задайте публичный HTTPS origin в
+   `QUICK_ACTIONS_BASE_URL`. Не загружайте `.env` и не коммитьте ключи.
+3. Production voice использует `BATCH_STT_MODEL` и
+   `BATCH_STT_TIMEOUT_SEC`. Существующий `STT_MODEL` поддерживается только
+   как compatibility alias на один релиз и должен быть заменён новым именем.
+4. `MISTRAL_API_KEY`, `MISTRAL_REALTIME_MODEL` и
+   `MISTRAL_CLIENT_SESSIONS_URL` нужны только для admin-only Experimental
+   Realtime Beta. Обычный tap-to-talk от них не зависит.
+5. Полный перечень и статусы переменных — в [ENV_AUDIT.md](ENV_AUDIT.md).
+6. Разверните проект. После первого успешного запуска, если переносится
    существующая память, загрузите `noema_test.sqlite3` в раздел **Data**
    Amvera как `/data/noema_test.sqlite3` и перезапустите приложение.
 

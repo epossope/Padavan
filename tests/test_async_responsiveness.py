@@ -1,0 +1,227 @@
+import ast
+import asyncio
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from telegram.error import BadRequest, Forbidden, TimedOut
+
+import bot
+
+
+class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_callback_ack_is_a_soft_failure(self):
+        query = SimpleNamespace(answer=AsyncMock(side_effect=BadRequest(
+            "Query is too old and response timeout expired or query id is invalid"
+        )))
+        result = await bot.safe_callback_answer(query)
+        self.assertIsNone(result)
+        query.answer.assert_awaited_once()
+
+    async def test_unrelated_callback_bad_request_is_not_hidden(self):
+        query = SimpleNamespace(answer=AsyncMock(side_effect=BadRequest("Other bad request")))
+        with self.assertRaises(BadRequest):
+            await bot.safe_callback_answer(query)
+
+    async def test_telegram_auto_clears_the_user_model_override(self):
+        query = SimpleNamespace(
+            answer=AsyncMock(), data="model:auto", edit_message_text=AsyncMock(),
+            message=SimpleNamespace(chat_id=42, message_id=7),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=None)
+        router = SimpleNamespace(set_primary=Mock())
+        with patch.object(bot, "ADMIN_CHAT_IDS", {42}), \
+             patch.object(bot, "adopt_active_ui", new=AsyncMock()), \
+             patch.object(bot, "register_bot_user"), \
+             patch.object(bot, "model_router", return_value=router), \
+             patch.object(bot, "effective_user_ai_config", return_value={"effective_model": {"value": "admin-fast", "source": "ADMIN"}}), \
+             patch.object(bot, "live_ui_text", side_effect=lambda value: value), \
+             patch.object(bot, "live_markup", side_effect=lambda value: value), \
+             patch.object(bot, "set_active_ui_message_id"):
+            await bot.callback(update, SimpleNamespace())
+        router.set_primary.assert_called_once_with(42, "")
+        query.edit_message_text.assert_awaited_once()
+        self.assertIn("Автоматический режим", query.edit_message_text.await_args.args[0])
+
+    async def test_telegram_send_has_one_bounded_retry(self):
+        telegram = SimpleNamespace(send_message=AsyncMock(side_effect=[TimedOut("slow"), SimpleNamespace(message_id=9)]))
+        with patch.object(bot, "TELEGRAM_SEND_RETRIES", 1), patch.object(bot.secrets, "randbelow", return_value=0), patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep:
+            sent = await bot.telegram_send_with_retry(telegram, source="test", chat_id=42, text="ok")
+        self.assertEqual(sent.message_id, 9)
+        self.assertEqual(telegram.send_message.await_count, 2)
+        sleep.assert_awaited_once()
+
+    async def test_replace_active_ui_absorbs_final_timeout(self):
+        telegram = SimpleNamespace(delete_message=AsyncMock(), send_message=AsyncMock(side_effect=TimedOut("slow")))
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42))
+        context = SimpleNamespace(bot=telegram)
+        with patch.object(bot, "TELEGRAM_SEND_RETRIES", 0), patch.object(bot, "active_ui_message_id", return_value=0):
+            result = await bot.replace_active_ui(update, context, "Меню", None)
+        self.assertIsNone(result)
+        telegram.send_message.assert_awaited_once()
+
+    async def test_replace_active_ui_absorbs_forbidden(self):
+        telegram = SimpleNamespace(delete_message=AsyncMock(), send_message=AsyncMock(side_effect=Forbidden("blocked")))
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42))
+        context = SimpleNamespace(bot=telegram)
+        with patch.object(bot, "active_ui_message_id", return_value=0), patch.object(bot, "set_app_setting") as unavailable:
+            result = await bot.replace_active_ui(update, context, "Меню", None)
+        self.assertIsNone(result)
+        unavailable.assert_called_once()
+
+    async def test_event_loop_lag_metric_is_recorded(self):
+        loop = asyncio.get_running_loop()
+        context = SimpleNamespace(job=SimpleNamespace(data={"expected": loop.time() - 0.02}))
+        await bot.event_loop_lag_tick(context)
+        self.assertGreaterEqual(bot.RUNTIME_METRICS["event_loop_lag_ms"]["value_ms"], 15)
+
+    async def test_voice_callback_and_reminder_work_do_not_starve_loop(self):
+        async def slow_send(**_):
+            await asyncio.sleep(0.03)
+            return SimpleNamespace(message_id=10)
+
+        telegram = SimpleNamespace(send_message=AsyncMock(side_effect=slow_send))
+        reminder_context = SimpleNamespace(bot=telegram)
+        rows = [{"id": index, "chat_id": 42 + index, "text": "Проверка"} for index in range(8)]
+        query = SimpleNamespace(
+            answer=AsyncMock(), data="ui:close",
+            message=SimpleNamespace(chat_id=42, message_id=1, delete=AsyncMock()),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=None)
+        callback_context = SimpleNamespace()
+        loop_delays = []
+
+        async def heartbeat():
+            expected = asyncio.get_running_loop().time()
+            for _ in range(12):
+                expected += 0.01
+                await asyncio.sleep(0.01)
+                loop_delays.append(max(0, asyncio.get_running_loop().time() - expected))
+
+        with patch.object(bot, "due_reminder_rows", return_value=(rows, [])), \
+             patch.object(bot, "mark_reminder_delivered"), \
+             patch.object(bot, "adopt_active_ui", new=AsyncMock()), \
+             patch.object(bot, "register_bot_user"), \
+             patch.object(bot, "set_active_ui_message_id"):
+            await asyncio.gather(
+                bot.reminder_tick(reminder_context),
+                asyncio.to_thread(time.sleep, 0.08),
+                bot.callback(update, callback_context),
+                heartbeat(),
+            )
+        query.answer.assert_awaited_once()
+        self.assertLess(max(loop_delays), 0.05)
+
+    def test_async_functions_do_not_call_requests_or_time_sleep(self):
+        tree = ast.parse(Path(bot.__file__).read_text(encoding="utf-8"))
+        violations = []
+        for function in (node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)):
+            for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
+                target = call.func
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    if (target.value.id, target.attr) in {("requests", "get"), ("requests", "post"), ("requests", "request"), ("time", "sleep")}:
+                        violations.append((function.name, call.lineno))
+        self.assertEqual(violations, [])
+
+    def test_reminder_tick_is_not_hot_loop(self):
+        self.assertGreaterEqual(bot.REMINDER_TICK_SECONDS, 15)
+        self.assertLessEqual(bot.REMINDER_TICK_SECONDS, 30)
+
+    def test_dynamic_angle_brackets_are_safe_for_telegram_html(self):
+        rendered = bot.live_ui_text(
+            "Формат: <провайдер>/<модель>; пример: <code>vendor/model</code>."
+        )
+        self.assertIn("&lt;провайдер&gt;/&lt;модель&gt;", rendered)
+        self.assertIn("<code>vendor/model</code>", rendered)
+
+
+class TelemetrySeriesTests(unittest.TestCase):
+    def setUp(self):
+        self.original_enabled = bot.TELEMETRY_ENABLED
+        bot.TELEMETRY_ENABLED = True
+        bot.reset_runtime_metric_series()
+
+    def tearDown(self):
+        bot.reset_runtime_metric_series()
+        bot.TELEMETRY_ENABLED = self.original_enabled
+
+    def test_export_has_bounded_numeric_latency_aggregates_only(self):
+        for value in (10, 20, 30, 40, 50):
+            bot.record_runtime_metric("llm_total_ms", value, chat_id=42, text="never exported")
+        bot.record_runtime_metric("untracked_metric", 999)
+
+        exported = bot.runtime_metric_export()
+        llm = exported["metrics"]["llm_total_ms"]
+        self.assertEqual(llm, {"count": 5, "avg": 30.0, "p50": 30.0, "p95": 48.0, "max": 50.0})
+        self.assertEqual(exported["metrics"]["tool_execution_ms"]["count"], 0)
+        self.assertIn("tts_queue_wait_ms", exported["groups"]["latency"])
+        self.assertIn("tts_prepare_ms", exported["groups"]["latency"])
+        self.assertIn("tts_first_chunk_ms", exported["groups"]["latency"])
+        self.assertIn("tts_engine_name", exported["groups"]["latency"])
+        self.assertIn("speech_text_length_chars", exported["groups"]["latency"])
+        self.assertIn("voice_robustness", exported["groups"])
+        self.assertIn("barge_in_duration_ms", exported["groups"]["voice_robustness"])
+        self.assertNotIn("untracked_metric", exported["metrics"])
+        serialized = repr(exported).lower()
+        self.assertNotIn("chat_id", serialized)
+        self.assertNotIn("never exported", serialized)
+
+    def test_disabled_telemetry_does_not_append_samples(self):
+        bot.TELEMETRY_ENABLED = False
+        bot.record_runtime_metric("llm_total_ms", 12)
+        self.assertEqual(bot.runtime_metric_export()["metrics"]["llm_total_ms"]["count"], 0)
+
+
+class TelemetryCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.original_enabled = bot.TELEMETRY_ENABLED
+        self.original_admins = bot.ADMIN_CHAT_IDS
+        bot.TELEMETRY_ENABLED = True
+        bot.ADMIN_CHAT_IDS = {42}
+        bot.reset_runtime_metric_series()
+
+    def tearDown(self):
+        bot.reset_runtime_metric_series()
+        bot.TELEMETRY_ENABLED = self.original_enabled
+        bot.ADMIN_CHAT_IDS = self.original_admins
+
+    @staticmethod
+    def update(chat_id=42):
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=chat_id),
+            effective_message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+    async def test_reset_clears_only_numeric_samples_and_returns_timestamp(self):
+        bot.record_runtime_metric("llm_total_ms", 77, text="not telemetry")
+        update = self.update()
+        await bot.telemetry_reset_command(update, SimpleNamespace())
+        exported = bot.runtime_metric_export()
+        self.assertTrue(exported["enabled"])
+        self.assertTrue(exported["started_at"].endswith("Z"))
+        self.assertEqual(exported["metrics"]["llm_total_ms"]["count"], 0)
+        message = update.effective_message.reply_text.await_args.args[0]
+        self.assertIn("Telemetry reset", message)
+        self.assertNotIn("not telemetry", message)
+
+    async def test_status_and_report_are_admin_only_and_content_free(self):
+        bot.record_runtime_metric("llm_total_ms", 10, text="private text")
+        bot.record_runtime_metric("llm_total_ms", 30, audio="payload")
+        admin = self.update()
+        await bot.telemetry_status_command(admin, SimpleNamespace())
+        await bot.telemetry_report_command(admin, SimpleNamespace())
+        report = admin.effective_message.reply_text.await_args.args[0]
+        self.assertIn("count 2", report)
+        self.assertIn("avg 20.0 ms", report)
+        self.assertIn("Voice robustness", report)
+        self.assertNotIn("private text", report)
+        self.assertNotIn("payload", report)
+        outsider = self.update(chat_id=99)
+        await bot.telemetry_report_command(outsider, SimpleNamespace())
+        outsider.effective_message.reply_text.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main()

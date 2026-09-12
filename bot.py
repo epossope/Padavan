@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import contextlib
+from collections import deque
 
 import base64
 
@@ -54,9 +55,9 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
 
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
 from aiohttp import web
 from cryptography.fernet import Fernet, InvalidToken
@@ -72,6 +73,9 @@ from url_enricher import HttpUrlEnricher
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
+from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
+                               iter_sse_json, sanitize_assistant_message,
+                               sanitize_visible_content)
 
 
 
@@ -95,16 +99,64 @@ try:
 except ValueError:
     USER_MONTHLY_LIMIT_USD = 2.0
 
-MODEL = os.getenv("MODEL", "minimax/minimax-m3:free").strip()
+def csv_env(name):
+    return tuple(value.strip() for value in os.getenv(name, "").split(",") if value.strip())
 
-FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", "").split(",") if x.strip()]
+
+def bool_env(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_first(*names, default=""):
+    """Return the first non-empty environment value, in precedence order."""
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return default
+
+
+DEFAULT_FAST_MODEL = "qwen/qwen3.5-flash-02-23"
+DEFAULT_STRONG_MODEL = "deepseek/deepseek-v3.2"
+LEGACY_FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", "").split(",") if x.strip()]
+FAST_MODEL = env_first("FAST_MODEL", "MODEL", default=DEFAULT_FAST_MODEL)
+STRONG_MODEL = env_first("STRONG_MODEL", default=(LEGACY_FALLBACK_MODELS[0] if LEGACY_FALLBACK_MODELS else DEFAULT_STRONG_MODEL))
+FAST_MODEL_PROVIDERS = csv_env("FAST_MODEL_PROVIDERS")
+STRONG_MODEL_PROVIDERS = csv_env("STRONG_MODEL_PROVIDERS")
+FAST_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("FAST_MODEL_ALLOW_PROVIDER_FALLBACK", False)
+STRONG_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK", True)
 
 VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 
 VISION_FALLBACK_MODELS = [x.strip() for x in os.getenv("VISION_FALLBACK_MODELS", "google/gemini-2.5-flash-lite").split(",") if x.strip()]
 
-STT_MODEL = os.getenv("STT_MODEL", "mistralai/voxtral-mini-transcribe").strip()
-
+# Production speech uses only the reliable OpenRouter batch path.  STT_MODEL is
+# deliberately retained as a one-release compatibility alias for existing
+# Amvera Secrets; BATCH_STT_* are the canonical names from this release on.
+BATCH_STT_MODEL = env_first("BATCH_STT_MODEL", "STT_MODEL", default="mistralai/voxtral-mini-transcribe")
+try:
+    BATCH_STT_TIMEOUT_SEC = max(15, int(env_first("BATCH_STT_TIMEOUT_SEC", default="180")))
+except ValueError:
+    BATCH_STT_TIMEOUT_SEC = 180
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-transcribe-realtime-2602").strip()
+MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
+TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lower()
+TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
+TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
+TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
+TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
+TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
+TELEGRAM_READ_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15")))
+TELEGRAM_WRITE_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "15")))
+TELEGRAM_POOL_TIMEOUT = max(1.0, float(os.getenv("TELEGRAM_POOL_TIMEOUT", "3")))
+TELEGRAM_CONNECTION_POOL_SIZE = max(8, int(os.getenv("TELEGRAM_CONNECTION_POOL_SIZE", "32")))
+REMINDER_TICK_SECONDS = min(30, max(15, int(os.getenv("REMINDER_TICK_SECONDS", "20"))))
 VOICE = os.getenv("EDGE_VOICE", "ru-RU-DmitryNeural").strip()
 
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Amsterdam").strip()
@@ -127,18 +179,53 @@ DB = PERSISTENT_ROOT / "noema_test.sqlite3"
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
-STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+BATCH_STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 MANAGED_KEY_LOCK = threading.RLock()
+ACTIVE_DRAFTS_LOCK = threading.RLock()
+ACTIVE_DRAFTS = {}
+ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
+ACTIVE_STREAM_RESPONSES = {}
+RUNTIME_METRICS = {}
+LATENCY_METRICS = (
+    "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
+    "stt_first_partial_ms", "stt_final_ms", "context_build_ms",
+    "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
+    "llm_total_ms", "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
+    "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+    "speech_text_length_chars", "total_response_start_ms", "total_ms",
+)
+VOICE_ROBUSTNESS_METRICS = (
+    "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
+    "barge_in_rms", "barge_in_vad_probability", "audio_capture_sample_rate_hz",
+    "stt_stream_sample_rate_hz", "vad_engine", "vad_engine_name",
+    "vad_fallback_reason", "vad_fallback_reason_code",
+    "noise_floor_rms", "speech_start_probability", "speech_start_rms",
+    "realtime_empty_final_count", "realtime_fallback_batch_count",
+    "batch_fallback_success_count", "stt_ws_connect_ms", "vosk_load_ms",
+    "silero_load_ms", "get_user_media_ms", "mic_permission_ms",
+    "conversation_ready_ms",
+)
+TELEMETRY_METRICS = LATENCY_METRICS + VOICE_ROBUSTNESS_METRICS
+TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+try:
+    TELEMETRY_SERIES_LIMIT = min(10000, max(50, int(os.getenv("TELEMETRY_SERIES_LIMIT", "2048"))))
+except ValueError:
+    TELEMETRY_SERIES_LIMIT = 2048
+RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in TELEMETRY_METRICS}
+RUNTIME_METRICS_LOCK = threading.Lock()
+# This is deliberately process-local: benchmark metadata must not create or
+# mutate user records in SQLite. A restart simply requires a new reset.
+TELEMETRY_BENCHMARK_STARTED_AT = None
 
 
 
 LOGGER = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = [x.strip() for x in os.getenv(
-    "AVAILABLE_MODELS",
-    "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-sonnet-4,openai/gpt-4.1"
-).split(",") if x.strip()]
+AVAILABLE_MODELS = list(csv_env("MODEL_CATALOG") or csv_env("AVAILABLE_MODELS") or (
+    "google/gemini-2.5-flash", "google/gemini-2.5-pro",
+    "anthropic/claude-sonnet-4", "openai/gpt-4.1",
+))
 
 
 
@@ -514,7 +601,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
 
 
 
@@ -733,11 +820,336 @@ def app_setting(key, default=""):
     return row["setting_value"] if row else default
 
 
-def set_app_setting(key, value):
+def set_app_setting(key, value, updated_by=None):
     with conn() as c:
-        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) "
-                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
-                  (key, value, datetime.now(timezone.utc).isoformat()))
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(app_settings)").fetchall()}
+        if "updated_by" not in columns:
+            c.execute("ALTER TABLE app_settings ADD COLUMN updated_by INTEGER")
+        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at,updated_by) VALUES(?,?,?,?) "
+                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+                  (key, value, datetime.now(timezone.utc).isoformat(), updated_by))
+
+
+RUNTIME_CONFIG_KEY = "admin_runtime_config_v1"
+RUNTIME_CONFIG_FIELDS = (
+    "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
+    "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
+    "vision_model", "vision_fallback_models", "batch_stt_model",
+    "tts_provider", "tts_fallback_provider", "tts_voice", "default_voice_reply_mode",
+    "realtime_model", "model_catalog",
+)
+_MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,200}$")
+_PROVIDER_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,120}$")
+
+
+def _env_is_set(*names):
+    return any(bool((os.getenv(name) or "").strip()) for name in names)
+
+
+def _runtime_env_defaults():
+    """Safe startup values and their provenance; no secrets are represented here."""
+    return {
+        "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL", "MODEL") else "DEFAULT"),
+        "fast_model_providers": (list(FAST_MODEL_PROVIDERS), "ENV" if _env_is_set("FAST_MODEL_PROVIDERS") else "DEFAULT"),
+        "fast_model_allow_provider_fallback": (FAST_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("FAST_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
+        "strong_model": (STRONG_MODEL, "ENV" if _env_is_set("STRONG_MODEL", "FALLBACK_MODELS") else "DEFAULT"),
+        "strong_model_providers": (list(STRONG_MODEL_PROVIDERS), "ENV" if _env_is_set("STRONG_MODEL_PROVIDERS") else "DEFAULT"),
+        "strong_model_allow_provider_fallback": (STRONG_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
+        "vision_model": (VISION_MODEL, "ENV" if _env_is_set("VISION_MODEL") else "DEFAULT"),
+        "vision_fallback_models": (list(VISION_FALLBACK_MODELS), "ENV" if _env_is_set("VISION_FALLBACK_MODELS") else "DEFAULT"),
+        "batch_stt_model": (BATCH_STT_MODEL, "ENV" if _env_is_set("BATCH_STT_MODEL", "STT_MODEL") else "DEFAULT"),
+        "tts_provider": (TTS_PROVIDER, "ENV" if _env_is_set("TTS_PROVIDER") else "DEFAULT"),
+        "tts_fallback_provider": (TTS_FALLBACK_PROVIDER, "ENV" if _env_is_set("TTS_FALLBACK_PROVIDER") else "DEFAULT"),
+        "tts_voice": (VOICE, "ENV" if _env_is_set("EDGE_VOICE") else "DEFAULT"),
+        "default_voice_reply_mode": (DEFAULT_MODE, "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
+        "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
+        "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
+    }
+
+
+def _runtime_config_record():
+    with conn() as c:
+        try:
+            row = c.execute("SELECT setting_value,updated_at,updated_by FROM app_settings WHERE setting_key=?", (RUNTIME_CONFIG_KEY,)).fetchone()
+        except sqlite3.OperationalError:
+            row = c.execute("SELECT setting_value,updated_at FROM app_settings WHERE setting_key=?", (RUNTIME_CONFIG_KEY,)).fetchone()
+    if not row:
+        return {"overrides": {}, "updated_at": "", "updated_by": None}
+    try:
+        value = json.loads(row["setting_value"])
+    except (TypeError, ValueError):
+        value = {}
+    overrides = value.get("overrides", {}) if isinstance(value, dict) else {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    return {"overrides": overrides, "updated_at": row["updated_at"] or "", "updated_by": row["updated_by"] if "updated_by" in row.keys() else None}
+
+
+def runtime_config_snapshot():
+    """Return the live, safe effective settings for API/UI and request routing."""
+    defaults, record = _runtime_env_defaults(), _runtime_config_record()
+    fields = {}
+    for field, (value, source) in defaults.items():
+        if field in record["overrides"]:
+            value, source = record["overrides"][field], "ADMIN"
+        fields[field] = {"value": value, "source": source}
+    return {"fields": fields, "updated_at": record["updated_at"], "updated_by": record["updated_by"]}
+
+
+def runtime_config_values():
+    return {field: entry["value"] for field, entry in runtime_config_snapshot()["fields"].items()}
+
+
+def _normalise_runtime_config_value(field, value):
+    if field not in RUNTIME_CONFIG_FIELDS:
+        raise ValueError("Unknown runtime configuration field")
+    if field in {"fast_model", "strong_model", "vision_model", "batch_stt_model", "realtime_model", "tts_voice"}:
+        clean = str(value or "").strip()
+        if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
+            raise ValueError("Invalid model or voice value")
+        return clean
+    if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models", "model_catalog"}:
+        raw = value if isinstance(value, list) else str(value or "").split(",")
+        clean = [str(item).strip() for item in raw if str(item).strip()]
+        if len(clean) > 30 or any(not _PROVIDER_VALUE_RE.fullmatch(item) for item in clean):
+            raise ValueError("Invalid provider or model catalogue")
+        return clean
+    if field in {"fast_model_allow_provider_fallback", "strong_model_allow_provider_fallback"}:
+        if isinstance(value, bool):
+            return value
+        if str(value).strip().lower() in {"true", "1", "yes", "on"}:
+            return True
+        if str(value).strip().lower() in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("Invalid boolean")
+    if field == "default_voice_reply_mode":
+        clean = str(value or "").strip().lower()
+        if clean not in {"text", "voice", "voice_and_text", "auto"}:
+            raise ValueError("Invalid voice reply mode")
+        return clean
+    if field in {"tts_provider", "tts_fallback_provider"}:
+        clean = str(value or "").strip().lower()
+        allowed = {"edge", "browser"} if field == "tts_provider" else {"edge", "browser", "none"}
+        if clean not in allowed:
+            raise ValueError("Invalid TTS provider")
+        return clean
+    raise ValueError("Unknown runtime configuration field")
+
+
+def set_admin_runtime_config(updated_by, field, value):
+    clean = _normalise_runtime_config_value(field, value)
+    record = _runtime_config_record()
+    record["overrides"][field] = clean
+    set_app_setting(RUNTIME_CONFIG_KEY, json.dumps({"overrides": record["overrides"]}, ensure_ascii=False), int(updated_by))
+    return runtime_config_snapshot()
+
+
+def reset_admin_runtime_config(updated_by, field):
+    if field not in RUNTIME_CONFIG_FIELDS:
+        raise ValueError("Unknown runtime configuration field")
+    record = _runtime_config_record()
+    record["overrides"].pop(field, None)
+    set_app_setting(RUNTIME_CONFIG_KEY, json.dumps({"overrides": record["overrides"]}, ensure_ascii=False), int(updated_by))
+    return runtime_config_snapshot()
+
+
+def active_ui_message_id(chat_id):
+    value = app_setting(f"active_ui_message:{chat_id}")
+    return int(value) if str(value).isdigit() else 0
+
+
+def set_active_ui_message_id(chat_id, message_id=0):
+    set_app_setting(f"active_ui_message:{chat_id}", str(int(message_id or 0)))
+
+
+def record_runtime_metric(name, value_ms, **detail):
+    sample = {"value_ms": max(0, round(float(value_ms), 1)), "at": time.time(), **detail}
+    RUNTIME_METRICS[name] = sample
+    if TELEMETRY_ENABLED and name in RUNTIME_METRIC_SERIES:
+        with RUNTIME_METRICS_LOCK:
+            RUNTIME_METRIC_SERIES[name].append(sample["value_ms"])
+    return sample
+
+
+def reset_runtime_metric_series():
+    """Clear only in-memory numeric samples and mark a fresh benchmark start."""
+    global TELEMETRY_BENCHMARK_STARTED_AT
+    started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    with RUNTIME_METRICS_LOCK:
+        for values in RUNTIME_METRIC_SERIES.values():
+            values.clear()
+        TELEMETRY_BENCHMARK_STARTED_AT = started_at
+    return started_at
+
+
+def _latency_percentile(values, percentile):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower, upper = int(index), min(len(ordered) - 1, int(index) + 1)
+    if lower == upper:
+        return round(ordered[lower], 1)
+    weight = index - lower
+    return round(ordered[lower] * (1 - weight) + ordered[upper] * weight, 1)
+
+
+def runtime_metric_export():
+    with RUNTIME_METRICS_LOCK:
+        series = {name: list(values) for name, values in RUNTIME_METRIC_SERIES.items()}
+        started_at = TELEMETRY_BENCHMARK_STARTED_AT
+    return {
+        "enabled": TELEMETRY_ENABLED,
+        "series_limit": TELEMETRY_SERIES_LIMIT,
+        "started_at": started_at,
+        "groups": {
+            "latency": list(LATENCY_METRICS),
+            "voice_robustness": list(VOICE_ROBUSTNESS_METRICS),
+        },
+        "metrics": {
+            name: {
+                "count": len(values),
+                "avg": round(sum(values) / len(values), 1) if values else None,
+                "p50": _latency_percentile(values, 0.50),
+                "p95": _latency_percentile(values, 0.95),
+                "max": round(max(values), 1) if values else None,
+            }
+            for name, values in series.items()
+        },
+    }
+
+
+async def telegram_send_with_retry(bot, source="telegram", **kwargs):
+    """Send without monopolizing handlers; retry only transient Telegram transport errors."""
+    kwargs.setdefault("connect_timeout", TELEGRAM_CONNECT_TIMEOUT)
+    kwargs.setdefault("read_timeout", TELEGRAM_READ_TIMEOUT)
+    kwargs.setdefault("write_timeout", TELEGRAM_WRITE_TIMEOUT)
+    kwargs.setdefault("pool_timeout", TELEGRAM_POOL_TIMEOUT)
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        started = time.perf_counter()
+        try:
+            sent = await bot.send_message(**kwargs)
+            elapsed = (time.perf_counter() - started) * 1000
+            record_runtime_metric("telegram_send_ms", elapsed, source=source, attempt=attempt)
+            if elapsed > 2000:
+                LOGGER.warning("telemetry telegram_send_ms=%.1f source=%s attempt=%d", elapsed, source, attempt)
+            else:
+                LOGGER.debug("telemetry telegram_send_ms=%.1f source=%s attempt=%d", elapsed, source, attempt)
+            return sent
+        except Forbidden:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source=source, attempt=attempt, error="forbidden")
+            raise
+        except (TimedOut, NetworkError) as exc:
+            elapsed = (time.perf_counter() - started) * 1000
+            record_runtime_metric("telegram_send_ms", elapsed, source=source, attempt=attempt, error=type(exc).__name__)
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                raise
+            delay = 0.15 * (2 ** attempt) + secrets.randbelow(80) / 1000
+            LOGGER.warning("Telegram send retry source=%s attempt=%d delay_ms=%d", source, attempt + 1, round(delay * 1000))
+            await asyncio.sleep(delay)
+
+
+async def replace_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
+    """Keep exactly one persistent inline control window per private chat."""
+    chat_id = update.effective_chat.id
+    previous_id = await asyncio.to_thread(active_ui_message_id, chat_id)
+    if previous_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+        except (BadRequest, Forbidden):
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Telegram delete delayed chat_id=%s", chat_id)
+    try:
+        rendered_text, rendered_markup = await asyncio.to_thread(
+            lambda: (live_ui_text(text), live_markup(reply_markup)))
+        sent = await telegram_send_with_retry(
+            context.bot, source="replace_active_ui", chat_id=chat_id,
+            text=rendered_text, reply_markup=rendered_markup, parse_mode=parse_mode,
+        )
+    except Forbidden:
+        await asyncio.to_thread(set_app_setting, f"telegram_destination_unavailable:{chat_id}", datetime.now(timezone.utc).isoformat())
+        LOGGER.warning("Telegram destination unavailable chat_id=%s source=replace_active_ui", chat_id)
+        return None
+    except (TimedOut, NetworkError):
+        LOGGER.warning("Telegram UI send timed out chat_id=%s after bounded retry", chat_id)
+        return None
+    await asyncio.to_thread(set_active_ui_message_id, chat_id, sent.message_id)
+    return sent
+
+
+async def refresh_active_ui(update, context, text, reply_markup, parse_mode="HTML"):
+    """Edit the current control window after a form-style text response."""
+    chat_id = update.effective_chat.id
+    message_id = await asyncio.to_thread(active_ui_message_id, chat_id)
+    if message_id:
+        try:
+            rendered_text, rendered_markup = await asyncio.to_thread(
+                lambda: (live_ui_text(text), live_markup(reply_markup)))
+            return await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=rendered_text,
+                reply_markup=rendered_markup,
+                parse_mode=parse_mode,
+            )
+        except Forbidden:
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+            return None
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Telegram UI edit timed out chat_id=%s; keeping existing control", chat_id)
+            return None
+        except BadRequest:
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
+    return await replace_active_ui(update, context, text, reply_markup, parse_mode)
+
+
+async def adopt_active_ui(query):
+    """Make a clicked legacy inline screen the sole active window."""
+    if not query.message:
+        return
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+    previous_id = await asyncio.to_thread(active_ui_message_id, chat_id)
+    if previous_id and previous_id != message_id:
+        with contextlib.suppress(Exception):
+            await query.get_bot().delete_message(chat_id=chat_id, message_id=previous_id)
+    await asyncio.to_thread(set_active_ui_message_id, chat_id, message_id)
+
+
+async def delete_ephemeral_job(context):
+    data = context.job.data or {}
+    with contextlib.suppress(Exception):
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+
+
+def schedule_ephemeral_delete(context, message, delay=240):
+    """Remove momentary confirmations without blocking the update handler."""
+    job_queue = getattr(context, "job_queue", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    if job_queue and chat_id and message_id:
+        job_queue.run_once(
+            delete_ephemeral_job,
+            when=delay,
+            data={"chat_id": int(chat_id), "message_id": int(message_id)},
+            name=f"ephemeral:{chat_id}:{message_id}",
+        )
+
+
+EPHEMERAL_CONFIRMATION_PREFIXES = (
+    "Напоминание поставлено", "Задача добавлена", "Заметка сохранена",
+    "Записала расход", "Записала поступление", "Обновила расход",
+    "Сохранила данные", "Записала взаимодействие", "Правило добавлено",
+    "Правило обновлено", "Правило удалено", "Часовой пояс изменён",
+)
+
+
+def is_ephemeral_confirmation(text):
+    compact = str(text or "").strip()
+    return bool(compact) and any(compact.startswith(prefix) for prefix in EPHEMERAL_CONFIRMATION_PREFIXES)
 
 
 EMOJI_SLOT_GROUPS = {
@@ -754,7 +1166,7 @@ EMOJI_SLOT_NAMES = {slot: label for group in EMOJI_SLOT_GROUPS.values() for slot
 # configured menu icon animate the same symbol in headings and notices.
 EMOJI_SLOT_BY_FALLBACK = {
     "📅": "today", "🌅": "briefing", "⚙️": "settings", "☰": "more",
-    "✅": "done", "◻️": "open", "❌": "failed", "⏰": "reminders",
+    "✅": "tasks", "◻️": "open", "❌": "failed", "⏰": "reminders",
     "👥": "people", "📝": "notes", "💳": "budget", "🧠": "model",
     "👁": "vision", "🔊": "replymode", "📜": "rules", "📱": "iphone",
     "🔐": "keys", "🧹": "clear",
@@ -819,8 +1231,8 @@ def interface_inline_button(slot, fallback, text, callback_data):
 def main_keyboard():
     """Build the persistent keyboard with optional Telegram custom-emoji icons."""
     return ReplyKeyboardMarkup([
-        [interface_button("briefing", "🌅", "Брифинг"), interface_button("today", "📅", "Сегодня")],
-        [interface_button("settings", "⚙️", "Настройки"), interface_button("more", "☰", "Ещё")],
+        [interface_button("today", "📅", "Сегодня"), interface_button("more", "☰", "Ещё"),
+         interface_button("settings", "⚙️", "Настройки")],
     ], resize_keyboard=True, is_persistent=True)
 
 
@@ -906,10 +1318,55 @@ def animate_configured_emojis(rendered_html, limit):
     return "".join(parts), used
 
 
+_TELEGRAM_HTML_FRAGMENT = re.compile(r"<\s*/?\s*[^<>]+>")
+_TELEGRAM_HTML_TAG_NAME = re.compile(r"<\s*/?\s*([^\s/>]+)")
+_TELEGRAM_HTML_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "span", "tg-spoiler", "a", "code", "pre", "blockquote", "tg-emoji",
+}
+
+
+def safe_telegram_html(text):
+    """Escape tag-looking dynamic text while preserving Telegram's supported markup."""
+    def replace(match):
+        fragment = match.group(0)
+        name = _TELEGRAM_HTML_TAG_NAME.match(fragment)
+        if name and name.group(1).lower() in _TELEGRAM_HTML_TAGS:
+            return fragment
+        return html.escape(fragment, quote=False)
+
+    return _TELEGRAM_HTML_FRAGMENT.sub(replace, str(text or ""))
+
+
 def live_ui_text(text):
     """Apply the user's live emoji palette to fixed Noema screens too."""
-    rendered, _ = animate_configured_emojis(str(text or ""), 7)
-    return rendered
+    # Interface screens must be consistent from top to bottom.  The 1/3/5/7
+    # limit is only for conversational answers, never for lists and menus.
+    rendered, _ = animate_configured_emojis(str(text or ""), 10_000)
+    return safe_telegram_html(rendered)
+
+
+def _is_stale_callback_error(error):
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "query is too old", "response timeout expired", "query id is invalid",
+    ))
+
+
+async def safe_callback_answer(query, *args, **kwargs):
+    """Acknowledge a callback without turning an expired query into a handler crash."""
+    started = time.perf_counter()
+    try:
+        return await query.answer(*args, **kwargs)
+    except BadRequest as error:
+        if not _is_stale_callback_error(error):
+            raise
+        LOGGER.warning("Telegram callback acknowledgement expired; continuing")
+        return None
+    finally:
+        callback_ack_ms = (time.perf_counter() - started) * 1000
+        record_runtime_metric("callback_ack_ms", callback_ack_ms)
+        LOGGER.debug("telemetry callback_ack_ms=%.1f", callback_ack_ms)
 
 
 def live_markup(markup):
@@ -956,12 +1413,15 @@ class LiveMessage:
         return getattr(self._message, name)
 
     async def reply_text(self, text, *args, **kwargs):
-        rendered = live_ui_text(text)
+        rendered = await asyncio.to_thread(live_ui_text, text)
         if rendered != str(text) and not kwargs.get("parse_mode"):
             kwargs["parse_mode"] = "HTML"
         if kwargs.get("reply_markup") is not None:
-            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
-        return await self._message.reply_text(rendered, *args, **kwargs)
+            kwargs["reply_markup"] = await asyncio.to_thread(live_markup, kwargs["reply_markup"])
+        started = time.perf_counter()
+        result = await self._message.reply_text(rendered, *args, **kwargs)
+        record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source="reply_text")
+        return result
 
 
 class LiveCallbackQuery:
@@ -977,13 +1437,21 @@ class LiveCallbackQuery:
     def message(self):
         return self._message
 
+    async def answer(self, *args, **kwargs):
+        return await safe_callback_answer(self._query, *args, **kwargs)
+
     async def edit_message_text(self, text, *args, **kwargs):
-        rendered = live_ui_text(text)
+        rendered = await asyncio.to_thread(live_ui_text, text)
         if rendered != str(text) and not kwargs.get("parse_mode"):
             kwargs["parse_mode"] = "HTML"
         if kwargs.get("reply_markup") is not None:
-            kwargs["reply_markup"] = live_markup(kwargs["reply_markup"])
-        return await self._query.edit_message_text(rendered, *args, **kwargs)
+            kwargs["reply_markup"] = await asyncio.to_thread(live_markup, kwargs["reply_markup"])
+        started = time.perf_counter()
+        result = await self._query.edit_message_text(rendered, *args, **kwargs)
+        record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source="edit_message_text")
+        if kwargs.get("reply_markup") is not None and self._query.message:
+            await asyncio.to_thread(set_active_ui_message_id, self._query.message.chat_id, self._query.message.message_id)
+        return result
 
 
 
@@ -1013,7 +1481,8 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS app_settings(
-            setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL
+            setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL,
+            updated_by INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS chat_models(
@@ -1025,6 +1494,12 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,role TEXT,content TEXT,created_at TEXT);
+
+        CREATE TABLE IF NOT EXISTS conversation_summaries(
+            chat_id INTEGER PRIMARY KEY, summary TEXT NOT NULL DEFAULT '',
+            through_message_id INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
 
         CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0,
             acknowledged INTEGER NOT NULL DEFAULT 0, followup_count INTEGER NOT NULL DEFAULT 0,
@@ -1068,7 +1543,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS briefings(
 
-            chat_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,time TEXT NOT NULL DEFAULT '08:00',
+            chat_id INTEGER PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0,time TEXT NOT NULL DEFAULT '08:30',
 
             city TEXT NOT NULL DEFAULT '',topics TEXT NOT NULL DEFAULT 'главные новости, ИИ, бизнес',
 
@@ -1110,6 +1585,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
             source TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0,
+            provider TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -1143,7 +1619,9 @@ def init_db():
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
-            ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''")
+            ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
+            ("app_settings","updated_by","INTEGER"),
+            ("usage_events","provider","TEXT NOT NULL DEFAULT ''")
 
         ]:
 
@@ -1154,7 +1632,29 @@ def init_db():
 
 def model_router():
     """Construct cheaply so every request observes the latest SQLite setting."""
-    return ModelRouter(conn, MODEL, FALLBACK_MODELS, VISION_MODEL)
+    config = runtime_config_values()
+    return ModelRouter(conn, config["fast_model"], [config["strong_model"]], config["vision_model"])
+
+
+def provider_preferences_for(model):
+    """Keep the A/B-tested model/provider routes beside the normal router.
+
+    Returning None preserves OpenRouter's usual routing for custom per-chat
+    models. The payload contains no credentials and does not alter any user
+    model preference.
+    """
+    config = runtime_config_values()
+    for configured_model, providers, allow_fallbacks in (
+        (config["fast_model"], config["fast_model_providers"], config["fast_model_allow_provider_fallback"]),
+        (config["strong_model"], config["strong_model_providers"], config["strong_model_allow_provider_fallback"]),
+    ):
+        if model == configured_model and providers:
+            configured = list(providers)
+            return {
+                "only": configured, "order": configured,
+                "allow_fallbacks": allow_fallbacks, "require_parameters": True,
+            }
+    return None
 
 
 def available_models_for(chat_id):
@@ -1162,7 +1662,7 @@ def available_models_for(chat_id):
     with conn() as c:
         rows = c.execute("SELECT model, enabled FROM chat_models WHERE chat_id=?", (chat_id,)).fetchall()
     overrides = {r["model"]: bool(r["enabled"]) for r in rows}
-    models = [model for model in AVAILABLE_MODELS if overrides.get(model, True)]
+    models = [model for model in runtime_config_values()["model_catalog"] if overrides.get(model, True)]
     models += [model for model, enabled in overrides.items() if enabled and model not in models]
     return models
 
@@ -1181,7 +1681,7 @@ def get_mode(chat_id):
 
         r = c.execute("SELECT response_mode FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
 
-    return r["response_mode"] if r else DEFAULT_MODE
+    return r["response_mode"] if r else runtime_config_values()["default_voice_reply_mode"]
 
 
 
@@ -1197,15 +1697,44 @@ def set_mode(chat_id, mode):
 
 def add_message(chat_id, role, content):
 
+    if role == "assistant":
+
+        content = sanitize_visible_content(content)
+
     with conn() as c:
 
         c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
 
                   (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
 
-        c.execute("""DELETE FROM messages WHERE chat_id=? AND id NOT IN(
 
-        SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 60)""",(chat_id,chat_id))
+def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_chars=5000):
+    """Keep raw history immutable while the prompt stays bounded and inspectable."""
+    with conn() as c:
+        rows = c.execute("SELECT id,role,content FROM messages WHERE chat_id=? ORDER BY id", (chat_id,)).fetchall()
+        summary_row = c.execute("SELECT summary,through_message_id FROM conversation_summaries WHERE chat_id=?", (chat_id,)).fetchone()
+        cutoff = max(0, len(rows) - recent_limit)
+        older = rows[:cutoff]
+        existing_through = int(summary_row["through_message_id"]) if summary_row else 0
+        if len(rows) > summary_after and older and older[-1]["id"] > existing_through:
+            # Deterministic compacting is deliberately conservative: exact state is still read through tools/DB.
+            transcript = "\n".join(
+                f'{r["role"]}: {(sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:500]}'
+                for r in older
+            )
+            compact = transcript[-summary_chars:]
+            c.execute("INSERT INTO conversation_summaries(chat_id,summary,through_message_id,version,updated_at) VALUES(?,?,?,?,?) "
+                      "ON CONFLICT(chat_id) DO UPDATE SET summary=excluded.summary,through_message_id=excluded.through_message_id,version=excluded.version,updated_at=excluded.updated_at",
+                      (chat_id, compact, older[-1]["id"], 1, datetime.now(timezone.utc).isoformat()))
+            summary_row = {"summary": compact, "through_message_id": older[-1]["id"]}
+    result = []
+    if summary_row and summary_row["summary"]:
+        result.append({"role": "system", "content": "Краткий контекст прошлой беседы (не источник точных данных):\n" + str(summary_row["summary"])})
+    result.extend({
+        "role": r["role"],
+        "content": (sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:1400],
+    } for r in rows[-recent_limit:])
+    return result
 
 
 
@@ -1219,7 +1748,10 @@ def history(chat_id, n=18):
 
     # A long OCR/vision response must not make the next ordinary message exceed
     # a model's context window. The full original is safely kept in knowledge.
-    return [{"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in reversed(rs)]
+    return [{
+        "role": r["role"],
+        "content": (sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:1400],
+    } for r in reversed(rs)]
 
 
 
@@ -1610,48 +2142,132 @@ def has_personal_api_key(chat_id):
 
 
 def shared_vision_model():
+    # ``shared_vision_model`` was the prior admin setting. Read it only as a
+    # migration fallback; all new writes use the unified runtime config.
+    snapshot = runtime_config_snapshot()
+    if snapshot["fields"]["vision_model"]["source"] == "ADMIN":
+        return snapshot["fields"]["vision_model"]["value"]
     with conn() as c:
         row = c.execute("SELECT setting_value FROM app_settings WHERE setting_key='shared_vision_model'").fetchone()
-    return (row["setting_value"] if row else "") or VISION_MODEL
+    return (row["setting_value"] if row else "") or snapshot["fields"]["vision_model"]["value"]
 
 
 def set_shared_vision_model(model):
-    with conn() as c:
-        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('shared_vision_model',?,?) "
-                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
-                  (model, datetime.now(timezone.utc).isoformat()))
+    # Compatibility for the existing Telegram setting flow. The normal admin
+    # Mini App route records the actual admin id; legacy callers are marked 0.
+    return set_admin_runtime_config(0, "vision_model", model)
 
 
 def vision_models_for(chat_id):
     """Resolve Vision independently from chat models and key ownership."""
+    config = runtime_config_values()
     if not has_personal_api_key(chat_id):
         primary = shared_vision_model()
-        return [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+        return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
     primary = model_router().resolve(chat_id, "vision")
-    return [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+    return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
+
+
+def effective_user_ai_config(chat_id):
+    """Explain the existing USER -> ADMIN -> ENV -> DEFAULT resolution safely."""
+    snapshot = runtime_config_snapshot()
+    fields = snapshot["fields"]
+    try:
+        with conn() as c:
+            row = c.execute(
+                "SELECT primary_model,fallback_model,vision_model FROM user_settings WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    user = dict(row) if row else {}
+    primary_override = str(user.get("primary_model") or "").strip()
+    fallback_override = str(user.get("fallback_model") or "").strip()
+    vision_override = str(user.get("vision_model") or "").strip()
+    fast = fields["fast_model"]
+    strong = fields["strong_model"]
+    vision_default = fields["vision_model"]
+    effective_vision = vision_models_for(chat_id)[0]
+    vision_is_user = bool(vision_override and has_personal_api_key(chat_id))
+    vision_source = "USER" if vision_is_user else vision_default["source"]
+    if not vision_is_user and effective_vision != vision_default["value"]:
+        # Compatibility value written by the previous admin Vision screen.
+        vision_source = "ADMIN"
+    return {
+        "effective_model": {
+            "value": primary_override or fast["value"],
+            "source": "USER" if primary_override else fast["source"],
+        },
+        "effective_fallback": {
+            "value": fallback_override or strong["value"],
+            "source": "USER" if fallback_override else strong["source"],
+        },
+        "fast_default": dict(fast),
+        "strong_fallback": dict(strong),
+        "vision": {"value": effective_vision, "source": vision_source},
+        "tts": {
+            "provider": fields["tts_provider"]["value"],
+            "provider_source": fields["tts_provider"]["source"],
+            "voice": fields["tts_voice"]["value"],
+            "voice_source": fields["tts_voice"]["source"],
+        },
+    }
+
+
+def usage_provider(payload, model):
+    """Persist a safe provider label when OpenRouter returned one.
+
+    A provider route is not necessarily the provider that ultimately served a
+    fallback request, so we only store a configured provider when it is the
+    single allowed choice. Otherwise ``openrouter`` is the truthful label.
+    """
+    payload = payload or {}
+    details = payload.get("usage") or {}
+    for candidate in (payload.get("provider"), payload.get("provider_name"),
+                      payload.get("model_provider"), details.get("provider"),
+                      details.get("provider_name")):
+        if isinstance(candidate, dict):
+            candidate = candidate.get("name") or candidate.get("id")
+        value = str(candidate or "").strip()
+        if value:
+            return re.sub(r"[^A-Za-z0-9._:/+\-]", "", value)[:120] or "openrouter"
+    route = provider_preferences_for(model)
+    choices = list((route or {}).get("only") or [])
+    return choices[0] if len(choices) == 1 else "openrouter"
 
 
 def record_usage(chat_id, source, model, payload):
+    """Record billing on the canonical Telegram user for every key source."""
     usage = (payload or {}).get("usage") or {}
     input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     cost = float(usage.get("cost") or usage.get("total_cost") or 0)
+    # A request can arrive through Mini App or a legacy endpoint before a
+    # Telegram update handler had a chance to register its profile. Keep that
+    # event attached to a canonical user row instead of creating an orphan.
+    register_bot_user(chat_id, None)
     with conn() as c:
-        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,created_at) VALUES(?,?,?,?,?,?,?)",
-                  (chat_id, source, model, input_tokens, output_tokens, cost, datetime.now(timezone.utc).isoformat()))
+        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,provider,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  (chat_id, source, model, input_tokens, output_tokens, cost,
+                   usage_provider(payload, model), datetime.now(timezone.utc).isoformat()))
 
 
 def register_bot_user(chat_id, user):
     """Assign a stable, non-sensitive sequential number to every chat user."""
-    if not chat_id or not user:
+    if not chat_id:
         return None
-    username = (getattr(user, "username", "") or "").strip().lstrip("@")[:64]
+    def field(name):
+        return user.get(name, "") if isinstance(user, dict) else getattr(user, name, "")
+    username = (field("username") or "").strip().lstrip("@")[:64]
     display_name = " ".join(part for part in (
-        getattr(user, "first_name", "") or "", getattr(user, "last_name", "") or "") if part).strip()[:120]
+        field("first_name") or "", field("last_name") or "") if part).strip()[:120]
     now = datetime.now(timezone.utc).isoformat()
     with conn() as c:
         c.execute("INSERT INTO bot_users(chat_id,username,display_name,first_seen_at,last_seen_at) VALUES(?,?,?,?,?) "
-                  "ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username,display_name=excluded.display_name,last_seen_at=excluded.last_seen_at",
+                  "ON CONFLICT(chat_id) DO UPDATE SET "
+                  "username=CASE WHEN excluded.username<>'' THEN excluded.username ELSE bot_users.username END,"
+                  "display_name=CASE WHEN excluded.display_name<>'' THEN excluded.display_name ELSE bot_users.display_name END,"
+                  "last_seen_at=excluded.last_seen_at",
                   (chat_id, username, display_name, now, now))
         row = c.execute("SELECT user_number FROM bot_users WHERE chat_id=?", (chat_id,)).fetchone()
     return row["user_number"] if row else None
@@ -1665,7 +2281,7 @@ def usage_summary(chat_id=None, days=30, source=None):
     if source:
         where += " AND source=?"; args.append(source)
     with conn() as c:
-        rows = c.execute(f"SELECT chat_id,source,model,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model ORDER BY cost DESC,requests DESC", args).fetchall()
+        rows = c.execute(f"SELECT chat_id,source,model,provider,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model,provider ORDER BY cost DESC,requests DESC", args).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -1693,6 +2309,64 @@ def shared_usage_users(days=30):
             GROUP BY e.chat_id
             ORDER BY cost DESC, requests DESC, e.chat_id
         """, (since,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_usage_users():
+    """Canonical admin list: every registered Noema user, including zero use.
+
+    ``bot_users`` is intentionally the driving table. API-key tables and
+    usage tables are optional attributes of a person, never membership gates.
+    """
+    month_start = datetime.now(TZ).date().replace(day=1).isoformat()
+    config = runtime_config_values()
+    with conn() as c:
+        # Repair historical orphan events once, including personal-key usage.
+        missing = c.execute("""SELECT DISTINCT e.chat_id FROM usage_events e
+                             LEFT JOIN bot_users u ON u.chat_id=e.chat_id
+                             WHERE u.chat_id IS NULL""").fetchall()
+        now = datetime.now(timezone.utc).isoformat()
+        for row in missing:
+            c.execute("INSERT OR IGNORE INTO bot_users(chat_id,username,display_name,first_seen_at,last_seen_at) VALUES(?,?,?,?,?)",
+                      (row["chat_id"], "", "", now, now))
+        rows = c.execute("""
+            SELECT u.user_number,u.chat_id,u.username,u.display_name,u.first_seen_at,u.last_seen_at,
+                   COALESCE(NULLIF(s.primary_model,''), ?) AS effective_model,
+                   CASE WHEN p.chat_id IS NULL THEN 0 ELSE 1 END AS has_personal_key,
+                   CASE WHEN m.chat_id IS NULL THEN 0 ELSE 1 END AS has_managed_key,
+                   COALESCE(m.limit_usd, 0) AS monthly_limit_usd,
+                   COUNT(e.id) AS requests,
+                   COALESCE(SUM(e.input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(e.output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(e.cost),0) AS cost,
+                   (SELECT MAX(last_event.created_at) FROM usage_events last_event
+                    WHERE last_event.chat_id=u.chat_id) AS last_llm_activity
+            FROM bot_users u
+            LEFT JOIN user_settings s ON s.chat_id=u.chat_id
+            LEFT JOIN user_api_keys p ON p.chat_id=u.chat_id AND p.active=1
+            LEFT JOIN managed_api_keys m ON m.chat_id=u.chat_id AND m.active=1
+            LEFT JOIN usage_events e ON e.chat_id=u.chat_id AND substr(e.created_at,1,10)>=?
+            GROUP BY u.chat_id
+            ORDER BY CASE WHEN MAX(e.created_at) IS NULL THEN 1 ELSE 0 END,
+                     MAX(e.created_at) DESC,last_llm_activity DESC,u.user_number DESC
+        """, (config["fast_model"], month_start)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_user_usage_rows(chat_id):
+    """Calendar-month model/provider breakdown for one canonical user."""
+    month_start = datetime.now(TZ).date().replace(day=1).isoformat()
+    with conn() as c:
+        rows = c.execute("""
+            SELECT source,model,provider,COUNT(*) AS requests,
+                   COALESCE(SUM(input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(cost),0) AS cost,MAX(created_at) AS last_activity
+            FROM usage_events
+            WHERE chat_id=? AND substr(created_at,1,10)>=?
+            GROUP BY source,model,provider
+            ORDER BY cost DESC,requests DESC,model
+        """, (chat_id, month_start)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -1769,6 +2443,24 @@ def save_reminder(chat_id, text, remind_at):
                         (chat_id,text,dt.astimezone(timezone.utc).isoformat()))
 
     return {"ok":True,"tool":"set_reminder","id":cur.lastrowid,"text":text,"local_time":dt.strftime("%d.%m.%Y %H:%M")}
+
+
+def update_reminder(chat_id, reminder_id, text="", remind_at=""):
+    text = str(text or "").strip()[:1000]
+    if not text or not remind_at:
+        return {"ok": False, "tool": "update_reminder", "error": "invalid_reminder"}
+    try:
+        dt = datetime.fromisoformat(str(remind_at))
+    except ValueError:
+        return {"ok": False, "tool": "update_reminder", "error": "invalid_time"}
+    chat_tz = timezone_for(chat_id)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=chat_tz)
+    utc_time = dt.astimezone(timezone.utc).isoformat()
+    with conn() as c:
+        cur = c.execute("UPDATE reminders SET text=?,remind_at_utc=?,sent=0,acknowledged=0,next_followup_at='' WHERE id=? AND chat_id=?",
+                        (text, utc_time, int(reminder_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_reminder", "updated": cur.rowcount}
 
 
 
@@ -1872,6 +2564,16 @@ def add_task(chat_id, text, due_date="", priority="normal"):
         VALUES(?,?,?,?,?,?)""",(chat_id,text,due_date or "",priority or "normal","open",datetime.now(timezone.utc).isoformat()))
 
     return {"ok":True,"tool":"add_task","id":cur.lastrowid,"text":text,"due_date":due_date or ""}
+
+
+def update_task(chat_id, task_id, text="", due_date="", priority="normal"):
+    text = str(text or "").strip()[:1000]
+    if not text:
+        return {"ok": False, "tool": "update_task", "error": "empty_task"}
+    with conn() as c:
+        cur = c.execute("UPDATE tasks SET text=?,due_date=?,priority=? WHERE id=? AND chat_id=?",
+                        (text, str(due_date or "")[:32], str(priority or "normal")[:32], int(task_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_task", "updated": cur.rowcount}
 
 
 
@@ -2144,6 +2846,58 @@ def save_note(chat_id, text, title=""):
     return {"ok":True,"tool":"save_note","id":cur.lastrowid,"title":title or ""}
 
 
+def update_note(chat_id, note_id, text="", title=""):
+    text = str(text or "").strip()[:12000]
+    if not text:
+        return {"ok": False, "tool": "update_note", "error": "empty_note"}
+    with conn() as c:
+        cur = c.execute("UPDATE notes SET title=?,text=? WHERE id=? AND chat_id=?",
+                        (str(title or "").strip()[:240], text, int(note_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_note", "updated": cur.rowcount}
+
+
+def update_expense(chat_id, expense_id, amount, description="", category="прочее", currency="RUB", spent_at=""):
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "update_expense", "error": "invalid_amount"}
+    if amount <= 0:
+        return {"ok": False, "tool": "update_expense", "error": "invalid_amount"}
+    with conn() as c:
+        row = c.execute("SELECT spent_at FROM expenses WHERE id=? AND chat_id=?", (int(expense_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "update_expense", "error": "not_found"}
+        cur = c.execute("UPDATE expenses SET amount=?,description=?,category=?,currency=?,spent_at=? WHERE id=? AND chat_id=?",
+                        (amount, str(description or "").strip()[:500], str(category or "прочее").strip()[:120],
+                         str(currency or "RUB").strip()[:8], normalize_spent_at(str(spent_at)) if spent_at else row["spent_at"], int(expense_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_expense", "updated": cur.rowcount}
+
+
+def update_person(chat_id, person_id, name="", relationship="", birthday="", age=None,
+                  home_city=None, current_location=None, projects="", notes=""):
+    name = str(name or "").strip()[:160]
+    if not name:
+        return {"ok": False, "tool": "update_person", "error": "empty_name"}
+    has_age = age is not None
+    try:
+        age = int(age) if age is not None and str(age).strip() else None
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "update_person", "error": "invalid_age"}
+    with conn() as c:
+        existing = c.execute("SELECT age,home_city,current_location FROM people WHERE id=? AND chat_id=?",
+                             (int(person_id), chat_id)).fetchone()
+        if not existing:
+            return {"ok": False, "tool": "update_person", "error": "not_found"}
+        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,updated_at=? WHERE id=? AND chat_id=?",
+                        (name, str(relationship or "")[:160], str(birthday or "")[:32],
+                         age if has_age else existing["age"],
+                         str(existing["home_city"] if home_city is None else home_city or "")[:160],
+                         str(existing["current_location"] if current_location is None else current_location or "")[:160],
+                         str(projects or "")[:1000], str(notes or "")[:3000],
+                         datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_person", "updated": cur.rowcount}
+
+
 def delete_note(chat_id,note_id):
 
     with conn() as c:
@@ -2219,7 +2973,17 @@ def execute_tool(chat_id,name,args):
 
         "save_note":save_note,
 
+        "update_note":update_note,
+
         "add_task":add_task,
+
+        "update_task":update_task,
+
+        "update_reminder":update_reminder,
+
+        "update_expense":update_expense,
+
+        "update_person":update_person,
 
         "person_upsert":person_upsert,
 
@@ -2276,7 +3040,14 @@ def execute_tool(chat_id,name,args):
     if name not in funcs: return {"ok":False,"tool":name,"error":"unknown_tool"}
 
     kwargs={k:v for k,v in args.items() if k!="chat_id"}
-    return funcs[name](chat_id,**kwargs)
+    started = time.perf_counter()
+    try:
+        return funcs[name](chat_id,**kwargs)
+    finally:
+        elapsed = (time.perf_counter() - started) * 1000
+        record_runtime_metric("tool_execution_ms", elapsed)
+        if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
+            record_runtime_metric("memory_retrieval_ms", elapsed)
 
 # ---------- LIVE DATA ----------
 
@@ -2717,6 +3488,7 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
     payload={"model":model,"messages":messages,"temperature":0.25,"max_tokens":int(os.getenv("CHAT_MAX_TOKENS", "1800"))}
 
     if tools: payload["tools"]=tools; payload["tool_choice"]=tool_choice
+    if provider := provider_preferences_for(model): payload["provider"] = provider
 
     key, _ = api_key_for_chat(chat_id)
     return requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
@@ -2724,14 +3496,281 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
                          json=payload,timeout=180)
 
 
+def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"):
+    payload = {"model": model, "messages": messages, "temperature": 0.25,
+               "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1800")), "stream": True,
+               "stream_options": {"include_usage": True}}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    if provider := provider_preferences_for(model):
+        payload["provider"] = provider
+    key, _ = api_key_for_chat(chat_id)
+    return requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                         json=payload, timeout=(20, 180), stream=True)
+
+
+def stream_agent_response(chat_id, text, cancel_event=None):
+    """One streaming core for text and voice; yields display-safe runtime events."""
+    started = time.perf_counter()
+    cancel_event = cancel_event or threading.Event()
+    if cancel_event.is_set():
+        yield {"type": "cancelled"}
+        return
+    live = direct_live_request(text)
+    if live is not None:
+        add_message(chat_id, "user", text); add_message(chat_id, "assistant", live)
+        yield {"type": "delta", "text": live}
+        yield {"type": "done", "text": live}
+        return
+    context_started = time.perf_counter()
+    messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
+    tools = ToolPackResolver().resolve(TOOLS, text)
+    selected = model_router().resolve(chat_id, "chat")
+    config = runtime_config_values()
+    models = list(dict.fromkeys([selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]]))
+    record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
+    writes = []
+    for round_index in range(5):
+        message = None
+        last_error = None
+        for model in [m for m in models if m]:
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
+            request_started = time.perf_counter()
+            response = request_chat_stream(chat_id, model, messages, tools, "required" if round_index == 0 and asks_external_web(text) else "auto")
+            if not response.ok:
+                last_error = response.status_code
+                response.close()
+                record_runtime_metric("llm_total_ms", (time.perf_counter() - request_started) * 1000)
+                continue
+            accumulator = StreamAccumulator()
+            first_delta = False
+            with ACTIVE_STREAM_RESPONSES_LOCK:
+                ACTIVE_STREAM_RESPONSES[cancel_event] = response
+            try:
+                for payload in iter_sse_json(response.iter_lines()):
+                    if cancel_event.is_set():
+                        response.close()
+                        yield {"type": "cancelled"}
+                        return
+                    for delta in accumulator.add(payload):
+                        if not first_delta:
+                            first_delta = True
+                            record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
+                        yield {"type": "delta", "text": delta}
+                tail = accumulator.finish()
+                if tail:
+                    if not first_delta:
+                        first_delta = True
+                        record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
+                    yield {"type": "delta", "text": tail}
+                message = accumulator.message()
+                if accumulator.usage:
+                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
+                break
+            except requests.RequestException:
+                if cancel_event.is_set():
+                    yield {"type": "cancelled"}
+                    return
+                raise
+            finally:
+                with ACTIVE_STREAM_RESPONSES_LOCK:
+                    if ACTIVE_STREAM_RESPONSES.get(cancel_event) is response:
+                        ACTIVE_STREAM_RESPONSES.pop(cancel_event, None)
+                response.close()
+                record_runtime_metric("llm_total_ms", (time.perf_counter() - request_started) * 1000)
+        if message is None:
+            raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
+        calls = message.get("tool_calls") or []
+        if not calls:
+            answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
+            add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
+            yield {"type": "done", "text": answer, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+            return
+        messages.append(message)
+        for call in calls:
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
+            name = call.get("function", {}).get("name", "")
+            raw = call.get("function", {}).get("arguments", "{}")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else raw
+                result = execute_tool(chat_id, name, args or {})
+            except Exception as exc:
+                result = {"ok": False, "tool": name, "error": str(exc)}
+            if name in WRITE_TOOLS:
+                writes.append(result)
+            messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
+            yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
+            if cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
+    answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
+    add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
+    yield {"type": "done", "text": answer}
+
+
+def mint_mistral_realtime_session():
+    """Mint a model-scoped, short-lived rt_* token without exposing the API key."""
+    if not MISTRAL_API_KEY:
+        raise RuntimeError("MISTRAL_NOT_CONFIGURED")
+    response = requests.post(
+        MISTRAL_CLIENT_SESSIONS_URL,
+        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+        json={"purpose": "realtime", "model": runtime_config_values()["realtime_model"]},
+        timeout=20,
+    )
+    if not response.ok:
+        raise RuntimeError("MISTRAL_SESSION_ERROR")
+    payload = response.json()
+    secret = payload.get("client_secret") or {}
+    token = secret.get("value")
+    if not isinstance(token, str) or not token.startswith("rt_"):
+        raise RuntimeError("MISTRAL_SESSION_ERROR")
+    return {
+        "token": token,
+        "expires_at": secret.get("expires_at") or payload.get("expires_at"),
+        "model": runtime_config_values()["realtime_model"],
+        "url": "wss://api.mistral.ai/v1/audio/transcriptions/realtime",
+    }
+
+
+def _new_draft_id():
+    return secrets.randbelow(2_147_483_646) + 1
+
+
+def register_active_draft(chat_id, draft_id, cancel_event):
+    with ACTIVE_DRAFTS_LOCK:
+        previous = ACTIVE_DRAFTS.get(chat_id)
+        if previous:
+            cancel_stream(previous[1])
+        ACTIVE_DRAFTS[chat_id] = (draft_id, cancel_event)
+
+
+def unregister_active_draft(chat_id, draft_id):
+    with ACTIVE_DRAFTS_LOCK:
+        current = ACTIVE_DRAFTS.get(chat_id)
+        if current and current[0] == draft_id:
+            ACTIVE_DRAFTS.pop(chat_id, None)
+
+
+def cancel_active_draft(chat_id, draft_id=None):
+    with ACTIVE_DRAFTS_LOCK:
+        current = ACTIVE_DRAFTS.get(chat_id)
+        if not current or (draft_id is not None and current[0] != draft_id):
+            return False
+        cancel_stream(current[1])
+        return True
+
+
+def cancel_stream(cancel_event):
+    cancel_event.set()
+    with ACTIVE_STREAM_RESPONSES_LOCK:
+        response = ACTIVE_STREAM_RESPONSES.get(cancel_event)
+    if response is not None:
+        with contextlib.suppress(Exception):
+            response.close()
+
+
+async def stopped_generation_handler(update, context):
+    stopped = (getattr(update, "api_kwargs", None) or {}).get("stopped_message_generation")
+    if not isinstance(stopped, dict):
+        return
+    chat = stopped.get("chat") or {}
+    chat_id, draft_id = chat.get("id"), stopped.get("draft_id")
+    if isinstance(chat_id, int):
+        cancel_active_draft(chat_id, draft_id if isinstance(draft_id, int) else None)
+
+
+async def stream_answer_to_telegram(update, context, text):
+    """Stream one ephemeral draft, then persist exactly one formatted final answer."""
+    chat_id = update.effective_chat.id
+    draft_id, cancelled = _new_draft_id(), threading.Event()
+    register_active_draft(chat_id, draft_id, cancelled)
+    queue, loop = asyncio.Queue(), asyncio.get_running_loop()
+
+    def produce():
+        try:
+            for event in stream_agent_response(chat_id, text, cancelled):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
+    throttle = AdaptiveDraftThrottle(TELEGRAM_DRAFT_MIN_INTERVAL, TELEGRAM_DRAFT_MAX_INTERVAL, TELEGRAM_DRAFT_MIN_CHARS)
+    accumulated, final = "", ""
+    draft_available = True
+    try:
+        try:
+            await context.bot.send_message_draft(chat_id, draft_id, "", api_kwargs={"can_stop": True, "keep_on_stop": False})
+        except Exception:
+            draft_available = False
+        next_watchdog_at = time.monotonic() + 8
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
+            except asyncio.TimeoutError:
+                if draft_available:
+                    with contextlib.suppress(Exception):
+                        await context.bot.send_message_draft(
+                            chat_id, draft_id, "Готовлю ответ…",
+                            api_kwargs={"can_stop": True, "keep_on_stop": False},
+                        )
+                next_watchdog_at = time.monotonic() + 8
+                continue
+            if event is None:
+                break
+            if isinstance(event, Exception):
+                raise event
+            kind = event.get("type")
+            if kind == "delta":
+                accumulated += event.get("text", "")
+                if draft_available and throttle.should_send(accumulated):
+                    try:
+                        await context.bot.send_message_draft(
+                            chat_id, draft_id, accumulated[-4096:],
+                            api_kwargs={"can_stop": True, "keep_on_stop": False},
+                        )
+                    except Exception:
+                        draft_available = False
+            elif kind == "done":
+                final = event.get("text") or accumulated
+            elif kind == "tool" and draft_available:
+                # ``tool`` is emitted only after the canonical core actually
+                # executed it, so this status is truthful.
+                with contextlib.suppress(Exception):
+                    await context.bot.send_message_draft(
+                        chat_id, draft_id, "Действие выполнено, готовлю ответ…",
+                        api_kwargs={"can_stop": True, "keep_on_stop": False},
+                    )
+            elif kind == "cancelled":
+                cancelled.set()
+        if cancelled.is_set():
+            return False
+        final = sanitize_visible_content(final or accumulated).strip()
+        if draft_available and final and throttle.should_send(final, force=True):
+            with contextlib.suppress(Exception):
+                await context.bot.send_message_draft(chat_id, draft_id, final[-4096:], api_kwargs={"can_stop": False})
+        await send_answer(update, final, context=context, voice_in=False, force_voice=wants_voice(text))
+        return True
+    finally:
+        cancelled.set()
+        unregister_active_draft(chat_id, draft_id)
+
+
 
 def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
     selected=model_router().resolve(chat_id, "chat")
     primary, fallback = selected["primary"], selected["fallback"]
-    # Explicit FALLBACK_MODELS has priority. If it is not configured, the
-    # preset catalogue is still a useful automatic fallback chain.
-    candidates = [fallback] + FALLBACK_MODELS + AVAILABLE_MODELS
+    # The admin/ENV strong model and catalogue are the live fallback chain.
+    config = runtime_config_values()
+    candidates = [fallback, config["strong_model"], *config["model_catalog"]]
     models = [primary] + [m for m in candidates if m and m != primary and m not in [primary]]
     models = list(dict.fromkeys(models))
 
@@ -2745,6 +3784,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
             started = time.perf_counter()
             r=request_chat(chat_id, model, messages, tools, tool_choice)
+            record_runtime_metric("llm_total_ms", (time.perf_counter()-started)*1000)
             print(f"LLM request chat_id={chat_id} model={model} seconds={time.perf_counter()-started:.2f} status={r.status_code}")
 
             if r.ok:
@@ -2753,7 +3793,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 choice = data["choices"][0]
                 if choice.get("finish_reason") == "length":
                     print(f"LLM truncation chat_id={chat_id} model={model}")
-                return choice["message"]
+                return sanitize_assistant_message(choice["message"])
 
             last=(r.status_code,r.text)
 
@@ -2776,12 +3816,14 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
         for model in models:
 
+            fallback_started = time.perf_counter()
             r=request_chat(chat_id, model, messages, tools, "auto")
+            record_runtime_metric("llm_total_ms", (time.perf_counter()-fallback_started)*1000)
 
             if r.ok:
                 data = r.json()
                 record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
-                return data["choices"][0]["message"]
+                return sanitize_assistant_message(data["choices"][0]["message"])
 
             last=(r.status_code,r.text)
 
@@ -2847,6 +3889,7 @@ def ask(chat_id,text):
 
 
 
+    context_started = time.perf_counter()
     msgs=[{"role":"system","content":system_prompt(chat_id)}]
 
     ctx=_LAST_RETRIEVAL.get(chat_id)
@@ -2861,7 +3904,8 @@ def ask(chat_id,text):
               "Если пользователь спрашивает «его/её/то/про неё/его id», опирайся на этот элемент (можно knowledge_get/knowledge_files по id).")
         msgs.append({"role":"system","content":note})
 
-    msgs+=history(chat_id)+[{"role":"user","content":text}]
+    msgs+=conversation_context(chat_id)+[{"role":"user","content":text}]
+    record_runtime_metric("context_build_ms", (time.perf_counter()-context_started)*1000)
 
     writes=[]
 
@@ -2878,7 +3922,7 @@ def ask(chat_id,text):
 
         if not calls:
 
-            ans=(msg.get("content") or "").strip() or write_confirmation(writes)
+            ans=sanitize_visible_content(msg.get("content") or "").strip() or write_confirmation(writes)
 
             add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans)
             print(f"Request complete chat_id={chat_id} route=llm seconds={time.perf_counter()-started:.2f}")
@@ -3013,9 +4057,12 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
 
 # ---------- VOICE ----------
 
-def transcribe(chat_id, path):
+def _transcribe_unmeasured(chat_id, path):
 
     b64=base64.b64encode(Path(path).read_bytes()).decode()
+    suffix = Path(path).suffix.lower().lstrip(".")
+    # Mini App records WebM/MP4 while Telegram voice notes are OGG. Never mislabel audio to STT.
+    audio_format = {"ogg": "ogg", "oga": "ogg", "webm": "webm", "mp4": "mp4", "m4a": "m4a", "wav": "wav"}.get(suffix, "webm")
 
     # A Noema-managed key is a complete private balance: speech-to-text,
     # chat and Vision all belong to the same Telegram user.
@@ -3023,20 +4070,29 @@ def transcribe(chat_id, path):
     r = None
     for attempt in range(2):
         key, source = api_key_for_chat(chat_id)
-        r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":"ogg"},"language":"ru"},timeout=180)
+        r=requests.post(BATCH_STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                        json={"model":runtime_config_values()["batch_stt_model"],"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=BATCH_STT_TIMEOUT_SEC)
         if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
             break
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
     data = r.json()
-    record_usage(chat_id, source, STT_MODEL, data)
+    record_usage(chat_id, source, runtime_config_values()["batch_stt_model"], data)
     text=data.get("text","").strip()
 
     if not text: raise RuntimeError("STT_EMPTY")
 
     return text
+
+
+def transcribe(chat_id, path):
+    """Keep STT behavior unchanged while recording a numeric end-to-end duration."""
+    started = time.perf_counter()
+    try:
+        return _transcribe_unmeasured(chat_id, path)
+    finally:
+        record_runtime_metric("stt_final_ms", (time.perf_counter() - started) * 1000)
 
 
 
@@ -3060,7 +4116,7 @@ async def make_voice(text):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
 
-    await edge_tts.Communicate(clean_tts(text) or "Готово.",VOICE).save(str(p))
+    await edge_tts.Communicate(clean_tts(text) or "Готово.", runtime_config_values()["tts_voice"]).save(str(p))
 
     return p
 
@@ -3074,7 +4130,7 @@ def wants_voice(text):
 
 
 
-async def send_answer(update,answer,voice_in=False,force_voice=False):
+async def send_answer(update,answer,context=None,voice_in=False,force_voice=False):
 
     mode=get_mode(update.effective_chat.id)
 
@@ -3094,7 +4150,9 @@ async def send_answer(update,answer,voice_in=False,force_voice=False):
                 kwargs["reply_markup"] = main_keyboard()
                 chunk = reply_emoji_prefix(update.effective_chat.id) + chunk
                 total_emoji_limit -= 1
-            await update.effective_message.reply_text(chunk, **kwargs)
+            sent = await update.effective_message.reply_text(chunk, **kwargs)
+            if context and is_ephemeral_confirmation(answer):
+                schedule_ephemeral_delete(context, sent)
 
     if eff in ("voice","voice_and_text"):
 
@@ -3127,12 +4185,9 @@ async def safe_error(update,e):
 
 
 def activity_labels(text):
-    low = (text or "").lower()
-    if any(word in low for word in ("найди", "купи", "товар", "вазу", "интернет")):
-        return ["🔎 Ищу варианты…", "🔎 Проверяю источники…", "🧠 Собираю ответ…"]
-    if any(word in low for word in ("где", "помни", "сохранял", "фото", "картинк")):
-        return ["📚 Ищу в памяти…", "🧠 Проверяю данные…", "✍️ Готовлю ответ…"]
-    return ["🧠 Думаю…", "📚 Проверяю данные…", "✍️ Готовлю ответ…"]
+    # A tool has not run yet when this card appears, so never infer a search
+    # or retrieval merely from the wording of the request.
+    return ["🧠 Готовлю ответ…", "🧠 Ответ ещё готовится…"]
 
 
 async def begin_activity(message, labels):
@@ -3176,13 +4231,88 @@ async def end_activity(card, stopped, task):
 async def start(update,context):
     chat_id = update.effective_chat.id
     register_bot_user(chat_id, getattr(update, "effective_user", None))
+    previous_id = active_ui_message_id(chat_id)
+    if previous_id:
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+        set_active_ui_message_id(chat_id, 0)
     # Provisioning happens in the background: /start remains instant even if
     # OpenRouter is temporarily slow.
     if OR_MANAGEMENT_KEY:
         asyncio.create_task(asyncio.to_thread(provision_managed_api_key, chat_id))
     await update.effective_message.reply_text(
-        f"<b>Noema активна</b>\n<code>v{BUILD_ID}</code>",
+        "<b>Привет, я Noema — твой личный ассистент.</b>\n\n"
+        "Напиши или скажи голосом, что нужно: напомнить о деле, сохранить мысль, "
+        "записать расход или найти ответ. Фото и файлы тоже можно присылать сюда.\n\n"
+        "Я помогу держать важное под рукой. Начнём?",
         reply_markup=main_keyboard(), parse_mode="HTML")
+    initialize_briefing(chat_id)
+
+
+def telemetry_command_allowed(update):
+    """Commands expose aggregates only, and only to the already configured admins."""
+    chat = getattr(update, "effective_chat", None)
+    return bool(chat and chat.id in ADMIN_CHAT_IDS)
+
+
+def telemetry_counts_text(exported):
+    return "\n".join(
+        f"<b>{heading}</b>\n" + "\n".join(
+            f"<code>{name}</code>: {exported['metrics'][name]['count']}"
+            for name in exported["groups"][group]
+        )
+        for heading, group in (("Latency", "latency"), ("Voice robustness", "voice_robustness"))
+    )
+
+
+def telemetry_report_text(exported):
+    lines = [
+        "<b>Telemetry report</b>",
+        f"Collection: <b>{'enabled' if exported['enabled'] else 'disabled'}</b>",
+        f"Started: <code>{exported['started_at'] or 'not reset in this process'}</code>",
+        "",
+    ]
+    for heading, group in (("Latency", "latency"), ("Voice robustness", "voice_robustness")):
+        lines.extend((f"<b>{heading}</b>",))
+        for name in exported["groups"][group]:
+            metric = exported["metrics"][name]
+            lines.append(
+                f"<code>{name}</code> — count {metric['count']} · avg {metric['avg']} ms · "
+                f"p50 {metric['p50']} ms · p95 {metric['p95']} ms · max {metric['max']} ms"
+            )
+    return "\n".join(lines)
+
+
+async def telemetry_reset_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    started_at = reset_runtime_metric_series()
+    await update.effective_message.reply_text(
+        "<b>Telemetry reset</b>\n"
+        f"Collection: <b>{'enabled' if TELEMETRY_ENABLED else 'disabled'}</b>\n"
+        f"Started: <code>{started_at}</code>\n\n"
+        "Only in-memory numeric latency samples were cleared.",
+        parse_mode="HTML",
+    )
+
+
+async def telemetry_status_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    exported = runtime_metric_export()
+    await update.effective_message.reply_text(
+        "<b>Telemetry status</b>\n"
+        f"Collection: <b>{'enabled' if exported['enabled'] else 'disabled'}</b>\n"
+        f"Started: <code>{exported['started_at'] or 'not reset in this process'}</code>\n\n"
+        "<b>Samples</b>\n" + telemetry_counts_text(exported),
+        parse_mode="HTML",
+    )
+
+
+async def telemetry_report_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    await update.effective_message.reply_text(telemetry_report_text(runtime_metric_export()), parse_mode="HTML")
 
 
 async def set_today_emoji(update, context):
@@ -3266,14 +4396,12 @@ async def clear_reply_emojis(update, context):
 
 
 
-async def list_people(update,context):
-
-    d=get_people(update.effective_chat.id)
+def people_page(chat_id):
+    d=get_people(chat_id)
+    lines=["👥 Люди:"]
 
     if not d["people"]:
-        return await update.effective_message.reply_text(live_ui_text("👥 Людей пока нет."), parse_mode="HTML")
-
-    lines=["👥 Люди:"]
+        lines.append("Людей пока нет.")
 
     for p in d["people"][:20]:
 
@@ -3295,7 +4423,13 @@ async def list_people(update,context):
 
         for x in p.get("recent_interactions",[])[:3]: lines.append(f'  ↳ {x["interaction_date"]}: {x["interaction"]}')
 
-    await update.effective_message.reply_text(live_ui_text("\n".join(lines)), parse_mode="HTML")
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="menu:more")]])
+    return "\n".join(lines), live_markup(markup)
+
+
+async def list_people(update,context):
+    text, markup = people_page(update.effective_chat.id)
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3364,13 +4498,14 @@ def budget_page(chat_id, date_from, date_to, page=0, page_size=6):
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="budget:noop"))
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"budget:range:{date_from}:{date_to}:{page+1}"))
         controls.append(nav)
+    controls.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(controls))
 
 
 async def list_expenses(update,context):
     today = datetime.now(timezone_for(update.effective_chat.id)).date()
     text, markup = budget_page(update.effective_chat.id, today.replace(day=1).isoformat(), today.isoformat())
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3384,7 +4519,9 @@ def reminders_page(chat_id, page=0, page_size=6):
         rs = c.execute("SELECT id,text,remind_at_utc,followup_count FROM reminders WHERE chat_id=? AND acknowledged=0 ORDER BY remind_at_utc",
                        (chat_id,)).fetchall()
     if not rs:
-        return "⏰ Активных напоминаний нет.", InlineKeyboardMarkup([])
+        return "⏰ Активных напоминаний нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")]
+        ]))
     pages = max(1, (len(rs) + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
     rs = rs[page * page_size:(page + 1) * page_size]
@@ -3393,7 +4530,7 @@ def reminders_page(chat_id, page=0, page_size=6):
     for r in rs[:20]:
         dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(chat_tz)
         suffix = f" · повторов: {r['followup_count']}" if r["followup_count"] else ""
-        lines.append(f'<code>#{r["id"]}</code> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
+        lines.append(f'⏰ <code>#{r["id"]}</code> — {dt:%d.%m %H:%M} — {html.escape(r["text"])}{suffix}')
         buttons.append(InlineKeyboardButton(f'🗑 #{r["id"]}', callback_data=f'delremask:{r["id"]}:{page}'))
     rows = button_rows(buttons)
     if pages > 1:
@@ -3402,12 +4539,13 @@ def reminders_page(chat_id, page=0, page_size=6):
         nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="reminders:noop"))
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"reminders:page:{page+1}"))
         rows.append(nav)
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(rows))
 
 
 async def reminders(update,context):
     text, markup = reminders_page(update.effective_chat.id)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3420,7 +4558,10 @@ def tasks_page(chat_id, page=0, page_size=8):
                          ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END, due_date, id DESC
                          LIMIT ? OFFSET ?""", (chat_id, page_size, page * page_size)).fetchall()
     if not rows:
-        return "✅ Задач пока нет.", InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")]])
+        return "✅ Задач пока нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")],
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")],
+        ]))
     lines = [f"✅ Задачи · {page + 1}/{pages}"]
     delete_buttons = []
     for row in rows:
@@ -3436,12 +4577,13 @@ def tasks_page(chat_id, page=0, page_size=8):
         if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"tasks:page:{page + 1}"))
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("➕ Добавить задачу", callback_data="tasks:add")])
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def tasks(update, context, page=0):
     text, markup = tasks_page(update.effective_chat.id, page)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 def notes_page(chat_id, page=0, page_size=6):
@@ -3452,7 +4594,9 @@ def notes_page(chat_id, page=0, page_size=6):
         rows = c.execute("SELECT id,title,text FROM notes WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
                          (chat_id, page_size, page * page_size)).fetchall()
     if not rows:
-        return "📝 Заметок пока нет.", InlineKeyboardMarkup([])
+        return "📝 Заметок пока нет.", live_markup(InlineKeyboardMarkup([
+            [InlineKeyboardButton("‹ Назад", callback_data="menu:more")]
+        ]))
     lines = [f"📝 Заметки · {page + 1}/{pages}"]
     delete_buttons = []
     for row in rows:
@@ -3463,12 +4607,13 @@ def notes_page(chat_id, page=0, page_size=6):
     if page > 0: nav.append(InlineKeyboardButton("‹", callback_data=f"notes:page:{page-1}"))
     if page + 1 < pages: nav.append(InlineKeyboardButton("›", callback_data=f"notes:page:{page+1}"))
     if nav: buttons.append(nav)
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="menu:more")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def notes(update,context, page=0):
     text, markup = notes_page(update.effective_chat.id, page)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
@@ -3507,7 +4652,10 @@ def plan_page(chat_id, day, page=0, page_size=12):
             late = " · просрочено" if status == "open" and task["due_date"] and task["due_date"] < today.isoformat() else ""
             lines.append(f'{marker} <code>#{task["id"]}</code> · задача — {html.escape(task["text"])}{late}')
             toggle_icon = "✅" if status == "done" else "◻️"
-            emoji_id = app_setting(f"task_{'done' if status == 'done' else 'open'}_custom_emoji_id")
+            if status == "done":
+                emoji_id = app_setting("interface_tasks_custom_emoji_id") or emoji_id_for("✅")
+            else:
+                emoji_id = app_setting("task_open_custom_emoji_id") or emoji_id_for("◻️")
             task_toggle_buttons.append(InlineKeyboardButton(
                 f"#{task['id']}" if emoji_id else f"{toggle_icon} #{task['id']}",
                 callback_data=f"tasktoggle:{task['id']}:{day}:{page}", icon_custom_emoji_id=emoji_id or None))
@@ -3520,7 +4668,9 @@ def plan_page(chat_id, day, page=0, page_size=12):
             elif not is_completed and not active_heading_added:
                 lines.append("\n<b>Предстоящие</b>")
                 active_heading_added = True
-            marker = "✅" if reminder["acknowledged"] else "◻️"
+            # Reminders always use the reminder icon. Their completion state is
+            # represented by the section, while tasks keep their own checkmark.
+            marker = "⏰"
             lines.append(f'{marker} {reminder["time"]} — {html.escape(reminder["text"])}')
     if task_toggle_buttons:
         buttons.extend(button_rows(task_toggle_buttons, 4))
@@ -3534,24 +4684,37 @@ def plan_page(chat_id, day, page=0, page_size=12):
         page_nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="plan:noop"))
         if page + 1 < pages: page_nav.append(InlineKeyboardButton("›", callback_data=f"plan:{day}:{page+1}"))
         buttons.append(page_nav)
-    buttons.append([InlineKeyboardButton("‹ Назад", callback_data=f"plan:{previous}:0"),
+    buttons.append([InlineKeyboardButton("‹ День", callback_data=f"plan:{previous}:0"),
                     InlineKeyboardButton("🔎 Дата", callback_data="plan:pick"),
                     InlineKeyboardButton("Вперёд ›", callback_data=f"plan:{following}:0")])
+    buttons.append([InlineKeyboardButton("‹ Назад", callback_data="ui:close")])
     return "\n".join(lines), live_markup(InlineKeyboardMarkup(buttons))
 
 
 async def today_plan(update,context, day=None):
     day = day or datetime.now(timezone_for(update.effective_chat.id)).date().isoformat()
     text, markup = plan_page(update.effective_chat.id, day)
-    await update.effective_message.reply_text(live_ui_text(text), reply_markup=live_markup(markup), parse_mode="HTML")
+    return await replace_active_ui(update, context, text, markup)
 
 
 
 async def callback(update,context):
 
-    raw_query=update.callback_query; await raw_query.answer()
+    raw_query=update.callback_query; await safe_callback_answer(raw_query)
+    if not str(raw_query.data or "").startswith("ackrem:"):
+        await adopt_active_ui(raw_query)
     q=LiveCallbackQuery(raw_query)
     register_bot_user(q.message.chat_id, getattr(update, "effective_user", None))
+
+    if q.data == "ui:close":
+        with contextlib.suppress(Exception):
+            await raw_query.message.delete()
+        set_active_ui_message_id(q.message.chat_id, 0)
+        return
+
+    if q.data == "menu:more":
+        text, markup = more_page()
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
     # Model and key management is a platform setting now. Older inline
     # messages may still contain these buttons, so protect those too.
@@ -3560,11 +4723,24 @@ async def callback(update,context):
         return await q.edit_message_text("Модели и ключи уже настроены Noema.", reply_markup=settings_keyboard(q.message.chat_id))
 
     if q.data == "settings:model":
-        selected = model_router().resolve(q.message.chat_id, "chat")
-        lines = ["<b>🧠 Текущая модель</b>", html.escape(selected["primary"]), "", "Выберите модель:"]
-        buttons = []
+        current = effective_user_ai_config(q.message.chat_id)
+        selected = current["effective_model"]
+        lines = [
+            "<b>🧠 Модель</b>",
+            f"Сейчас: <code>{html.escape(str(selected['value']))}</code>",
+            f"Источник: <b>{html.escape(str(selected['source']))}</b>",
+            "",
+            f"FAST default: <code>{html.escape(str(current['fast_default']['value']))}</code>",
+            f"STRONG fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
+            "",
+            "Выберите модель или вернитесь в автоматический router mode:",
+        ]
+        buttons = [[InlineKeyboardButton(
+            ("●" if selected["source"] != "USER" else "○") + " Авто",
+            callback_data="model:auto",
+        )]]
         for model in available_models_for(q.message.chat_id):
-            mark = "●" if model == selected["primary"] else "○"
+            mark = "●" if selected["source"] == "USER" and model == selected["value"] else "○"
             buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
         buttons += [
             [InlineKeyboardButton("➕ Добавить модель", callback_data="model:add")],
@@ -3604,7 +4780,7 @@ async def callback(update,context):
         context.user_data["awaiting_vision_model"] = "personal"
         return await q.edit_message_text(
             "Пришлите точный ID Vision-модели OpenRouter, например:\n<code>google/gemini-2.5-flash</code>",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:vision")]]))
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:vision")]]))
 
     if q.data == "vision:shared:add":
         if q.message.chat_id not in ADMIN_CHAT_IDS:
@@ -3612,7 +4788,7 @@ async def callback(update,context):
         context.user_data["awaiting_vision_model"] = "shared"
         return await q.edit_message_text(
             "Пришлите точный ID общей Vision-модели. Она будет использоваться всеми, у кого нет личного ключа.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:vision")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:vision")]]))
 
     if q.data == "vision:personal:reset":
         model_router().set_vision(q.message.chat_id, "")
@@ -3620,15 +4796,36 @@ async def callback(update,context):
             f"Vision-модель возвращена к стандартной: <code>{html.escape(shared_vision_model())}</code>.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]))
 
+    if q.data == "model:auto":
+        model_router().set_primary(q.message.chat_id, "")
+        current = effective_user_ai_config(q.message.chat_id)["effective_model"]
+        await q.edit_message_text(
+            f"<b>🧠 Автоматический режим</b>\n"
+            f"Сейчас: <code>{html.escape(str(current['value']))}</code>\n"
+            f"Источник: <b>{html.escape(str(current['source']))}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Изменить", callback_data="settings:model")],
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
+            ]),
+        )
+        return
+
     if q.data.startswith("model:set:"):
         model = q.data.split(":", 2)[2]
         if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель недоступна.")
+            return await q.edit_message_text("Модель недоступна.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
+            ]))
         model_router().set_primary(q.message.chat_id, model)
         await q.edit_message_text(
-            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n\nСледующее сообщение сразу будет обработано этой моделью.",
+            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n"
+            f"Источник: <b>USER</b>\n\nСледующее сообщение сразу будет обработано этой моделью.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Изменить", callback_data="settings:model")]]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Изменить", callback_data="settings:model")],
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
+            ]),
         )
         return
 
@@ -3637,7 +4834,7 @@ async def callback(update,context):
         await q.edit_message_text(
             "Пришлите точный ID модели OpenRouter, например:\n<code>deepseek/deepseek-v4-flash-0731</code>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:model")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:model")]]),
         )
         return
 
@@ -3651,7 +4848,9 @@ async def callback(update,context):
     if q.data.startswith("model:delete:"):
         model = q.data.split(":", 2)[2]
         if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель уже удалена.")
+            return await q.edit_message_text("Модель уже удалена.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
+            ]))
         set_chat_model(q.message.chat_id, model, enabled=False)
         if model_router().resolve(q.message.chat_id, "chat")["primary"] == model:
             model_router().set_primary(q.message.chat_id, "")
@@ -3670,19 +4869,25 @@ async def callback(update,context):
     if q.data.startswith("mode:set:"):
         mode = q.data.split(":", 2)[2]
         if mode not in ("text", "voice", "voice_and_text"):
-            return await q.edit_message_text("Неизвестный режим.")
+            return await q.edit_message_text("Неизвестный режим.", reply_markup=mode_keyboard(q.message.chat_id))
         set_mode(q.message.chat_id, mode)
         labels = {"text": "💬 Текст", "voice": "🎙 Голос", "voice_and_text": "🔊 Голос + текст"}
         await q.edit_message_text(f"Режим: {labels[mode]}.", reply_markup=mode_keyboard(q.message.chat_id))
         return
 
     if q.data == "menu:reminders":
-        return await reminders(update, context)
+        text, markup = reminders_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:tasks":
-        return await tasks(update, context)
+        text, markup = tasks_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "tasks:add":
         context.user_data["awaiting_task_text"] = True
-        return await q.message.reply_text("Напишите задачу. Можно добавить дату: <code>12.09 — позвонить врачу</code>. Без даты поставлю на сегодня.", parse_mode="HTML")
+        return await q.edit_message_text(
+            "Напишите задачу. Можно добавить дату: <code>12.09 — позвонить врачу</code>. Без даты поставлю на сегодня.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="menu:tasks")]
+            ]))
     if q.data.startswith("tasks:page:"):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = tasks_page(q.message.chat_id, page)
@@ -3691,7 +4896,7 @@ async def callback(update,context):
         _, task_id, page = q.data.split(":")
         return await q.edit_message_text(f"Удалить задачу #{task_id}?", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Удалить", callback_data=f"deltask:{task_id}:{page}"),
-             InlineKeyboardButton("Отмена", callback_data=f"tasks:page:{page}")],
+             InlineKeyboardButton("‹ Назад", callback_data=f"tasks:page:{page}")],
         ]))
     if q.data.startswith("deltask:"):
         _, task_id, page = q.data.split(":")
@@ -3699,7 +4904,9 @@ async def callback(update,context):
         text, markup = tasks_page(q.message.chat_id, int(page))
         return await q.edit_message_text(live_ui_text(text), reply_markup=markup, parse_mode="HTML")
     if q.data in ("menu:expenses", "menu:budget"):
-        return await list_expenses(update, context)
+        today = datetime.now(timezone_for(q.message.chat_id)).date()
+        text, markup = budget_page(q.message.chat_id, today.replace(day=1).isoformat(), today.isoformat())
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("budget:"):
         action = q.data.split(":", 1)[1]
         today = datetime.now(timezone_for(q.message.chat_id)).date()
@@ -3707,7 +4914,11 @@ async def callback(update,context):
             return
         if action == "pick":
             context.user_data["awaiting_budget_range"] = True
-            return await q.message.reply_text("Напишите период: 01.09.2026–07.09.2026. Можно указать и одну дату.")
+            return await q.edit_message_text(
+                "Напишите период: 01.09.2026–07.09.2026. Можно указать и одну дату.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("‹ Назад", callback_data="budget:month")]
+                ]))
         if action == "today":
             date_from = date_to = today.isoformat(); page = 0
         elif action == "yesterday":
@@ -3731,14 +4942,21 @@ async def callback(update,context):
                 return
             raise
     if q.data == "menu:briefing":
-        return await q.edit_message_text(live_ui_text(build_briefing(q.message.chat_id)), parse_mode="HTML")
+        return await q.edit_message_text(
+            live_ui_text(build_briefing(q.message.chat_id)), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="menu:more")]]))
     if q.data.startswith("plan:"):
         value = q.data.split(":", 1)[1]
         if value == "noop":
             return
         if value == "pick":
             context.user_data["awaiting_plan_date"] = True
-            return await q.message.reply_text("Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.")
+            today = datetime.now(timezone_for(q.message.chat_id)).date().isoformat()
+            return await q.edit_message_text(
+                "Напишите дату в формате ДД.ММ.ГГГГ, например 15.09.2026.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("‹ Назад", callback_data=f"plan:{today}:0")]
+                ]))
         try:
             day, page = value.split(":") if ":" in value else (value, "0")
             text, markup = plan_page(q.message.chat_id, day, int(page))
@@ -3776,9 +4994,11 @@ async def callback(update,context):
         text, markup = plan_page(q.message.chat_id, day, int(page))
         return await q.edit_message_text(live_ui_text(text), reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:people":
-        return await list_people(update, context)
+        text, markup = people_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "menu:notes":
-        return await notes(update, context)
+        text, markup = notes_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("notes:page:"):
         page = int(q.data.rsplit(":", 1)[1])
         text, markup = notes_page(q.message.chat_id, page)
@@ -3788,7 +5008,7 @@ async def callback(update,context):
         return await q.edit_message_text(
             f"Удалить заметку #{note_id}? Это действие нельзя отменить.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delnote:{note_id}:{page}"),
-                                                InlineKeyboardButton("Отмена", callback_data=f"notes:page:{page}")]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f"notes:page:{page}")]]))
     if q.data.startswith("delnote:"):
         _, note_id, page = q.data.split(":")
         delete_note(q.message.chat_id, int(note_id))
@@ -3800,13 +5020,15 @@ async def callback(update,context):
     if q.data.startswith("rule:edit:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
         if not any(rule["id"] == rule_id for rule in behavior_rules_for(q.message.chat_id)):
-            return await q.edit_message_text("Правило не найдено.")
+            return await q.edit_message_text("Правило не найдено.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:rules")]
+            ]))
         context.user_data["awaiting_rule_edit"] = rule_id
-        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:rules")]]))
+        return await q.edit_message_text("Пришлите новую формулировку правила.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:rules")]]))
     if q.data.startswith("rule:deleteask:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
         return await q.edit_message_text(f"Удалить правило <code>#{rule_id}</code>?", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"rule:delete:{rule_id}"), InlineKeyboardButton("‹ Назад", callback_data="settings:rules")],
         ]))
     if q.data.startswith("rule:delete:"):
         rule_id = int(q.data.rsplit(":", 1)[1])
@@ -3815,7 +5037,7 @@ async def callback(update,context):
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data == "rule:deleteallask":
         return await q.edit_message_text("Удалить все правила? Напоминания и другие данные не затрону.", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("Отмена", callback_data="settings:rules")],
+            [InlineKeyboardButton("🗑 Удалить все", callback_data="rule:deleteall"), InlineKeyboardButton("‹ Назад", callback_data="settings:rules")],
         ]))
     if q.data == "rule:deleteall":
         delete_behavior_rule(q.message.chat_id, all=True)
@@ -3850,7 +5072,9 @@ async def callback(update,context):
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
         if not secret:
-            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         token = quick_action_token(device_id, "action", secret)
         text = (
             "⚡ <b>Быстрая команда</b>\n\n"
@@ -3867,7 +5091,9 @@ async def callback(update,context):
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         secret = device_quick_action_secret(q.message.chat_id, device_id) if device else ""
         if not secret:
-            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.")
+            return await q.edit_message_text("Устройство не найдено. Выпустите новое подключение.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         text = (
             "📤 <b>Поделиться в Noema</b>\n\n"
             "Эта команда появляется в системном меню «Поделиться». Через неё можно отправить в Noema фото, скриншот, PDF, файл, ссылку или выделенный текст. Материал попадёт в тот же чат и обработается как обычное вложение Telegram.\n\n"
@@ -3881,7 +5107,9 @@ async def callback(update,context):
         device_id = q.data.split(":", 2)[2]
         device = next((item for item in quick_action_devices(q.message.chat_id) if item["id"] == device_id), None)
         if not device:
-            return await q.edit_message_text("Устройство не найдено или отключено.")
+            return await q.edit_message_text("Устройство не найдено или отключено.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:iphone")]
+            ]))
         text = (
             '<b>iPhone и Noema</b>\n\n'
             '1. Подключите одну голосовую команду к кнопке iPhone или Back Tap.\n'
@@ -3908,19 +5136,23 @@ async def callback(update,context):
     if q.data.startswith("iphone:set:"):
         _, _, device_id, trigger, action = q.data.split(":")
         if not set_quick_action_binding(q.message.chat_id, device_id, trigger, action):
-            return await q.edit_message_text("Не удалось изменить действие.")
+            return await q.edit_message_text("Не удалось изменить действие.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:device:{device_id}")]
+            ]))
         text, markup = iphone_device_page(q.message.chat_id, device_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("iphone:rotateask:"):
         device_id = q.data.split(":", 2)[2]
         return await q.edit_message_text("Выпустить новый ключ? Старые команды Shortcut сразу перестанут работать.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Выпустить", callback_data=f"iphone:rotate:{device_id}")],
-                                                [InlineKeyboardButton("Отмена", callback_data=f"iphone:shortcut:{device_id}")]]))
+                                                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:shortcut:{device_id}")]]))
     if q.data.startswith("iphone:rotate:"):
         device_id = q.data.split(":", 2)[2]
         secret = rotate_quick_action_secret(q.message.chat_id, device_id)
         if not secret:
-            return await q.edit_message_text("Не удалось выпустить ключ. Проверьте USER_SECRETS_MASTER_KEY.")
+            return await q.edit_message_text("Не удалось выпустить ключ. Проверьте USER_SECRETS_MASTER_KEY.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data=f"iphone:shortcut:{device_id}")]
+            ]))
         return await q.edit_message_text("🔑 <b>Новый ключ выпущен</b>\nСтарые быстрые команды сразу отключены. Откройте нужную команду ниже и вставьте новый ключ в Shortcut.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📱 Открыть подключение", callback_data=f"iphone:shortcut:{device_id}")],
                                                                     [InlineKeyboardButton("‹ iPhone", callback_data="settings:iphone")]]))
@@ -3928,7 +5160,7 @@ async def callback(update,context):
         device_id = q.data.split(":", 2)[2]
         return await q.edit_message_text("Отключить iPhone? Команды с этого устройства сразу перестанут работать.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Отключить", callback_data=f'iphone:revoke:{device_id}'),
-                                                InlineKeyboardButton("Отмена", callback_data=f'iphone:device:{device_id}')]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f'iphone:device:{device_id}')]]))
     if q.data.startswith("iphone:revoke:"):
         device_id = q.data.split(":", 2)[2]
         revoke_quick_action_device(q.message.chat_id, device_id)
@@ -3939,9 +5171,15 @@ async def callback(update,context):
         with conn() as c:
             c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
                       (reminder_id, q.message.chat_id))
-        return await q.edit_message_text("✅ Отмечено как выполненное.")
+        sent = await raw_query.edit_message_text(
+            live_ui_text("⏰ Напоминание выполнено."),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
+        schedule_ephemeral_delete(context, raw_query.message)
+        return sent
     if q.data == "settings:status":
-        return await q.edit_message_text(status_text(q.message.chat_id), parse_mode="HTML")
+        return await q.edit_message_text(
+            status_text(q.message.chat_id), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:back")]]))
     if q.data == "settings:keys":
         text, markup = api_keys_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -3971,7 +5209,7 @@ async def callback(update,context):
         context.user_data["awaiting_interface_emoji"] = slot
         return await q.edit_message_text(
             f"Выбрано: <b>{html.escape(EMOJI_SLOT_NAMES[slot])}</b>.\n\nТеперь просто отправь один живой эмодзи из Premium-панели.",
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="emoji:slots")]]))
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="emoji:slots")]]))
     if q.data.startswith("emoji:page:"):
         if q.message.chat_id not in ADMIN_CHAT_IDS:
             return await q.answer("Нет доступа.", show_alert=True)
@@ -3983,7 +5221,7 @@ async def callback(update,context):
     if q.data == "emoji:clearask":
         return await q.edit_message_text("Очистить всю палитру живых эмодзи для ответов?", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Очистить", callback_data="emoji:clear")],
-            [InlineKeyboardButton("Отмена", callback_data="settings:emoji")],
+            [InlineKeyboardButton("‹ Назад", callback_data="settings:emoji")],
         ]))
     if q.data == "emoji:clear":
         set_app_setting("reply_custom_emoji_palette", "[]")
@@ -3994,7 +5232,7 @@ async def callback(update,context):
             return await q.answer("Сначала нужен USER_SECRETS_MASTER_KEY на сервере.", show_alert=True)
         context.user_data["awaiting_personal_api_key"] = True
         return await q.edit_message_text("🔐 Пришлите личный ключ OpenRouter одним сообщением. После сохранения я удалю это сообщение из чата.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="settings:keys")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:keys")]]))
     if q.data == "keys:remove":
         remove_user_api_key(q.message.chat_id)
         text, markup = api_keys_page(q.message.chat_id)
@@ -4031,13 +5269,26 @@ async def callback(update,context):
             return await q.answer("Нет доступа.", show_alert=True)
         _, _, user_number, page = q.data.split(":")
         with conn() as c:
-            user = c.execute("SELECT user_number,chat_id,username,display_name FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
+            user = c.execute("SELECT user_number,chat_id,username,display_name,first_seen_at,last_seen_at FROM bot_users WHERE user_number=?", (int(user_number),)).fetchone()
         if not user:
-            return await q.edit_message_text("Пользователь не найден.")
+            return await q.edit_message_text("Пользователь не найден.", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("‹ Назад", callback_data="keys:admin_usage")]
+            ]))
         user = dict(user)
-        rows = [row for row in usage_summary(user["chat_id"])
-                if row.get("source") in {"shared", "managed"}]
-        text = usage_text(rows, f'📊 <b>Ключ Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        summary = next((item for item in admin_usage_users() if item["chat_id"] == user["chat_id"]), None)
+        rows = admin_user_usage_rows(user["chat_id"])
+        text = usage_text(rows, f'📊 <b>Пользователь Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
+        if summary:
+            source = "user key" if summary["has_personal_key"] else "нет"
+            managed = "да" if summary["has_managed_key"] else "нет"
+            limit = f"${float(summary['monthly_limit_usd']):.2f}/мес." if summary["has_managed_key"] else "общий ключ · без отдельного лимита"
+            last = str(summary.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
+            text += ("\n\n<b>Профиль и учёт</b>\n"
+                     f"Telegram ID: <code>{int(user['chat_id'])}</code>\n"
+                     f"Personal API key: {source} · managed key: {managed}\n"
+                     f"Effective model: <code>{html.escape(str(summary['effective_model']))}</code>\n"
+                     f"Лимит: {limit}\n"
+                     f"Последняя LLM-активность: {html.escape(last)}")
         text += managed_key_lifecycle_text(user["chat_id"])
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
@@ -4045,14 +5296,16 @@ async def callback(update,context):
         ]))
     if q.data == "settings:clear":
         clear_history(q.message.chat_id)
-        return await q.edit_message_text("Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.")
+        return await q.edit_message_text(
+            "Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:back")]]))
 
     if q.data.startswith("delremask:"):
         _, rid, page = q.data.split(":")
         return await q.edit_message_text(
             f"Удалить напоминание #{rid}? Это действие нельзя отменить.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"delrem:{rid}:{page}"),
-                                                InlineKeyboardButton("Отмена", callback_data=f"reminders:page:{page}")]]))
+                                                InlineKeyboardButton("‹ Назад", callback_data=f"reminders:page:{page}")]]))
     if q.data == "reminders:noop":
         return
     if q.data.startswith("reminders:page:"):
@@ -4068,6 +5321,22 @@ async def callback(update,context):
             c.execute("DELETE FROM reminders WHERE id=? AND chat_id=?",(rid,q.message.chat_id))
         text, markup = reminders_page(q.message.chat_id, int(page))
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+def more_page():
+    markup = InlineKeyboardMarkup([
+        [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"),
+         interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
+        [interface_inline_button("people", "👥", "Люди", "menu:people"),
+         interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
+        [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
+        [InlineKeyboardButton("‹ Назад", callback_data="ui:close")],
+    ])
+    if QUICK_ACTIONS_BASE_URL:
+        rows = list(markup.inline_keyboard)
+        rows.insert(0, [InlineKeyboardButton("Открыть Noema", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app"))])
+        markup = InlineKeyboardMarkup(rows)
+    return "✨ Дополнительно:", live_markup(markup)
 
 
 def settings_keyboard(chat_id=None):
@@ -4087,6 +5356,7 @@ def settings_keyboard(chat_id=None):
         ]
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="ui:close")])
     return live_markup(InlineKeyboardMarkup(rows))
 
 
@@ -4177,8 +5447,10 @@ def api_keys_page(chat_id):
         return "Ключи и модели настроены Noema.", InlineKeyboardMarkup([[InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]])
     with conn() as c:
         count = c.execute("SELECT COUNT(*) AS total FROM managed_api_keys WHERE active=1").fetchone()["total"]
+        user_count = c.execute("SELECT COUNT(*) AS total FROM bot_users").fetchone()["total"]
     if OR_MANAGEMENT_KEY and secrets_cipher():
-        state = f"Автовыдача включена · лимит <b>${USER_MONTHLY_LIMIT_USD:.2f}</b> на пользователя в месяц.\nВыдано ключей: <b>{count}</b>."
+        state = (f"Автовыдача включена · лимит <b>${USER_MONTHLY_LIMIT_USD:.2f}</b> на пользователя в месяц.\n"
+                 f"Зарегистрировано пользователей: <b>{user_count}</b> · выдано ключей: <b>{count}</b>.")
     elif not OR_MANAGEMENT_KEY:
         state = "Автовыдача выключена: добавьте <code>OPENROUTER_MANAGEMENT_API_KEY</code> в Secrets Amvera. До этого используется общий ключ."
     else:
@@ -4186,7 +5458,7 @@ def api_keys_page(chat_id):
     buttons = [[InlineKeyboardButton("📊 Расходы пользователей", callback_data="keys:admin_usage")],
                [InlineKeyboardButton("↻ Создать и синхронизировать ключи", callback_data="keys:sync_labels")],
                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
-    return "🔐 <b>Управление AI</b>\n" + state + "\n\nПользователи получают отдельный ключ автоматически и не видят модели или API-ключи.", live_markup(InlineKeyboardMarkup(buttons))
+    return "🔐 <b>Управление AI</b>\n" + state + "\n\nРасходы показывают всех зарегистрированных пользователей, включая usage = 0. Пользователи не видят модели или API-ключи.", live_markup(InlineKeyboardMarkup(buttons))
 
 
 def usage_text(rows, title, show_chats=False):
@@ -4195,17 +5467,17 @@ def usage_text(rows, title, show_chats=False):
     total_cost = sum(float(row["cost"] or 0) for row in rows)
     total_requests = sum(int(row["requests"] or 0) for row in rows)
     total_tokens = sum(int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in rows)
-    lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", "",
-             "<pre>Модель                    Запр.   Токены        $</pre>"]
+    lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Estimated cost: <b>${total_cost:.4f}</b>", "",
+             "<pre>Модель                    Запр.  In / Out       $</pre>"]
     for row in rows[:8]:
         source = {"personal": "личный", "managed": "отдельный"}.get(row["source"], "общий")
         chat = f'чат <code>{row["chat_id"]}</code> · ' if show_chats else ""
         model = str(row["model"] or "—")
         model = (model[:23] + "…") if len(model) > 24 else model
-        tokens = int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0)
-        lines.append(f'{chat}<pre>{html.escape(model):<25}{int(row["requests"] or 0):>5,}{tokens:>9,}  ${float(row["cost"] or 0):>8.4f}</pre>')
+        input_tokens, output_tokens = int(row["input_tokens"] or 0), int(row["output_tokens"] or 0)
+        lines.append(f'{chat}<pre>{html.escape(model):<25}{int(row["requests"] or 0):>5,}{input_tokens:>5,}/{output_tokens:<5,} ${float(row["cost"] or 0):>8.4f}</pre>')
         if not show_chats:
-            lines.append(f"  {source} ключ")
+            lines.append(f"  {source} ключ · provider: {html.escape(str(row.get('provider') or 'openrouter'))}")
     if len(rows) > 8:
         lines.append(f"\nПоказаны 8 из {len(rows)} моделей.")
     return "\n".join(lines)
@@ -4237,22 +5509,24 @@ def user_caption(row):
 
 
 def shared_usage_users_page(page=0, page_size=8):
-    users = shared_usage_users()
+    users = admin_usage_users()
     pages = max(1, (len(users) + page_size - 1) // page_size)
     page = max(0, min(int(page), pages - 1))
     shown = users[page * page_size:(page + 1) * page_size]
     if not users:
-        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗа последние 30 дней расхода пока нет.",
+        return ("📈 <b>Ключи Noema · пользователи</b>\n\nЗарегистрированных пользователей пока нет.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")]]))
     total_cost = sum(float(row["cost"] or 0) for row in users)
     total_requests = sum(int(row["requests"] or 0) for row in users)
     lines = ["📈 <b>Ключи Noema · пользователи</b>",
-             f"Пользователей: <b>{len(users)}</b> · Запросов: <b>{total_requests:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", ""]
+             f"Текущий месяц · пользователей: <b>{len(users)}</b> · запросов: <b>{total_requests:,}</b> · estimated cost: <b>${total_cost:.4f}</b>", ""]
     buttons = []
     for row in shown:
         number = int(row["user_number"])
         caption = user_caption(row)
-        lines.append(f'<code>#{number:03d}</code> {html.escape(caption)} · {int(row["requests"]):,} запр. · ${float(row["cost"] or 0):.4f}')
+        total_tokens = int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0)
+        activity = str(row.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
+        lines.append(f'<code>#{number:03d}</code> {html.escape(caption)} · {int(row["requests"]):,} запр. · {total_tokens:,} ток. · ${float(row["cost"] or 0):.4f} · {activity}')
         buttons.append(InlineKeyboardButton(f"#{number:03d} {caption}"[:60], callback_data=f"keys:admin_user:{number}:{page}"))
     markup_rows = button_rows(buttons, 2)
     if pages > 1:
@@ -4270,11 +5544,13 @@ def shared_usage_users_page(page=0, page_size=8):
 def mode_keyboard(chat_id):
     current = get_mode(chat_id)
     choices = [("text", "💬 Текст"), ("voice", "🎙 Голос"), ("voice_and_text", "🔊 Голос + текст")]
-    return live_markup(InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(("● " if current == value else "○ ") + label,
                               callback_data=f"mode:set:{value}")]
         for value, label in choices
-    ]))
+    ]
+    rows.append([InlineKeyboardButton("‹ Назад", callback_data="settings:back")])
+    return live_markup(InlineKeyboardMarkup(rows))
 
 
 def status_text(chat_id):
@@ -4289,7 +5565,7 @@ def status_text(chat_id):
 
 
 
-def set_briefing(chat_id,enabled,time_="08:00",city="",topics=""):
+def set_briefing(chat_id,enabled,time_="08:30",city="",topics=""):
 
     with conn() as c:
 
@@ -4297,7 +5573,7 @@ def set_briefing(chat_id,enabled,time_="08:00",city="",topics=""):
 
         use_city=city or (old["city"] if old else "") or DEFAULT_CITY
 
-        use_topics=topics or (old["topics"] if old else "") or "главные новости, ИИ, бизнес"
+        use_topics=topics or (old["topics"] if old else "") or "главные новости мира"
 
         c.execute("""INSERT INTO briefings(chat_id,enabled,time,city,topics,last_sent_date)
 
@@ -4313,7 +5589,7 @@ def set_briefing_preferences(chat_id, city="", topics="", time="", enabled=None)
     with conn() as c:
         old = c.execute("SELECT * FROM briefings WHERE chat_id=?", (chat_id,)).fetchone()
     old = dict(old) if old else {}
-    use_time = time or old.get("time") or "08:00"
+    use_time = time or old.get("time") or "08:30"
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", use_time):
         return {"ok": False, "tool": "set_briefing_preferences", "error": "time_format"}
     result = set_briefing(chat_id, old.get("enabled", False) if enabled is None else bool(enabled),
@@ -4436,15 +5712,20 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text("Нужен именно живой эмодзи из Premium-панели. Попробуй ещё раз.")
         key = f"task_{emoji_slot}_custom_emoji_id" if emoji_slot in {"open", "done", "failed"} else f"interface_{emoji_slot}_custom_emoji_id"
         set_app_setting(key, entity.custom_emoji_id)
-        return await update.effective_message.reply_text(
-            f"Готово — кнопка «{EMOJI_SLOT_NAMES[emoji_slot]}» обновлена.", reply_markup=main_keyboard())
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = emoji_palette_page()
+        return await refresh_active_ui(update, context, text, markup)
 
     rule_id = context.user_data.pop("awaiting_rule_edit", None)
     if rule_id is not None:
         result = update_behavior_rule(cid, int(rule_id), t)
         if not result.get("ok"):
             return await update.effective_message.reply_text("Не удалось обновить правило.")
-        return await update.effective_message.reply_text(f'📜 Правило <code>#{rule_id}</code> обновлено.', parse_mode="HTML")
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = rules_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_task_text", False):
         raw = t.strip()
@@ -4462,8 +5743,11 @@ async def text_handler(update,context):
                 return await update.effective_message.reply_text("Не поняла дату. Пример: <code>12.09 — позвонить врачу</code>.", parse_mode="HTML")
         if not raw:
             return await update.effective_message.reply_text("Напишите текст задачи.")
-        result = add_task(cid, raw, due_date)
-        return await update.effective_message.reply_text(f"✅ Задача <code>#{result['id']}</code> добавлена на {due_date[8:10]}.{due_date[5:7]}.", parse_mode="HTML")
+        add_task(cid, raw, due_date)
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = tasks_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_personal_api_key", False):
         if not t.startswith("sk-or-") or len(t) < 24:
@@ -4473,14 +5757,15 @@ async def text_handler(update,context):
             await update.effective_message.delete()
         if not ok:
             return await update.effective_message.reply_text("Не удалось включить личный ключ: администратор не настроил master key.")
-        return await update.effective_message.reply_text(f"🔐 Личный ключ {result} сохранён и теперь имеет приоритет.", reply_markup=settings_keyboard(cid))
+        text, markup = api_keys_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     vision_scope = context.user_data.pop("awaiting_vision_model", "")
     if vision_scope:
         model = t.strip()
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.:-]+", model):
             return await update.effective_message.reply_text(
-                "Не похож на ID модели. Формат: <провайдер>/<модель>, например <code>google/gemini-2.5-flash</code>.",
+                "Не похож на ID модели. Формат: &lt;провайдер&gt;/&lt;модель&gt;, например <code>google/gemini-2.5-flash</code>.",
                 parse_mode="HTML")
         if vision_scope == "shared":
             if cid not in ADMIN_CHAT_IDS:
@@ -4504,7 +5789,9 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text("Не поняла дату. Пример: 01.09.2026–07.09.2026.")
         date_from = min(parsed).isoformat(); date_to = max(parsed).isoformat()
         text, markup = budget_page(cid, date_from, date_to)
-        return await update.effective_message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_plan_date", False):
         parsed = None
@@ -4516,7 +5803,10 @@ async def text_handler(update,context):
                 pass
         if not parsed:
             return await update.effective_message.reply_text("Не поняла дату. Пример: 15.09.2026.")
-        return await today_plan(update, context, parsed.isoformat())
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = plan_page(cid, parsed.isoformat())
+        return await refresh_active_ui(update, context, text, markup)
 
     if context.user_data.pop("awaiting_model", False):
         model = t.strip()
@@ -4530,16 +5820,12 @@ async def text_handler(update,context):
 
     if t in ("⚙️ Настройки", "Настройки"):
         await consume_menu_tap()
-        return await update.effective_message.reply_text(live_ui_text("⚙️ Настройки"), reply_markup=settings_keyboard(cid), parse_mode="HTML")
+        return await replace_active_ui(update, context, "⚙️ Настройки", settings_keyboard(cid))
 
     if t in ("☰ Ещё", "Ещё"):
         await consume_menu_tap()
-        return await update.effective_message.reply_text(
-            live_ui_text("✨ Дополнительно:"), parse_mode="HTML", reply_markup=live_markup(InlineKeyboardMarkup([
-                [interface_inline_button("tasks", "✅", "Задачи", "menu:tasks"), interface_inline_button("reminders", "⏰", "Напоминания", "menu:reminders")],
-                [interface_inline_button("people", "👥", "Люди", "menu:people"), interface_inline_button("notes", "📝", "Заметки", "menu:notes")],
-                [interface_inline_button("budget", "💳", "Бюджет", "menu:budget")],
-            ])))
+        text, markup = more_page()
+        return await replace_active_ui(update, context, text, markup)
 
     if t=="📚 Знания":
         return await update.effective_message.reply_text("📚 Знания\nНапишите, что найти: проект, человека, ресурс или тему. Например: «где Узел задеплоен?»")
@@ -4598,7 +5884,7 @@ async def text_handler(update,context):
 
         m=re.search(r"(\d{1,2}):(\d{2})",t)
 
-        time_=f"{int(m.group(1)):02d}:{m.group(2)}" if m else "08:00"
+        time_=f"{int(m.group(1)):02d}:{m.group(2)}" if m else "08:30"
 
         city=DEFAULT_CITY
 
@@ -4651,9 +5937,19 @@ async def text_handler(update,context):
 
 
 
+    if TELEGRAM_DRAFT_STREAMING_ENABLED and update.effective_chat.type == "private":
+        try:
+            completed = await stream_answer_to_telegram(update, context, t)
+            if completed:
+                await drain_media_outbox(update, context)
+        except Exception as e:
+            await safe_error(update, e)
+        return
+
     activity = await begin_activity(update.effective_message, activity_labels(t))
     try:
-        a=await asyncio.to_thread(ask,cid,t); await send_answer(update,a,False,wants_voice(t))
+        a=await asyncio.to_thread(ask,cid,t)
+        await send_answer(update, a, context=context, voice_in=False, force_voice=wants_voice(t))
         await drain_media_outbox(update, context)
     except Exception as e:
         await safe_error(update,e)
@@ -4672,9 +5968,8 @@ async def voice_handler(update,context):
     try:
         f=await context.bot.get_file(update.effective_message.voice.file_id); await f.download_to_drive(custom_path=str(p))
         txt=await asyncio.to_thread(transcribe, update.effective_chat.id, p)
-        transcript = "🎤 " + html.escape(txt)
-        await update.effective_message.reply_text(live_ui_text(transcript), parse_mode="HTML")
-        a=await asyncio.to_thread(ask,update.effective_chat.id,txt); await send_answer(update,a,True,wants_voice(txt))
+        a=await asyncio.to_thread(ask,update.effective_chat.id,txt)
+        await send_answer(update, a, context=context, voice_in=True, force_voice=wants_voice(txt))
         await drain_media_outbox(update, context)
     except Exception as e:
         await safe_error(update,e)
@@ -4806,62 +6101,153 @@ async def image_handler(update,context):
 
 
 
-async def reminder_tick(context):
-
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
+def due_reminder_rows(now_iso):
     with conn() as c:
-        initial = c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50", (now_iso,)).fetchall()
-        followups = c.execute("""SELECT id,chat_id,text,followup_count FROM reminders
-                               WHERE sent=1 AND acknowledged=0 AND followup_count<3
-                               AND next_followup_at<>'' AND next_followup_at<=?
-                               ORDER BY next_followup_at LIMIT 50""", (now_iso,)).fetchall()
+        initial = [dict(row) for row in c.execute("SELECT id,chat_id,text FROM reminders WHERE sent=0 AND remind_at_utc<=? ORDER BY remind_at_utc LIMIT 50", (now_iso,)).fetchall()]
+        followups = [dict(row) for row in c.execute("""SELECT id,chat_id,text,followup_count FROM reminders
+                                      WHERE sent=1 AND acknowledged=0 AND followup_count<3
+                                      AND next_followup_at<>'' AND next_followup_at<=?
+                                      ORDER BY next_followup_at LIMIT 50""", (now_iso,)).fetchall()]
+    return initial, followups
+
+
+def mark_reminder_delivered(reminder_id, message_id, is_followup):
+    next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    with conn() as c:
+        c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
+                  (1 if is_followup else 0, next_at, message_id, reminder_id))
+
+
+def mark_reminder_unavailable(row, is_followup):
+    set_app_setting(f'telegram_destination_unavailable:{row["chat_id"]}', datetime.now(timezone.utc).isoformat())
+    with conn() as c:
+        if is_followup:
+            c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='' WHERE id=?", (row["id"],))
+        else:
+            c.execute("UPDATE reminders SET sent=1,next_followup_at='' WHERE id=?", (row["id"],))
+
+
+def reminder_delivery_payload(row, is_followup):
+    prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
+    return (
+        live_ui_text(prefix + row["text"]),
+        live_markup(InlineKeyboardMarkup([[
+            interface_inline_button("reminders", "⏰", "Выполнено", f"ackrem:{row['id']}")
+        ]])),
+    )
+
+
+async def reminder_tick(context):
+    started = time.perf_counter()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    initial, followups = await asyncio.to_thread(due_reminder_rows, now_iso)
+    semaphore = asyncio.Semaphore(4)
 
     async def deliver(row, is_followup=False):
-        prefix = "🔁 Напоминаю ещё раз: " if is_followup else "⏰ Напоминание: "
-        sent_message = await context.bot.send_message(
-            chat_id=row["chat_id"], text=live_ui_text(prefix + row["text"]), parse_mode="HTML",
-            reply_markup=live_markup(InlineKeyboardMarkup([[InlineKeyboardButton("✅ Выполнено", callback_data=f"ackrem:{row['id']}")]])),
-        )
-        next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-        with conn() as c:
-            c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
-                      (1 if is_followup else 0, next_at, sent_message.message_id, row["id"]))
+        async with semaphore:
+            rendered_text, rendered_markup = await asyncio.to_thread(reminder_delivery_payload, row, is_followup)
+            sent_message = await telegram_send_with_retry(
+                context.bot, source="reminder_followup" if is_followup else "reminder",
+                chat_id=row["chat_id"], text=rendered_text, parse_mode="HTML",
+                reply_markup=rendered_markup,
+            )
+            await asyncio.to_thread(mark_reminder_delivered, row["id"], sent_message.message_id, is_followup)
 
-    for row in initial:
+    async def guarded_deliver(row, is_followup=False):
         try:
-            await deliver(row)
+            await deliver(row, is_followup)
+        except Forbidden:
+            await asyncio.to_thread(mark_reminder_unavailable, row, is_followup)
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Reminder delivery deferred chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
         except Exception:
-            pass
-    for row in followups:
-        try:
-            await deliver(row, is_followup=True)
-        except Exception:
-            pass
+            LOGGER.exception("Reminder delivery failed chat_id=%s", row["chat_id"])
 
+    await asyncio.gather(
+        *(guarded_deliver(row, False) for row in initial),
+        *(guarded_deliver(row, True) for row in followups),
+    )
+    record_runtime_metric("reminder_tick_ms", (time.perf_counter() - started) * 1000, delivered=len(initial) + len(followups))
+
+
+
+def initialize_briefing(chat_id):
+    """Persist first-run scheduling so restarts and repeated /start are harmless."""
+    key = f"briefing_welcome:{chat_id}"
+    if app_setting(key):
+        return
+    with conn() as c:
+        existing = c.execute("SELECT 1 FROM briefings WHERE chat_id=?", (chat_id,)).fetchone()
+    if existing:
+        set_app_setting(key, "done")
+        return
+    set_briefing(chat_id, True)
+    set_app_setting(key, str(int(time.time()) + 150))
 
 
 async def briefing_tick(context):
-    with conn() as c: rows=c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()
+    def load_enabled():
+        with conn() as c:
+            return [dict(row) for row in c.execute("SELECT * FROM briefings WHERE enabled=1").fetchall()]
+
+    rows = await asyncio.to_thread(load_enabled)
 
     for row in rows:
 
-        cfg=dict(row)
+        cfg=row
         now = datetime.now(timezone_for(cfg["chat_id"])); today = now.date().isoformat()
 
-        if cfg.get("last_sent_date")==today: continue
+        welcome_key = f'briefing_welcome:{cfg["chat_id"]}'
+        welcome = app_setting(welcome_key)
+        first = welcome.isdigit()
+        if first and time.time() < int(welcome):
+            continue
 
-        if now.strftime("%H:%M") < (cfg.get("time") or "08:00"): continue
+        if not first and cfg.get("last_sent_date")==today: continue
+
+        if not first and now.strftime("%H:%M") < (cfg.get("time") or "08:30"): continue
 
         try:
 
             text=await asyncio.to_thread(build_briefing,cfg["chat_id"])
+            if first:
+                text += ("\n\nЭто твой первый брифинг. Если что-то не подходит, смело поменяем: "
+                         "скажи, какие темы тебе интересны и во сколько присылать. "
+                         f"Пока буду приходить в {cfg.get('time') or '08:30'} по твоему часовому поясу. "
+                         "Рассылку можно отключить в любой момент.")
 
-            await context.bot.send_message(chat_id=cfg["chat_id"], text=live_ui_text(text), parse_mode="HTML")
+            rendered_text = await asyncio.to_thread(live_ui_text, text)
+            await telegram_send_with_retry(
+                context.bot, source="briefing", chat_id=cfg["chat_id"],
+                text=rendered_text, parse_mode="HTML",
+            )
 
-            with conn() as c: c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?",(today,cfg["chat_id"]))
+            def mark_sent():
+                with conn() as c:
+                    c.execute("UPDATE briefings SET last_sent_date=? WHERE chat_id=?", (today, cfg["chat_id"]))
+            await asyncio.to_thread(mark_sent)
+            if first:
+                set_app_setting(welcome_key, "done")
 
-        except Exception: pass
+        except Forbidden:
+            set_app_setting(f'telegram_destination_unavailable:{cfg["chat_id"]}', datetime.now(timezone.utc).isoformat())
+            set_briefing_preferences(cfg["chat_id"], enabled=False)
+            LOGGER.warning("Telegram destination unavailable chat_id=%s source=briefing", cfg["chat_id"])
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Briefing delivery deferred chat_id=%s", cfg["chat_id"])
+        except Exception:
+            LOGGER.exception("Briefing delivery failed chat_id=%s", cfg["chat_id"])
+
+
+async def event_loop_lag_tick(context):
+    loop = asyncio.get_running_loop()
+    expected = context.job.data.get("expected", loop.time())
+    lag_ms = max(0.0, (loop.time() - expected) * 1000)
+    context.job.data["expected"] = loop.time() + 1.0
+    record_runtime_metric("event_loop_lag_ms", lag_ms)
+    if lag_ms > 500:
+        LOGGER.warning("telemetry event_loop_lag_ms=%.1f", lag_ms)
 
 
 
@@ -4924,8 +6310,13 @@ def ingest_from_iphone(chat_id, text="", attachment=None):
 
 async def send_quick_action_feedback(request, chat_id, ok, message):
     try:
-        await request.app["telegram_app"].bot.send_message(
-            chat_id=chat_id, text=live_ui_text(message), parse_mode="HTML")
+        telegram_app = request.app["telegram_app"]
+        rendered_text = await asyncio.to_thread(live_ui_text, message)
+        sent = await telegram_send_with_retry(
+            telegram_app.bot, source="quick_action_feedback",
+            chat_id=chat_id, text=rendered_text, parse_mode="HTML")
+        if is_ephemeral_confirmation(message):
+            schedule_ephemeral_delete(telegram_app, sent)
     except Exception:
         return web.json_response({"ok": False, "error": "telegram_delivery_failed"}, status=502)
     return web.json_response({"ok": ok, "message": message})
@@ -4947,10 +6338,11 @@ async def show_iphone_input(request, chat_id, text="", attachment=None):
             LOGGER.warning("Unable to mirror iPhone attachment into chat %s", chat_id)
     visible = str(text or "").strip()
     if visible:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=live_ui_text(f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}"),
-            parse_mode="HTML")
+        rendered_text = await asyncio.to_thread(
+            live_ui_text, f"🎙 <b>С iPhone</b>\n{html.escape(visible[:3800])}")
+        await telegram_send_with_retry(
+            bot, source="iphone_input", chat_id=chat_id,
+            text=rendered_text, parse_mode="HTML")
 
 
 async def quick_actions_run(request):
@@ -5067,18 +6459,28 @@ async def save_webapp_timezone(request):
     user = valid_webapp_user(payload.get("init_data"))
     if not user or not user.get("id"):
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    register_bot_user(int(user["id"]), user)
     result = set_user_timezone(int(user["id"]), payload.get("timezone"))
     return web.json_response({"ok": bool(result.get("ok")), "timezone": result.get("timezone", "")}, status=200 if result.get("ok") else 400)
 
 
 async def telegram_error_handler(update, context):
     """Keep unexpected callback errors visible in the operator log."""
+    if isinstance(context.error, Forbidden):
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            set_app_setting(f"telegram_destination_unavailable:{chat.id}", datetime.now(timezone.utc).isoformat())
+        LOGGER.warning("Telegram destination unavailable chat_id=%s", getattr(chat, "id", None))
+        return
     LOGGER.exception("Unhandled Telegram update", exc_info=context.error)
 
 
 async def start_quick_actions_server(telegram_app):
     server = web.Application(client_max_size=MAX_FILE_MB * 1024 * 1024)
     server["telegram_app"] = telegram_app
+    import sys
+    from miniapp_api import register_miniapp
+    register_miniapp(server, sys.modules[__name__])
     server.router.add_get("/healthz", health_check)
     server.router.add_get("/timezone", timezone_page)
     server.router.add_post("/api/v1/timezone", save_webapp_timezone)
@@ -5115,11 +6517,32 @@ async def main_async():
 
     print("="*60)
 
-    app=Application.builder().token(TG).build()
+    app=(Application.builder().token(TG)
+         .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+         .pool_timeout(TELEGRAM_POOL_TIMEOUT)
+         .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+         .read_timeout(TELEGRAM_READ_TIMEOUT)
+         .write_timeout(TELEGRAM_WRITE_TIMEOUT)
+         .get_updates_connection_pool_size(2)
+         .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT)
+         .get_updates_connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+         .get_updates_read_timeout(30)
+         .get_updates_write_timeout(TELEGRAM_WRITE_TIMEOUT)
+         .build())
 
     app.add_error_handler(telegram_error_handler)
 
+    # PTB 22.8 preserves the newest Bot API stop event in Update.api_kwargs.
+    # A separate group lets normal message handlers continue unchanged.
+    app.add_handler(TypeHandler(Update, stopped_generation_handler), group=-1)
+
     app.add_handler(CommandHandler("start",start))
+
+    # Measurement-only admin controls. They never expose message, audio,
+    # identity, or secret material and do not touch persistent user data.
+    app.add_handler(CommandHandler("telemetry_reset", telemetry_reset_command))
+    app.add_handler(CommandHandler("telemetry_status", telemetry_status_command))
+    app.add_handler(CommandHandler("telemetry_report", telemetry_report_command))
 
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
 
@@ -5131,17 +6554,29 @@ async def main_async():
 
     app.add_handler(CommandHandler("clearreplyemojis", clear_reply_emojis))
 
-    app.add_handler(CallbackQueryHandler(callback))
+    # Long-running voice/image work and a slow Telegram send must not delay the
+    # acknowledgement of the next inline button.
+    app.add_handler(CallbackQueryHandler(callback, block=False))
 
-    app.add_handler(MessageHandler(filters.VOICE,voice_handler))
+    app.add_handler(MessageHandler(filters.VOICE,voice_handler, block=False))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
+    # block=False is required so a stopped_message_generation update can cancel
+    # a still-running draft instead of waiting behind the text handler.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler, block=False))
 
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,image_handler))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,image_handler, block=False))
 
-    app.job_queue.run_repeating(reminder_tick,interval=5,first=2)
+    app.job_queue.run_repeating(
+        reminder_tick, interval=REMINDER_TICK_SECONDS, first=2,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": REMINDER_TICK_SECONDS},
+    )
 
-    app.job_queue.run_repeating(briefing_tick,interval=60,first=10)
+    app.job_queue.run_repeating(briefing_tick,interval=30,first=10)
+    app.job_queue.run_repeating(
+        event_loop_lag_tick, interval=1, first=1,
+        data={"expected": asyncio.get_running_loop().time() + 1},
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+    )
 
     await app.initialize()
     await app.start()

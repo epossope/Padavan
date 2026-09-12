@@ -1,0 +1,6 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Noema UI Polish V1.2</title><style>
+*{box-sizing:border-box}body{margin:0;padding:24px;background:#151515;color:#eee;font:14px Arial,sans-serif}h1{margin:0 0 22px;font-size:22px}.screen{width:820px;margin:0 0 26px;padding:16px;background:#202020;border:1px solid #3a3a3a;border-radius:16px}.screen h2{margin:0 0 12px;font-size:16px;text-transform:uppercase;letter-spacing:.12em}.pair{display:grid;grid-template-columns:1fr 1fr;gap:16px}.shot{display:grid;gap:7px}.shot strong{font-size:12px;letter-spacing:.13em}.shot img{display:block;width:386px;height:auto;background:#050606;border:1px solid #343434;border-radius:8px}
+</style></head><body><h1>Noema Mini App — UI Polish V1.2</h1><main id="proof"></main><script>
+const screens=['chat','archive','budget','notes','people'];
+document.querySelector('#proof').innerHTML=screens.map(screen=>`<section class="screen" data-screen="${screen}"><h2>${screen}</h2><div class="pair"><div class="shot"><strong>BEFORE · 32d2b40</strong><img src="before-${screen}.png"></div><div class="shot"><strong>AFTER · V1.2</strong><img src="after-${screen}.png"></div></div></section>`).join('');
+</script></body></html>
