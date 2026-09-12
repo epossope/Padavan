@@ -573,9 +573,8 @@ class VisionExtractor:
 
     def _default_models(self):
         import bot
-        config = bot.runtime_config_values()
-        models = [config["vision_model"]]
-        models += [m for m in config["vision_fallback_models"] if m != models[0]]
+        models = [bot.VISION_MODEL]
+        models += [m for m in bot.VISION_FALLBACK_MODELS if m != bot.VISION_MODEL]
         return models
 
     # -- prompt -------------------------------------------------------------
