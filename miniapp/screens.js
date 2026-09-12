@@ -91,7 +91,7 @@ render=function(){
  const title={home:'Noema',archive:'Архив',notes:'Заметки',people:'Люди',tasks:'Задачи',reminders:'Календарь',budget:'Бюджет',settings:'Настройки',chat:'Чат'}[page];
  content.querySelector('h1')?.remove();
  const utilities=page==='settings'?'':`${page!=='chat'?iconButton('bell','Напоминания','data-page="reminders"'):''}${iconButton('settings','Настройки','data-page="settings"')}`;
- document.querySelector('#header').innerHTML=`<div class="header-title">${page!=='home'?iconButton('back','Назад','data-back'):''}<h1>${title}</h1></div><div class="utilities">${utilities}</div>`;
+ document.querySelector('#header').innerHTML=`<div class="header-title"><h1>${title}</h1></div><div class="utilities">${utilities}</div>`;
  document.querySelector('#shell').dataset.page=page;
  content.querySelector('.all-sections')?.remove();
  document.querySelector('#shell').classList.toggle('chat-screen',page==='chat');

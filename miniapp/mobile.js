@@ -21,9 +21,23 @@
  function viewport(){const v=window.visualViewport;document.documentElement.style.setProperty('--visible-height',(v?.height||innerHeight)+'px');document.documentElement.style.setProperty('--keyboard-inset',Math.max(0,innerHeight-(v?.height||innerHeight)-(v?.offsetTop||0))+'px')}
  window.visualViewport?.addEventListener('resize',viewport);window.visualViewport?.addEventListener('scroll',viewport);window.addEventListener('resize',viewport);viewport();
 
- /* Deliberate edge swipe returns to the preceding screen without stealing ordinary scrolls. */
+ /* iPhone-like edge swipe: lock only after a clear horizontal move and never
+    consume a vertical scroll or a horizontal control gesture. */
  let edgeSwipe=null;
- document.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'||page==='home'||e.clientX>28||e.target.closest('input,textarea,select,dialog,.grid'))return;edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId}}, {passive:true});
- document.addEventListener('pointerup',e=>{if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;const dx=e.clientX-edgeSwipe.x,dy=e.clientY-edgeSwipe.y;edgeSwipe=null;if(dx>92&&Math.abs(dy)<Math.abs(dx)*.55){tg?.HapticFeedback?.impactOccurred('light');back()}}, {passive:true});
+ document.addEventListener('pointerdown',e=>{
+  if(e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>26||e.target.closest('input,textarea,select,dialog,.grid,.chip-row,.segments,.bars'))return;
+  edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,dx:0,dy:0};
+ },{passive:true});
+ document.addEventListener('pointermove',e=>{
+  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
+  edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;
+  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>12)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.18&&edgeSwipe.dx>0?'x':'cancel';
+  if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0)edgeSwipe=null;
+ },{passive:true});
+ document.addEventListener('pointerup',e=>{
+  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
+  const {dx,dy,axis}=edgeSwipe;edgeSwipe=null;
+  if(axis==='x'&&dx>Math.min(82,innerWidth*.21)&&Math.abs(dy)<44){tg?.HapticFeedback?.impactOccurred('light');back()}
+ },{passive:true});
  document.addEventListener('pointercancel',()=>edgeSwipe=null,{passive:true});
 })();

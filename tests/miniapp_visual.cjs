@@ -61,6 +61,11 @@ const visualFixture={
    await page.evaluate(route=>go(route),route);
    if(route==='tasks')await page.locator('.task-card details').first().evaluate(element=>element.open=true);
    if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))errors.push(`${route} overflows ${width}`);
+   if(route!=='home'){
+    if(await page.locator('#header [data-back]').count())errors.push(`${route} still exposes a header back arrow ${width}`);
+    const header=await page.locator('#header').boundingBox();
+    if(header.height>34)errors.push(`${route} header is visually oversized ${width}`);
+   }
    if(route==='settings'&&await page.locator('#dock').isVisible())errors.push('Membrane visible in settings');
    if(route==='settings'){
     const sections=page.locator('.admin-ai .runtime-section');
@@ -72,8 +77,8 @@ const visualFixture={
    if(width<=430&&['notes','archive','people'].includes(route)){
     const searchBox=await page.locator('.search-field').boundingBox();
     const chipBox=await page.locator('.chip').first().boundingBox();
-    if(searchBox.height>44)errors.push(`${route} search is visually oversized ${width}`);
-    if(chipBox.height>34)errors.push(`${route} chip is visually oversized ${width}`);
+    if(searchBox.height>34)errors.push(`${route} search is visually oversized ${width}`);
+    if(chipBox.height>30)errors.push(`${route} chip is visually oversized ${width}`);
    }
    if(width<=430&&route==='tasks'){
     const segmentBox=await page.locator('.segments').boundingBox();
@@ -88,14 +93,15 @@ const visualFixture={
    }
    if(width<=430&&route==='budget'){
     const picker=await page.locator('.period-picker').boundingBox(),periods=await page.locator('.budget-controls .segments').boundingBox(),total=await page.locator('.budget-totals .card').first().boundingBox();
-    if(Math.abs(picker.y-periods.y)>3||picker.height>40||periods.height>40||total.height>108)errors.push(`Budget proportions regressed ${width}`);
+    const charts=await Promise.all([0,1].map(index=>page.locator('.budget-dashboard>.card').nth(index).boundingBox()));
+    if(Math.abs(picker.y-periods.y)>3||picker.x<=periods.x||picker.height>36||periods.height>36||total.height>84||charts[1].y<charts[0].y+charts[0].height)errors.push(`Budget proportions regressed ${width}`);
    }
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
     const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x+sphere.width>box.x+box.width+1||sphere.x<sphere.width)errors.push(`Chat sphere is not docked on composer right ${width}`);
     const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild}));
-    if(Number.parseFloat(sphereStyle.width)<52||!sphereStyle.hasCanvas||!sphereStyle.isLast)errors.push(`Chat voice sphere is not the compact right-side action ${width}`);
+    if(Number.parseFloat(sphereStyle.width)<80||Number.parseFloat(sphereStyle.width)>94||box.height>62||!sphereStyle.hasCanvas||!sphereStyle.isLast)errors.push(`Chat voice sphere is not the prominent right-side action ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
     await page.evaluate(()=>say('Слушаю…'));
     if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);
@@ -108,16 +114,17 @@ const visualFixture={
     const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||dockStyle.frame!=='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
     if(width<=430){
      const tile=await page.locator('.home-grid>[data-widget]').first().boundingBox();
+     const focusShape=await page.locator('#dock .focus-pill').evaluate(el=>({body:getComputedStyle(el).borderRadius,organic:getComputedStyle(el,'::before').backgroundImage}));
      await page.evaluate(()=>scrollTo(0,document.documentElement.scrollHeight));await page.waitForTimeout(50);
      const last=await page.locator('.home-grid>[data-widget]').last().boundingBox(),dock=await page.locator('#dock').boundingBox();
-     if(tile.height>145||boxes[1].width>120||last.y+last.height>dock.y+2)errors.push(`Home density or dock safe-zone regressed ${width}`);
+     if(tile.height>145||boxes[1].width>120||last.y+last.height>dock.y+2||focusShape.body!=='0px'||focusShape.organic==='none')errors.push(`Home density, organic focus, or dock safe-zone regressed ${width}`);
      await page.evaluate(()=>scrollTo(0,0));
     }
    }
    if(width===390){
     await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:false});
-    if(['home','tasks','notes','archive','people','budget','settings'].includes(route)){
-     await page.screenshot({path:path.resolve('ui-proof','design-match-v1.1',`v1.1-${route}.png`),fullPage:false});
+    if(['chat','archive','budget','notes','people'].includes(route)){
+     await page.screenshot({path:path.resolve('ui-proof','ui-polish-v1.2',`after-${route}.png`),fullPage:false});
     }
    }
   }
@@ -140,6 +147,16 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
+ await touch.evaluate(()=>go('archive'));
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:105,y:226}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
+ if(await touch.evaluate(()=>page)!=='home')errors.push('Edge swipe did not return to the preceding screen');
+ await touch.evaluate(()=>go('archive'));
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:12,y:350}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
+ if(await touch.evaluate(()=>page)!=='archive')errors.push('Vertical scroll was mistaken for an edge swipe');
  const fullscreen=await browser.newPage({viewport:{width:390,height:844}});
  await fullscreen.route('https://telegram.org/**',route=>route.abort());
  await fullscreen.addInitScript(()=>{
@@ -166,5 +183,5 @@ const visualFixture={
  const fallbackBoot=await fallback.evaluate(()=>window.__telegramBoot);
  if(fallbackBoot.ready!==1||fallbackBoot.expand!==1)errors.push('Telegram expand fallback failed');
  await fallback.close();
- await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('7 viewports × 9 screens + zoom guard + overlay dock + compact composer sphere + direct mouse/touch sorting: passed');
+ await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('7 viewports × 9 screens + edge-swipe guard + overlay dock + prominent composer sphere + direct mouse/touch sorting: passed');
 })().catch(e=>{console.error(e);process.exitCode=1});
