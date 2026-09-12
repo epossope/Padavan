@@ -10,6 +10,23 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_batch_stt_env_prefers_canonical_name_then_one_release_alias(self):
+        values = {"BATCH_STT_MODEL": "canonical-model", "STT_MODEL": "legacy-model"}
+        with patch.object(bot.os, "getenv", side_effect=lambda name: values.get(name)):
+            self.assertEqual(bot.env_first("BATCH_STT_MODEL", "STT_MODEL", default="default"), "canonical-model")
+        values = {"STT_MODEL": "legacy-model"}
+        with patch.object(bot.os, "getenv", side_effect=lambda name: values.get(name)):
+            self.assertEqual(bot.env_first("BATCH_STT_MODEL", "STT_MODEL", default="default"), "legacy-model")
+
+    def test_batch_stt_runtime_uses_canonical_configuration_only(self):
+        source = (Path(__file__).parent.parent / "bot.py").read_text(encoding="utf-8")
+        example = (Path(__file__).parent.parent / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("BATCH_STT_MODEL = env_first(\"BATCH_STT_MODEL\", \"STT_MODEL\"", source)
+        self.assertIn("timeout=BATCH_STT_TIMEOUT_SEC", source)
+        self.assertIn("BATCH_STT_MODEL=mistralai/voxtral-mini-transcribe", example)
+        for removed in ("VOICE_CONVERSATION_ENABLED=", "VOICE_MODE=", "VAD_SPEECH_THRESHOLD="):
+            self.assertNotIn(removed, example)
+
     def test_ab_router_uses_configured_provider_chains_only(self):
         with patch.object(bot, "FAST_MODEL_PROVIDERS", ("fast-one",)), \
              patch.object(bot, "STRONG_MODEL_PROVIDERS", ("strong-one", "strong-two")), \

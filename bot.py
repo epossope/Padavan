@@ -108,6 +108,15 @@ def bool_env(name, default):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_first(*names, default=""):
+    """Return the first non-empty environment value, in precedence order."""
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return default
+
+
 FAST_MODEL = os.getenv("FAST_MODEL", "qwen/qwen3.5-flash-02-23").strip()
 STRONG_MODEL = os.getenv("STRONG_MODEL", "deepseek/deepseek-v3.2").strip()
 FAST_MODEL_PROVIDERS = csv_env("FAST_MODEL_PROVIDERS")
@@ -122,7 +131,14 @@ VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 
 VISION_FALLBACK_MODELS = [x.strip() for x in os.getenv("VISION_FALLBACK_MODELS", "google/gemini-2.5-flash-lite").split(",") if x.strip()]
 
-STT_MODEL = os.getenv("STT_MODEL", "mistralai/voxtral-mini-transcribe").strip()
+# Production speech uses only the reliable OpenRouter batch path.  STT_MODEL is
+# deliberately retained as a one-release compatibility alias for existing
+# Amvera Secrets; BATCH_STT_* are the canonical names from this release on.
+BATCH_STT_MODEL = env_first("BATCH_STT_MODEL", "STT_MODEL", default="mistralai/voxtral-mini-transcribe")
+try:
+    BATCH_STT_TIMEOUT_SEC = max(15, int(env_first("BATCH_STT_TIMEOUT_SEC", default="180")))
+except ValueError:
+    BATCH_STT_TIMEOUT_SEC = 180
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-transcribe-realtime-2602").strip()
 MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
@@ -137,13 +153,6 @@ TELEGRAM_WRITE_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_WRITE_TIMEOUT", "15"
 TELEGRAM_POOL_TIMEOUT = max(1.0, float(os.getenv("TELEGRAM_POOL_TIMEOUT", "3")))
 TELEGRAM_CONNECTION_POOL_SIZE = max(8, int(os.getenv("TELEGRAM_CONNECTION_POOL_SIZE", "32")))
 REMINDER_TICK_SECONDS = min(30, max(15, int(os.getenv("REMINDER_TICK_SECONDS", "20"))))
-VOICE_CONVERSATION_ENABLED = os.getenv("VOICE_CONVERSATION_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
-VOICE_MODE = os.getenv("VOICE_MODE", "push_to_talk").strip().lower()
-VOICE_SESSION_TIMEOUT_SEC = max(5, int(os.getenv("VOICE_SESSION_TIMEOUT_SEC", "25")))
-VAD_SPEECH_THRESHOLD = float(os.getenv("VAD_SPEECH_THRESHOLD", "0.035"))
-VAD_END_SILENCE_MS = max(250, int(os.getenv("VAD_END_SILENCE_MS", "450")))
-VAD_MIN_SPEECH_MS = max(100, int(os.getenv("VAD_MIN_SPEECH_MS", "300")))
-
 VOICE = os.getenv("EDGE_VOICE", "ru-RU-DmitryNeural").strip()
 
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Amsterdam").strip()
@@ -166,7 +175,7 @@ DB = PERSISTENT_ROOT / "noema_test.sqlite3"
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
-STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+BATCH_STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 
 MANAGED_KEY_LOCK = threading.RLock()
 ACTIVE_DRAFTS_LOCK = threading.RLock()
@@ -3718,15 +3727,15 @@ def _transcribe_unmeasured(chat_id, path):
     r = None
     for attempt in range(2):
         key, source = api_key_for_chat(chat_id)
-        r=requests.post(STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-                        json={"model":STT_MODEL,"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=180)
+        r=requests.post(BATCH_STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                        json={"model":BATCH_STT_MODEL,"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=BATCH_STT_TIMEOUT_SEC)
         if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
             break
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
     data = r.json()
-    record_usage(chat_id, source, STT_MODEL, data)
+    record_usage(chat_id, source, BATCH_STT_MODEL, data)
     text=data.get("text","").strip()
 
     if not text: raise RuntimeError("STT_EMPTY")
