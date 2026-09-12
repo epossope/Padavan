@@ -64,6 +64,7 @@ const visualFixture={
    if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))errors.push(`${route} overflows ${width}`);
    if(route!=='home'){
     if(await page.locator('#header [data-back]').count())errors.push(`${route} still exposes a header back arrow ${width}`);
+    if(await page.locator('#header .utilities button').count())errors.push(`${route} still exposes header actions ${width}`);
     const header=await page.locator('#header').boundingBox();
     if(header.height>34)errors.push(`${route} header is visually oversized ${width}`);
     uniform.headers.push(header.height);
@@ -95,7 +96,6 @@ const visualFixture={
    if(width<=430&&route==='people'){
     const expanded=await page.locator('.person-profile').first().boundingBox(),collapsed=await page.locator('.person-profile').nth(1).boundingBox();
     if(expanded.height>350||collapsed.height>68)errors.push(`People density regressed ${width}`);
-    if(await page.locator('#header [data-page="people"][aria-current="page"]').count()!==1)errors.push(`People navigation entry is not visible ${width}`);
    }
    if(width<=430&&route==='budget'){
     const picker=await page.locator('.period-picker').boundingBox(),periods=await page.locator('.budget-controls .segments').boundingBox(),total=await page.locator('.budget-totals .card').first().boundingBox();
@@ -109,7 +109,7 @@ const visualFixture={
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>4||sphere.x<box.x+box.width-60||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not bottom-aligned on composer right ${width}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>4||Math.abs(sphere.x-(box.x+box.width))>3||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
     const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild,borderRight:getComputedStyle(el.parentElement).borderRightWidth}));
     if(Number.parseFloat(sphereStyle.width)<96||Number.parseFloat(sphereStyle.width)>106||box.height>62||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/open composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
@@ -119,6 +119,7 @@ const visualFixture={
     if(Number.parseFloat(await page.locator('#chat-input').evaluate(el=>getComputedStyle(el).fontSize))<16)errors.push(`Chat input can trigger iPhone zoom ${width}`);
    }
    if(route==='home'){
+    if(await page.locator('#header .utilities button').count()!==1||await page.locator('#header [data-page="settings"]').count()!==1)errors.push(`Home header is not Noema plus Settings only ${width}`);
     const dockStyle=await page.locator('#dock').evaluate(el=>({position:getComputedStyle(el).position,background:getComputedStyle(el).backgroundImage,frame:getComputedStyle(el,'::before').display}));
     const boxes=await Promise.all(['.focus-pill','.orb-button','.keyboard-button'].map(selector=>page.locator(`#dock ${selector}`).boundingBox()));
     const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||dockStyle.frame!=='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
@@ -144,20 +145,31 @@ const visualFixture={
   await page.evaluate(()=>go('home'));
   const stable=await page.evaluate(()=>{const canvas=document.querySelector('#dock canvas');render();render();return canvas===document.querySelector('#dock canvas')});if(!stable)errors.push('Dock canvas recreated on render');
   if(await page.locator('.all-sections').count()||await page.locator('#header [data-layout]').count())errors.push('Removed layout controls still present');
-  if(await page.locator('#header [aria-label="Напоминания"]').count()!==1)errors.push('Notification shortcut missing');
-  if(await page.locator('#header [aria-label="Люди"]').count()!==1)errors.push('People shortcut missing');
+  if(await page.locator('#header .utilities button').count()!==1||await page.locator('#header [data-page="settings"]').count()!==1)errors.push('Home header contains actions other than Settings');
   await page.locator('#dock [data-voice]').click();
   if(await page.evaluate(()=>page!=='home'))errors.push('Sphere navigated to chat');
-  const first=await page.locator('[data-widget=tasks]').boundingBox(),second=await page.locator('[data-widget=next_event]').boundingBox();
-  await page.mouse.move(first.x+first.width/2,first.y+first.height/2);await page.mouse.down();await page.waitForTimeout(500);await page.mouse.move(second.x+second.width/2,second.y+second.height/2,{steps:5});await page.mouse.up();await page.waitForTimeout(400);
+  let first=await page.locator('[data-widget=tasks]').boundingBox();
+  await page.mouse.move(first.x+first.width/2,first.y+first.height/2);await page.mouse.down();await page.waitForTimeout(500);await page.mouse.up();await page.waitForTimeout(100);
+  if(!await page.locator('.home-grid.editing').count()||!await page.locator('[data-home-done]').count())errors.push(`Long press did not enter Home edit mode ${width}`);
+  first=await page.locator('[data-widget=tasks]').boundingBox();const second=await page.locator('[data-widget=next_event]').boundingBox();
+  await page.mouse.move(first.x+first.width/2,first.y+first.height/2);await page.mouse.down();await page.mouse.move(second.x+second.width/2,second.y+second.height/2,{steps:5});await page.mouse.up();await page.waitForTimeout(650);
   if(await page.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push(`Direct drag failed ${width}`);
+  await page.locator('[data-home-hide="tasks"]').click();
+  if(await page.locator('[data-widget="tasks"]').count()||await page.locator('[data-home-show="tasks"]').count()!==1)errors.push(`Home hide control failed ${width}`);
+  await page.locator('[data-home-show="tasks"]').click();
+  if(await page.locator('[data-widget="tasks"]').count()!==1)errors.push(`Home restore chip failed ${width}`);
+  await page.locator('[data-home-done]').click();
+  if(await page.locator('.home-grid.editing').count()||await page.locator('.home-widget-hide').count())errors.push(`Home Done did not leave edit mode ${width}`);
   await page.evaluate(()=>go('settings'));if(await page.getByRole('button',{name:'Настроить виджеты',exact:true}).count())errors.push('Widget settings remained in Settings');
   await page.close();
  }
  const touch=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
  await touch.goto('http://127.0.0.1:8091/app');await touch.locator('#splash.hidden').waitFor();await touch.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);
- const a=await touch.locator('[data-widget=tasks]').boundingBox(),b=await touch.locator('[data-widget=next_event]').boundingBox(),cdp=await touch.context().newCDPSession(touch);
- await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:a.x+a.width/2,y:a.y+a.height/2}]});await touch.waitForTimeout(500);
+ let a=await touch.locator('[data-widget=tasks]').boundingBox(),cdp=await touch.context().newCDPSession(touch);
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:a.x+a.width/2,y:a.y+a.height/2}]});await touch.waitForTimeout(500);await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
+ if(!await touch.locator('.home-grid.editing').count())errors.push('Touch long press did not enter edit mode');
+ a=await touch.locator('[data-widget=tasks]').boundingBox();const b=await touch.locator('[data-widget=next_event]').boundingBox();
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:a.x+a.width/2,y:a.y+a.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
@@ -197,5 +209,5 @@ const visualFixture={
  const fallbackBoot=await fallback.evaluate(()=>window.__telegramBoot);
  if(fallbackBoot.ready!==1||fallbackBoot.expand!==1)errors.push('Telegram expand fallback failed');
  await fallback.close();
- await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('7 viewports × 9 screens + edge-swipe guard + overlay dock + prominent composer sphere + direct mouse/touch sorting: passed');
+ await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('7 viewports × 9 screens + edge swipe + compact headers + Home edit mode + open composer: passed');
 })().catch(e=>{console.error(e);process.exitCode=1});

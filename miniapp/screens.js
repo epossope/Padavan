@@ -24,8 +24,10 @@ home=function(){
   recent_saved:[list(data.files.slice(0,2).map(f=>f.original_name),'file')||empty('Нет сохранённых файлов'),'archive','file'],
   people:[list(data.people.slice(0,3).map(p=>p.name),'people')||empty('Нет сохранённых контактов'),'people','people']
  };
- const widgets=(data.settings.home_widgets||defaultWidgets).filter(type=>bodies[type]);
- return `<section class="card hero"><div class="hero-calendar"><h3>${icon('calendar')} Сегодня</h3><div class="hero-date"><span class="date-number">${d.getDate()}</span><p>${d.toLocaleDateString('ru-RU',{month:'long'})}<br>${d.toLocaleDateString('ru-RU',{weekday:'long'})}</p></div></div><div class="weather">${weather}</div><canvas class="membrane" width="420" height="420" aria-hidden="true"></canvas></section><div class="grid home-grid">${widgets.map(type=>`<div data-widget="${type}">${card(widgetNames[type],`<div class="widget-content">${bodies[type][0]}</div>`,bodies[type][1],bodies[type][2])}</div>`).join('')}</div>`;
+ const widgets=(data.settings.home_widgets||defaultWidgets).filter(type=>bodies[type]),hidden=Object.keys(bodies).filter(type=>!widgets.includes(type));
+ const editHead=homeEditing?`<div class="home-edit-head"><small>Перетаскивай карточки</small><button type="button" data-home-done>Готово</button></div>`:'';
+ const hiddenTray=homeEditing?`<div class="home-hidden"><small>Скрытые</small><div class="chip-row">${hidden.map(type=>`<button type="button" class="chip" data-home-show="${type}">+ ${esc(widgetNames[type])}</button>`).join('')||'<span>Нет</span>'}</div></div>`:'';
+ return `<section class="card hero"><div class="hero-calendar"><h3>${icon('calendar')} Сегодня</h3><div class="hero-date"><span class="date-number">${d.getDate()}</span><p>${d.toLocaleDateString('ru-RU',{month:'long'})}<br>${d.toLocaleDateString('ru-RU',{weekday:'long'})}</p></div></div><div class="weather">${weather}</div><canvas class="membrane" width="420" height="420" aria-hidden="true"></canvas></section>${editHead}<div class="grid home-grid ${homeEditing?'editing':''}">${widgets.map(type=>`<div data-widget="${type}">${card(widgetNames[type],`<div class="widget-content">${bodies[type][0]}</div>`,bodies[type][1],bodies[type][2])}${homeEditing?`<button type="button" class="home-widget-hide" data-home-hide="${type}" aria-label="Скрыть ${esc(widgetNames[type])}">×</button>`:''}</div>`).join('')}</div>${hiddenTray}`;
 };
 const originalSettings=settings;
 settings=function(){const html=originalSettings().replace('<h1>Настройки</h1><p class="subtle">Фокус, ясность и контроль.</p>','').replace('<p class="subtle">Подключение iPhone и управление AI доступны в настройках бота.</p>','').replace(/<button data-delete="delete_behavior_rule" data-id="(\d+)" aria-label="Удалить правило">×<\/button>/g,'<button class="icon" data-edit="rule" data-id="$1" aria-label="Изменить правило">'+icon('settings')+'</button><button class="icon" data-delete="delete_behavior_rule" data-id="$1" aria-label="Удалить правило">'+icon('trash')+'</button>');return `<div class="settings-stack">${html}</div>`};
@@ -99,7 +101,7 @@ render=function(){
  content.innerHTML=(screens[page]||home)();
  const title={home:'Noema',archive:'Архив',notes:'Заметки',people:'Люди',tasks:'Задачи',reminders:'Календарь',budget:'Бюджет',settings:'Настройки',chat:'Чат'}[page];
  content.querySelector('h1')?.remove();
- const utilities=page==='settings'?'':`${page!=='chat'?iconButton('bell','Напоминания','data-page="reminders"'):''}${iconButton('people','Люди',`data-page="people" aria-current="${page==='people'?'page':'false'}"`)}${iconButton('settings','Настройки','data-page="settings"')}`;
+ const utilities=page==='home'?iconButton('settings','Настройки','data-page="settings"'):'';
  document.querySelector('#header').innerHTML=`<div class="header-title"><h1>${title}</h1></div><div class="utilities">${utilities}</div>`;
  document.querySelector('#shell').dataset.page=page;
  content.querySelector('.all-sections')?.remove();
@@ -112,10 +114,11 @@ render=function(){
   content.querySelector('.subtle')?.remove();
  }
  for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
- renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread&&thread.scrollHeight-thread.scrollTop-thread.clientHeight<72)thread.scrollTop=thread.scrollHeight});if(tg){page==='home'?tg.BackButton.hide():tg.BackButton.show()}
+ renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread&&thread.scrollHeight-thread.scrollTop-thread.clientHeight<72)thread.scrollTop=thread.scrollHeight});tg?.BackButton.hide()
 };
-go=function(next){if(next!==page)navHistory.push(page);page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
+go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')homeEditing=false;page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
 function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';render()}
+async function saveHomeWidgets(widgets){const previous=[...(data.settings.home_widgets||defaultWidgets)];data.settings.home_widgets=[...widgets];render();if(preview)return;try{await api('home_layout',{widgets})}catch(e){data.settings.home_widgets=previous;render();say(e.message)}}
 function openLayout(){layoutDraft=[...(data.settings.home_widgets||defaultWidgets)];drawLayout();document.querySelector('#layout-editor').showModal()}
 function drawLayout(){document.querySelector('#layout-items').innerHTML=layoutDraft.map((type,i)=>`<div class="layout-row" draggable="true" data-index="${i}"><select aria-label="Виджет ${i+1}" data-replace="${i}">${Object.entries(widgetNames).filter(([k])=>k===type||!layoutDraft.includes(k)).map(([k,v])=>`<option value="${k}" ${k===type?'selected':''}>${v}</option>`).join('')}</select><button data-move="${i}" data-step="-1" aria-label="Выше" ${i===0?'disabled':''}>↑</button><button data-move="${i}" data-step="1" aria-label="Ниже" ${i===layoutDraft.length-1?'disabled':''}>↓</button><button data-hide="${i}" aria-label="Скрыть ${widgetNames[type]}">×</button></div>`).join('')+`<div class="toolbar">${Object.entries(widgetNames).filter(([k])=>!layoutDraft.includes(k)).map(([k,v])=>`<button class="secondary" data-add-widget="${k}">+ ${v}</button>`).join('')}</div>`}
 let held=false,dragIndex=null;
@@ -137,6 +140,9 @@ document.addEventListener('click',async e=>{
  if(b.dataset.move!==undefined){const i=Number(b.dataset.move),j=i+Number(b.dataset.step);if(j>=0&&j<layoutDraft.length){[layoutDraft[i],layoutDraft[j]]=[layoutDraft[j],layoutDraft[i]];drawLayout()}}
  if(b.dataset.hide!==undefined){layoutDraft.splice(Number(b.dataset.hide),1);drawLayout()}
  if(b.dataset.addWidget){layoutDraft.push(b.dataset.addWidget);drawLayout()}
+ if(b.dataset.homeHide){await saveHomeWidgets((data.settings.home_widgets||defaultWidgets).filter(type=>type!==b.dataset.homeHide))}
+ if(b.dataset.homeShow){await saveHomeWidgets([...(data.settings.home_widgets||defaultWidgets),b.dataset.homeShow])}
+ if(b.hasAttribute('data-home-done')){homeEditing=false;render()}
  if(b.dataset.taskTab){taskTab=b.dataset.taskTab;taskFilter='all';render()}
  if(b.dataset.taskFilter){taskFilter=b.dataset.taskFilter;render()}
  if(b.dataset.noteFilter){noteFilter=b.dataset.noteFilter;render()}
