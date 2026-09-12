@@ -69,6 +69,28 @@ const visualFixture={
     const adminText=await page.locator('.admin-ai').innerText();
     if(!adminText.includes('deepseek/deepseek-v4-flash-0731')||!adminText.includes('USER'))errors.push(`Effective USER model is not distinct ${width}`);
    }
+   if(width<=430&&['notes','archive','people'].includes(route)){
+    const searchBox=await page.locator('.search-field').boundingBox();
+    const chipBox=await page.locator('.chip').first().boundingBox();
+    if(searchBox.height>44)errors.push(`${route} search is visually oversized ${width}`);
+    if(chipBox.height>34)errors.push(`${route} chip is visually oversized ${width}`);
+   }
+   if(width<=430&&route==='tasks'){
+    const segmentBox=await page.locator('.segments').boundingBox();
+    const collapsedBox=await page.locator('.task-card').nth(1).boundingBox();
+    if(segmentBox.height>44||collapsedBox.height>76)errors.push(`Task density regressed ${width}`);
+   }
+   if(width<=430&&route==='notes'&&(await page.locator('.note-card').first().boundingBox()).height>100)errors.push(`Note density regressed ${width}`);
+   if(width<=430&&route==='archive'&&(await page.locator('.resource-card').first().boundingBox()).height>92)errors.push(`Archive density regressed ${width}`);
+   if(width<=430&&route==='people'){
+    const expanded=await page.locator('.person-profile').first().boundingBox(),collapsed=await page.locator('.person-profile').nth(1).boundingBox();
+    if(expanded.height>350||collapsed.height>68)errors.push(`People density regressed ${width}`);
+   }
+   if(width<=430&&route==='budget'){
+    const picker=await page.locator('.period-picker').boundingBox(),periods=await page.locator('.budget-controls .segments').boundingBox(),total=await page.locator('.budget-totals .card').first().boundingBox();
+    if(Math.abs(picker.y-periods.y)>3||picker.height>40||periods.height>40||total.height>108)errors.push(`Budget proportions regressed ${width}`);
+   }
+   if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
     const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x+sphere.width>box.x+box.width+1||sphere.x<sphere.width)errors.push(`Chat sphere is not docked on composer right ${width}`);
@@ -84,8 +106,20 @@ const visualFixture={
     const dockStyle=await page.locator('#dock').evaluate(el=>({position:getComputedStyle(el).position,background:getComputedStyle(el).backgroundImage,frame:getComputedStyle(el,'::before').display}));
     const boxes=await Promise.all(['.focus-pill','.orb-button','.keyboard-button'].map(selector=>page.locator(`#dock ${selector}`).boundingBox()));
     const centers=boxes.map(box=>box.y+box.height/2);if(dockStyle.position!=='fixed'||dockStyle.background==='none'||dockStyle.frame!=='none'||Math.max(...centers)-Math.min(...centers)>3)errors.push(`Dock overlay alignment failed ${width}`);
+    if(width<=430){
+     const tile=await page.locator('.home-grid>[data-widget]').first().boundingBox();
+     await page.evaluate(()=>scrollTo(0,document.documentElement.scrollHeight));await page.waitForTimeout(50);
+     const last=await page.locator('.home-grid>[data-widget]').last().boundingBox(),dock=await page.locator('#dock').boundingBox();
+     if(tile.height>145||boxes[1].width>120||last.y+last.height>dock.y+2)errors.push(`Home density or dock safe-zone regressed ${width}`);
+     await page.evaluate(()=>scrollTo(0,0));
+    }
    }
-   if(width===390){await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:false});await page.screenshot({path:path.resolve('ui-proof','design-match-v1',`current-after-${route}.png`),fullPage:false})}
+   if(width===390){
+    await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:false});
+    if(['home','tasks','notes','archive','people','budget','settings'].includes(route)){
+     await page.screenshot({path:path.resolve('ui-proof','design-match-v1.1',`v1.1-${route}.png`),fullPage:false});
+    }
+   }
   }
   await page.evaluate(()=>go('home'));
   const stable=await page.evaluate(()=>{const canvas=document.querySelector('#dock canvas');render();render();return canvas===document.querySelector('#dock canvas')});if(!stable)errors.push('Dock canvas recreated on render');

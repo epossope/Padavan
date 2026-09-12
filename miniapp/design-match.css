@@ -458,3 +458,251 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
   .person-overview{grid-template-columns:1fr}
 }
 @media(prefers-reduced-motion:reduce){.bubble,.interactive{animation:none;transition:none}}
+
+/* Design Match V1.1 — literal reference density, without scaling the app. */
+:root{--dock-height:136px}
+.subpage header{min-height:38px;margin-bottom:12px}
+.subpage header h1{font-size:clamp(24px,5.8vw,34px);letter-spacing:.055em}
+.subpage .header-title .icon,.subpage .utilities .icon{width:32px;height:32px;min-height:32px;padding:7px}
+.subpage .header-title svg,.subpage .utilities svg{width:17px;height:17px}
+
+.search-field{
+  min-height:42px;height:42px;margin-bottom:10px;padding:0 12px;gap:9px;
+  border-color:rgba(244,244,242,.12);border-radius:14px;background:rgba(255,255,255,.012);
+}
+.search-field svg{width:17px;height:17px}
+.search-field input{min-height:40px;height:40px;font-size:13px}
+.segments{min-height:42px;margin-bottom:11px;padding:3px;border-radius:15px}
+.segments button{min-height:34px;padding:5px 9px;border-radius:11px;font-size:12px}
+.screen-toolbar{align-items:center;gap:7px;margin-bottom:11px}
+.chip-row{gap:6px}
+.chip,.subpage .secondary,.subpage .primary,.subpage .pill{
+  min-height:30px;padding:5px 10px;border-radius:999px;font-size:11.5px;
+}
+.add-action{gap:4px}
+.add-action svg{width:13px;height:13px}
+.section-head{margin:16px 2px 8px}
+.section-head h2{font-size:10px;letter-spacing:.15em}
+.section-head span{font-size:10px}
+.task-list,.reminder-list,.recent-notes,.resource-list,.people-list{gap:7px}
+.subpage:not(.chat-screen) .card{border-radius:17px;border-color:rgba(238,238,238,.12)}
+.compact-actions{justify-content:flex-end;gap:3px;margin:8px 0 0}
+.compact-actions .icon{width:30px;height:30px;min-height:30px;padding:7px}
+.compact-actions .icon svg{width:15px;height:15px}
+
+/* Tasks and reminders: one compact reading line, details only when opened. */
+.task-card{min-height:68px;padding:8px 10px;gap:6px}
+.task-card>.check{width:30px;height:46px;min-height:46px}
+.task-card>.check:before{width:19px;height:19px;line-height:19px}
+.task-summary{min-height:46px;grid-template-columns:minmax(0,1fr) auto 15px;gap:7px}
+.task-summary h2{margin-bottom:2px;font-size:15px;line-height:1.18}
+.task-summary>div:first-child small{gap:5px;font-size:9.5px}
+.task-summary>div:first-child i{width:5px;height:5px}
+.task-summary>svg{width:14px;height:14px}
+.task-meta span{margin-bottom:2px;font-size:9px}
+.task-meta small{gap:3px;font-size:9px}
+.task-meta svg,.reminder-row small svg{width:11px;height:11px}
+.task-card .details{margin-top:6px;padding:9px 1px 0}
+.detail-grid{gap:8px;font-size:11px}
+.detail-grid small{margin-bottom:2px;font-size:8px}
+.reminder-row{min-height:62px;padding:8px 10px}
+.reminder-row .icon{width:30px;height:30px;min-height:30px;padding:7px}
+.reminder-row p{font-size:13px}
+.reminder-row .body small{font-size:9px}
+
+/* Notes: preserve hierarchy while removing empty vertical mass. */
+.pinned-notes{gap:8px}
+.note-card{padding:11px 12px}
+.note-card .card-head{margin-bottom:5px}
+.note-card .card-head h2{font-size:15.5px;line-height:1.2}
+.note-card .card-head>svg{width:16px;height:16px}
+.note-card>p{font-size:11.5px;line-height:1.4;-webkit-line-clamp:2}
+.note-meta{min-height:27px;margin-top:7px;gap:6px}
+.note-meta>span:first-child{padding:3px 6px;border-radius:6px;font-size:8.5px}
+.note-meta>small{font-size:9px}
+.note-actions .icon{width:27px;height:27px;min-height:27px;padding:6px}
+.note-actions .icon svg{width:14px;height:14px}
+.recent-notes .note-card>p{-webkit-line-clamp:1}
+.memory-search{min-height:29px;margin-top:9px;gap:5px;padding:5px 9px}
+.memory-search svg{width:13px;height:13px}
+
+/* Archive: compact reference row — small preview, text, quiet actions. */
+.resource-card{min-height:84px;padding:9px 10px;grid-template-columns:58px minmax(0,1fr) auto;gap:10px}
+.resource-thumb{width:58px;height:58px;border-radius:11px}
+.resource-thumb svg{width:24px;height:24px;stroke-width:1}
+.resource-thumb.screenshots{
+  background:linear-gradient(150deg,rgba(255,255,255,.11),rgba(255,255,255,.01)),
+    repeating-linear-gradient(0deg,transparent 0 7px,rgba(255,255,255,.035) 7px 8px),
+    repeating-linear-gradient(90deg,transparent 0 9px,rgba(255,255,255,.025) 9px 10px);
+}
+.resource-body h2{margin-bottom:3px;font-size:14.5px;line-height:1.2}
+.resource-body p{margin-bottom:4px;font-size:10.5px;line-height:1.35;-webkit-line-clamp:1}
+.resource-body small{font-size:8.5px}
+.resource-actions{gap:1px}
+.resource-actions .icon{width:27px;height:27px;min-height:27px;padding:6px}
+.resource-actions .icon svg{width:14px;height:14px}
+
+/* People: a compact profile rather than a CRM form. */
+.person-profile{padding:8px 10px}
+.person-profile>summary{min-height:48px;grid-template-columns:44px minmax(0,1fr) auto 14px;gap:9px}
+.person-profile>summary>.avatar{width:44px;height:44px;font-size:15px}
+.person-profile summary h2{margin-bottom:1px;font-size:15.5px}
+.person-profile summary .body>small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9.5px}
+.person-profile summary>svg{width:14px;height:14px}
+.person-birthday{gap:4px;font-size:9px}
+.person-birthday svg{width:12px;height:12px}
+.person-profile .details{margin-top:7px;padding:9px 1px 0}
+.person-overview{grid-template-columns:minmax(0,1.5fr) minmax(95px,.5fr);gap:10px}
+.person-overview h3,.person-profile .details>h3{margin-bottom:5px;font-size:8.5px}
+.person-overview p{font-size:11px;line-height:1.4}
+.person-profile .details>h3{margin-top:10px}
+.profile-interaction{padding:5px 0;font-size:10.5px;line-height:1.35}
+.profile-interaction small{margin-top:1px;font-size:8.5px}
+.project-chips{gap:5px}
+.project-chips span,.currency-list span{gap:4px;padding:4px 7px;border-radius:7px;font-size:9.5px}
+.project-chips svg,.currency-list svg{width:12px;height:12px}
+
+/* Budget: controls share one row; cards and charts follow reference proportions. */
+.budget-controls{grid-template-columns:minmax(150px,.72fr) minmax(250px,1.28fr);gap:9px;margin-bottom:9px}
+.period-picker{width:auto;min-width:0;height:38px;padding:0 11px;gap:7px;font-size:11px}
+.period-picker svg{width:15px;height:15px}
+.budget-controls .segments{min-height:38px;height:38px;margin:0;padding:3px}
+.budget-controls .segments button{min-height:30px;padding:4px 7px;font-size:11px}
+.budget-actions{margin-bottom:9px}
+.budget-actions>div{gap:5px}
+.budget-totals,.budget-dashboard{gap:9px;margin-bottom:9px}
+.budget-totals .card{min-height:88px;padding:10px 12px}
+.budget-totals .card h3{margin-bottom:8px}
+.budget-totals .amount{margin-bottom:3px;font-size:22px}
+.budget-totals small{font-size:9px}
+.orb-fragment{width:104px;height:104px;right:-65px;top:2px;border-color:rgba(255,255,255,.25)}
+.budget-dashboard>.card{min-height:186px;padding:10px 11px}
+.budget-dashboard h3{margin-bottom:10px}
+.distribution-body{grid-template-columns:minmax(108px,.9fr) minmax(100px,1.1fr);gap:8px}
+.distribution-body>svg{max-width:122px}
+.distribution-body p{margin-bottom:5px;font-size:9.5px}
+.distribution-body small{margin-left:13px;font-size:8px}
+.bars{height:104px;padding:6px 0 10px;gap:4px}
+.bar-group{min-width:22px;grid-template-rows:1fr 14px;gap:3px;font-size:8px}
+.finance-strip{margin-bottom:9px;padding:9px 11px;gap:10px}
+.finance-strip h3{margin-bottom:6px}
+.finance-strip .amount{font-size:21px}
+.operations{padding:12px 14px}
+.operation-row{min-height:39px;grid-template-columns:27px minmax(0,1fr) auto auto 25px 25px;gap:6px}
+.operation-icon{width:25px;height:25px}
+.operation-icon svg{width:14px;height:14px}
+.operation-row p{font-size:12px}
+.operation-row>.mono{font-size:12px}
+.operation-row>.icon{width:25px;height:25px;min-height:25px;padding:6px}
+.operation-row>.icon svg{width:13px;height:13px}
+.operation-row>.icon svg{width:14px;height:14px}
+
+/* Settings: tighter rows and switches; runtime groups remain collapsed. */
+.settings-stack{gap:8px}
+.settings-stack>.card{padding:12px 14px;border-radius:17px}
+.settings-stack .card-head{margin-bottom:6px}
+.settings-stack .setting{min-height:42px;padding:5px 0;gap:8px;font-size:12px}
+.settings-stack .setting select,.settings-stack .setting input[type=time]{min-height:31px;padding-top:3px;padding-bottom:3px;font-size:11px}
+.settings-stack .setting input[type=checkbox]{width:37px;height:21px;min-height:21px}
+.settings-stack .setting input[type=checkbox]:before{width:13px;height:13px}
+.settings-stack .setting input[type=checkbox]:checked:before{transform:translateX(16px)}
+.settings-stack .setting button{min-height:30px;font-size:11px}
+.settings-stack .runtime-config{min-height:38px;padding:4px 0}
+.runtime-section>summary{min-height:42px}
+.runtime-section>summary>span{font-size:12px}
+.runtime-section>summary>small{font-size:9px}
+.runtime-section-body{padding-bottom:6px}
+.effective-config>div{min-height:34px;grid-template-columns:82px minmax(0,1fr) auto}
+.effective-config strong{font-size:10.5px}
+.admin-ai>small{margin-top:5px;font-size:9px}
+
+/* Home and fixed voice dock: the whole six-card composition clears the dock. */
+.hero{min-height:144px;margin-bottom:9px;padding:16px 17px}
+.hero h3{margin-bottom:9px;font-size:12px;gap:7px}
+.hero h3 svg{width:18px;height:18px}
+.hero .date-number{font-size:54px}
+.hero-date{gap:10px}
+.hero-date p{font-size:10px}
+.weather{min-height:94px;padding-left:14px;gap:9px}
+.weather>svg{width:22px;height:22px}
+.weather .temperature{font-size:24px}
+.weather p,.weather small{font-size:9px}
+.hero .membrane{right:-122px;top:-95px;width:276px;height:276px}
+.home-grid{gap:8px}
+.home-grid>[data-widget]{height:142px;min-height:142px}
+.home-grid .card{padding:12px 13px;border-radius:17px}
+.home-grid .card-head{margin-bottom:7px}
+.home-grid .card-head h3{font-size:9px}
+.home-grid .card-head svg{width:17px;height:17px}
+.home-grid .widget-content{max-height:95px;gap:5px}
+.home-grid .widget-line{gap:5px}
+.home-grid .widget-line svg{width:11px;height:14px}
+.home-grid .widget-line>span{font-size:10.5px;line-height:1.28}
+.home-grid .widget-line small{font-size:8px}
+.home-grid .amount{font-size:22px}
+.widget-time{font-size:22px!important}
+#dock{
+  bottom:calc(var(--keyboard-inset,0px) - 5px);height:calc(var(--dock-height) + var(--app-safe-bottom,env(safe-area-inset-bottom)));
+  grid-template-columns:minmax(0,1fr) 116px minmax(0,1fr);background:linear-gradient(0deg,rgba(5,6,6,.82),rgba(5,6,6,.28) 52%,transparent 96%);
+}
+#dock>*{transform:translateY(7px)}
+#dock .orb-button{
+  width:116px;height:116px;transform:translateY(7px);opacity:.96;filter:brightness(1.9) contrast(1.02) drop-shadow(0 0 13px rgba(255,255,255,.18));
+}
+.focus-pill{max-width:116px;min-height:50px;padding:7px 9px;transform:translateY(7px)}
+.focus-pill small{margin-bottom:2px;font-size:7.5px}
+.focus-pill span{font-size:9.5px;line-height:1.28}
+.keyboard-button{width:43px;height:43px;min-height:43px;padding:10px;transform:translateY(7px)}
+
+@media(max-width:600px){
+  #shell{padding-top:calc(14px + var(--app-safe-top,env(safe-area-inset-top)))}
+  .budget-controls{grid-template-columns:minmax(125px,.72fr) minmax(0,1.28fr);gap:7px}
+  .period-picker{width:100%;font-size:10px;padding:0 8px}
+  .budget-dashboard{grid-template-columns:1fr 1fr}
+  .budget-dashboard>.card{min-height:186px}
+  .operation-row{grid-template-columns:30px minmax(0,1fr) auto 28px}
+  .person-profile>summary{grid-template-columns:42px minmax(0,1fr) 14px;gap:8px}
+  .person-profile>summary>.avatar{width:42px;height:42px}
+}
+@media(max-width:430px){
+  :root{--page-pad:14px;--dock-height:132px}
+  .subpage header h1{font-size:23px}
+  .search-field input{font-size:16px}
+  .pinned-notes{gap:7px}
+  .pinned-notes .note-card{padding:10px}
+  .resource-card{grid-template-columns:54px minmax(0,1fr) auto;gap:9px}
+  .resource-thumb{width:54px;height:54px}
+  .budget-totals{gap:7px}
+  .budget-totals .card{min-height:84px;padding:9px 10px}
+  .budget-totals .amount{font-size:20px}
+  .distribution-body{grid-template-columns:105px minmax(0,1fr)}
+  .finance-strip{padding:11px 12px}
+  .operations{padding:10px 11px}
+  #dock{grid-template-columns:minmax(0,1fr) 112px minmax(0,1fr)}
+  #dock .orb-button{width:112px;height:112px}
+  .focus-pill{max-width:108px;min-height:48px}
+  .keyboard-button{width:41px;height:41px;min-height:41px;padding:9px}
+}
+@media(max-width:370px){
+  :root{--page-pad:12px;--dock-height:126px}
+  .segments button{padding-left:5px;padding-right:5px;font-size:11px}
+  .chip{padding-left:8px;padding-right:8px}
+  .add-action span{display:none}
+  .hero{padding:14px}
+  .hero .date-number{font-size:49px}
+  .home-grid>[data-widget]{height:138px;min-height:138px}
+  .home-grid .card{padding:11px}
+  .task-meta span{display:none}
+  .pinned-notes{grid-template-columns:1fr 1fr}
+  .resource-card{grid-template-columns:48px minmax(0,1fr) 27px;padding:8px;gap:8px}
+  .resource-thumb{width:48px;height:48px}
+  .resource-actions .icon{width:26px;height:26px;min-height:26px}
+  .person-overview{grid-template-columns:1fr 90px}
+  .budget-controls{grid-template-columns:116px minmax(0,1fr);gap:5px}
+  .budget-controls .segments button{font-size:9.5px}
+  .budget-totals .card{padding:8px 9px;min-height:82px}
+  .distribution-body{grid-template-columns:92px minmax(0,1fr)}
+  #dock{grid-template-columns:minmax(0,1fr) 106px minmax(0,1fr)}
+  #dock .orb-button{width:106px;height:106px}
+  .focus-pill{max-width:98px;padding-left:7px;padding-right:7px}
+}
