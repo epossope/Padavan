@@ -117,15 +117,15 @@ def env_first(*names, default=""):
     return default
 
 
-FAST_MODEL = os.getenv("FAST_MODEL", "qwen/qwen3.5-flash-02-23").strip()
-STRONG_MODEL = os.getenv("STRONG_MODEL", "deepseek/deepseek-v3.2").strip()
+DEFAULT_FAST_MODEL = "qwen/qwen3.5-flash-02-23"
+DEFAULT_STRONG_MODEL = "deepseek/deepseek-v3.2"
+LEGACY_FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", "").split(",") if x.strip()]
+FAST_MODEL = env_first("FAST_MODEL", "MODEL", default=DEFAULT_FAST_MODEL)
+STRONG_MODEL = env_first("STRONG_MODEL", default=(LEGACY_FALLBACK_MODELS[0] if LEGACY_FALLBACK_MODELS else DEFAULT_STRONG_MODEL))
 FAST_MODEL_PROVIDERS = csv_env("FAST_MODEL_PROVIDERS")
 STRONG_MODEL_PROVIDERS = csv_env("STRONG_MODEL_PROVIDERS")
 FAST_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("FAST_MODEL_ALLOW_PROVIDER_FALLBACK", False)
 STRONG_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK", True)
-MODEL = os.getenv("MODEL", FAST_MODEL).strip()
-
-FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", STRONG_MODEL).split(",") if x.strip()]
 
 VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 
@@ -142,6 +142,8 @@ except ValueError:
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
 MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-transcribe-realtime-2602").strip()
 MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
+TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lower()
 TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
 TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
@@ -218,10 +220,10 @@ TELEMETRY_BENCHMARK_STARTED_AT = None
 
 LOGGER = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = [x.strip() for x in os.getenv(
-    "AVAILABLE_MODELS",
-    "google/gemini-2.5-flash,google/gemini-2.5-pro,anthropic/claude-sonnet-4,openai/gpt-4.1"
-).split(",") if x.strip()]
+AVAILABLE_MODELS = list(csv_env("MODEL_CATALOG") or csv_env("AVAILABLE_MODELS") or (
+    "google/gemini-2.5-flash", "google/gemini-2.5-pro",
+    "anthropic/claude-sonnet-4", "openai/gpt-4.1",
+))
 
 
 
@@ -816,11 +818,137 @@ def app_setting(key, default=""):
     return row["setting_value"] if row else default
 
 
-def set_app_setting(key, value):
+def set_app_setting(key, value, updated_by=None):
     with conn() as c:
-        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) "
-                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
-                  (key, value, datetime.now(timezone.utc).isoformat()))
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(app_settings)").fetchall()}
+        if "updated_by" not in columns:
+            c.execute("ALTER TABLE app_settings ADD COLUMN updated_by INTEGER")
+        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at,updated_by) VALUES(?,?,?,?) "
+                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at,updated_by=excluded.updated_by",
+                  (key, value, datetime.now(timezone.utc).isoformat(), updated_by))
+
+
+RUNTIME_CONFIG_KEY = "admin_runtime_config_v1"
+RUNTIME_CONFIG_FIELDS = (
+    "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
+    "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
+    "vision_model", "vision_fallback_models", "batch_stt_model",
+    "tts_provider", "tts_fallback_provider", "tts_voice", "default_voice_reply_mode",
+    "realtime_model", "model_catalog",
+)
+_MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,200}$")
+_PROVIDER_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,120}$")
+
+
+def _env_is_set(*names):
+    return any(bool((os.getenv(name) or "").strip()) for name in names)
+
+
+def _runtime_env_defaults():
+    """Safe startup values and their provenance; no secrets are represented here."""
+    return {
+        "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL", "MODEL") else "DEFAULT"),
+        "fast_model_providers": (list(FAST_MODEL_PROVIDERS), "ENV" if _env_is_set("FAST_MODEL_PROVIDERS") else "DEFAULT"),
+        "fast_model_allow_provider_fallback": (FAST_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("FAST_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
+        "strong_model": (STRONG_MODEL, "ENV" if _env_is_set("STRONG_MODEL", "FALLBACK_MODELS") else "DEFAULT"),
+        "strong_model_providers": (list(STRONG_MODEL_PROVIDERS), "ENV" if _env_is_set("STRONG_MODEL_PROVIDERS") else "DEFAULT"),
+        "strong_model_allow_provider_fallback": (STRONG_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
+        "vision_model": (VISION_MODEL, "ENV" if _env_is_set("VISION_MODEL") else "DEFAULT"),
+        "vision_fallback_models": (list(VISION_FALLBACK_MODELS), "ENV" if _env_is_set("VISION_FALLBACK_MODELS") else "DEFAULT"),
+        "batch_stt_model": (BATCH_STT_MODEL, "ENV" if _env_is_set("BATCH_STT_MODEL", "STT_MODEL") else "DEFAULT"),
+        "tts_provider": (TTS_PROVIDER, "ENV" if _env_is_set("TTS_PROVIDER") else "DEFAULT"),
+        "tts_fallback_provider": (TTS_FALLBACK_PROVIDER, "ENV" if _env_is_set("TTS_FALLBACK_PROVIDER") else "DEFAULT"),
+        "tts_voice": (VOICE, "ENV" if _env_is_set("EDGE_VOICE") else "DEFAULT"),
+        "default_voice_reply_mode": (DEFAULT_MODE, "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
+        "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
+        "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
+    }
+
+
+def _runtime_config_record():
+    with conn() as c:
+        try:
+            row = c.execute("SELECT setting_value,updated_at,updated_by FROM app_settings WHERE setting_key=?", (RUNTIME_CONFIG_KEY,)).fetchone()
+        except sqlite3.OperationalError:
+            row = c.execute("SELECT setting_value,updated_at FROM app_settings WHERE setting_key=?", (RUNTIME_CONFIG_KEY,)).fetchone()
+    if not row:
+        return {"overrides": {}, "updated_at": "", "updated_by": None}
+    try:
+        value = json.loads(row["setting_value"])
+    except (TypeError, ValueError):
+        value = {}
+    overrides = value.get("overrides", {}) if isinstance(value, dict) else {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    return {"overrides": overrides, "updated_at": row["updated_at"] or "", "updated_by": row["updated_by"] if "updated_by" in row.keys() else None}
+
+
+def runtime_config_snapshot():
+    """Return the live, safe effective settings for API/UI and request routing."""
+    defaults, record = _runtime_env_defaults(), _runtime_config_record()
+    fields = {}
+    for field, (value, source) in defaults.items():
+        if field in record["overrides"]:
+            value, source = record["overrides"][field], "ADMIN"
+        fields[field] = {"value": value, "source": source}
+    return {"fields": fields, "updated_at": record["updated_at"], "updated_by": record["updated_by"]}
+
+
+def runtime_config_values():
+    return {field: entry["value"] for field, entry in runtime_config_snapshot()["fields"].items()}
+
+
+def _normalise_runtime_config_value(field, value):
+    if field not in RUNTIME_CONFIG_FIELDS:
+        raise ValueError("Unknown runtime configuration field")
+    if field in {"fast_model", "strong_model", "vision_model", "batch_stt_model", "realtime_model", "tts_voice"}:
+        clean = str(value or "").strip()
+        if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
+            raise ValueError("Invalid model or voice value")
+        return clean
+    if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models", "model_catalog"}:
+        raw = value if isinstance(value, list) else str(value or "").split(",")
+        clean = [str(item).strip() for item in raw if str(item).strip()]
+        if len(clean) > 30 or any(not _PROVIDER_VALUE_RE.fullmatch(item) for item in clean):
+            raise ValueError("Invalid provider or model catalogue")
+        return clean
+    if field in {"fast_model_allow_provider_fallback", "strong_model_allow_provider_fallback"}:
+        if isinstance(value, bool):
+            return value
+        if str(value).strip().lower() in {"true", "1", "yes", "on"}:
+            return True
+        if str(value).strip().lower() in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("Invalid boolean")
+    if field == "default_voice_reply_mode":
+        clean = str(value or "").strip().lower()
+        if clean not in {"text", "voice", "voice_and_text", "auto"}:
+            raise ValueError("Invalid voice reply mode")
+        return clean
+    if field in {"tts_provider", "tts_fallback_provider"}:
+        clean = str(value or "").strip().lower()
+        allowed = {"edge", "browser"} if field == "tts_provider" else {"edge", "browser", "none"}
+        if clean not in allowed:
+            raise ValueError("Invalid TTS provider")
+        return clean
+    raise ValueError("Unknown runtime configuration field")
+
+
+def set_admin_runtime_config(updated_by, field, value):
+    clean = _normalise_runtime_config_value(field, value)
+    record = _runtime_config_record()
+    record["overrides"][field] = clean
+    set_app_setting(RUNTIME_CONFIG_KEY, json.dumps({"overrides": record["overrides"]}, ensure_ascii=False), int(updated_by))
+    return runtime_config_snapshot()
+
+
+def reset_admin_runtime_config(updated_by, field):
+    if field not in RUNTIME_CONFIG_FIELDS:
+        raise ValueError("Unknown runtime configuration field")
+    record = _runtime_config_record()
+    record["overrides"].pop(field, None)
+    set_app_setting(RUNTIME_CONFIG_KEY, json.dumps({"overrides": record["overrides"]}, ensure_ascii=False), int(updated_by))
+    return runtime_config_snapshot()
 
 
 def active_ui_message_id(chat_id):
@@ -1305,7 +1433,8 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS app_settings(
-            setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL
+            setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL,
+            updated_by INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS chat_models(
@@ -1441,7 +1570,8 @@ def init_db():
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
-            ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''")
+            ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
+            ("app_settings","updated_by","INTEGER")
 
         ]:
 
@@ -1452,7 +1582,8 @@ def init_db():
 
 def model_router():
     """Construct cheaply so every request observes the latest SQLite setting."""
-    return ModelRouter(conn, MODEL, FALLBACK_MODELS, VISION_MODEL)
+    config = runtime_config_values()
+    return ModelRouter(conn, config["fast_model"], [config["strong_model"]], config["vision_model"])
 
 
 def provider_preferences_for(model):
@@ -1462,9 +1593,10 @@ def provider_preferences_for(model):
     models. The payload contains no credentials and does not alter any user
     model preference.
     """
+    config = runtime_config_values()
     for configured_model, providers, allow_fallbacks in (
-        (FAST_MODEL, FAST_MODEL_PROVIDERS, FAST_MODEL_ALLOW_PROVIDER_FALLBACK),
-        (STRONG_MODEL, STRONG_MODEL_PROVIDERS, STRONG_MODEL_ALLOW_PROVIDER_FALLBACK),
+        (config["fast_model"], config["fast_model_providers"], config["fast_model_allow_provider_fallback"]),
+        (config["strong_model"], config["strong_model_providers"], config["strong_model_allow_provider_fallback"]),
     ):
         if model == configured_model and providers:
             configured = list(providers)
@@ -1480,7 +1612,7 @@ def available_models_for(chat_id):
     with conn() as c:
         rows = c.execute("SELECT model, enabled FROM chat_models WHERE chat_id=?", (chat_id,)).fetchall()
     overrides = {r["model"]: bool(r["enabled"]) for r in rows}
-    models = [model for model in AVAILABLE_MODELS if overrides.get(model, True)]
+    models = [model for model in runtime_config_values()["model_catalog"] if overrides.get(model, True)]
     models += [model for model, enabled in overrides.items() if enabled and model not in models]
     return models
 
@@ -1499,7 +1631,7 @@ def get_mode(chat_id):
 
         r = c.execute("SELECT response_mode FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
 
-    return r["response_mode"] if r else DEFAULT_MODE
+    return r["response_mode"] if r else runtime_config_values()["default_voice_reply_mode"]
 
 
 
@@ -1947,25 +2079,30 @@ def has_personal_api_key(chat_id):
 
 
 def shared_vision_model():
+    # ``shared_vision_model`` was the prior admin setting. Read it only as a
+    # migration fallback; all new writes use the unified runtime config.
+    snapshot = runtime_config_snapshot()
+    if snapshot["fields"]["vision_model"]["source"] == "ADMIN":
+        return snapshot["fields"]["vision_model"]["value"]
     with conn() as c:
         row = c.execute("SELECT setting_value FROM app_settings WHERE setting_key='shared_vision_model'").fetchone()
-    return (row["setting_value"] if row else "") or VISION_MODEL
+    return (row["setting_value"] if row else "") or snapshot["fields"]["vision_model"]["value"]
 
 
 def set_shared_vision_model(model):
-    with conn() as c:
-        c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('shared_vision_model',?,?) "
-                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",
-                  (model, datetime.now(timezone.utc).isoformat()))
+    # Compatibility for the existing Telegram setting flow. The normal admin
+    # Mini App route records the actual admin id; legacy callers are marked 0.
+    return set_admin_runtime_config(0, "vision_model", model)
 
 
 def vision_models_for(chat_id):
     """Resolve Vision independently from chat models and key ownership."""
+    config = runtime_config_values()
     if not has_personal_api_key(chat_id):
         primary = shared_vision_model()
-        return [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+        return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
     primary = model_router().resolve(chat_id, "vision")
-    return [primary] + [m for m in VISION_FALLBACK_MODELS if m != primary]
+    return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
 
 
 def record_usage(chat_id, source, model, payload):
@@ -3190,7 +3327,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
     tools = ToolPackResolver().resolve(TOOLS, text)
     selected = model_router().resolve(chat_id, "chat")
-    models = list(dict.fromkeys([selected["primary"], selected["fallback"], *FALLBACK_MODELS, *AVAILABLE_MODELS]))
+    config = runtime_config_values()
+    models = list(dict.fromkeys([selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]]))
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes, final_text = [], ""
     for round_index in range(5):
@@ -3277,7 +3415,7 @@ def mint_mistral_realtime_session():
     response = requests.post(
         MISTRAL_CLIENT_SESSIONS_URL,
         headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
-        json={"purpose": "realtime", "model": MISTRAL_REALTIME_MODEL},
+        json={"purpose": "realtime", "model": runtime_config_values()["realtime_model"]},
         timeout=20,
     )
     if not response.ok:
@@ -3290,7 +3428,7 @@ def mint_mistral_realtime_session():
     return {
         "token": token,
         "expires_at": secret.get("expires_at") or payload.get("expires_at"),
-        "model": MISTRAL_REALTIME_MODEL,
+        "model": runtime_config_values()["realtime_model"],
         "url": "wss://api.mistral.ai/v1/audio/transcriptions/realtime",
     }
 
@@ -3425,9 +3563,9 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
     selected=model_router().resolve(chat_id, "chat")
     primary, fallback = selected["primary"], selected["fallback"]
-    # Explicit FALLBACK_MODELS has priority. If it is not configured, the
-    # preset catalogue is still a useful automatic fallback chain.
-    candidates = [fallback] + FALLBACK_MODELS + AVAILABLE_MODELS
+    # The admin/ENV strong model and catalogue are the live fallback chain.
+    config = runtime_config_values()
+    candidates = [fallback, config["strong_model"], *config["model_catalog"]]
     models = [primary] + [m for m in candidates if m and m != primary and m not in [primary]]
     models = list(dict.fromkeys(models))
 
@@ -3728,14 +3866,14 @@ def _transcribe_unmeasured(chat_id, path):
     for attempt in range(2):
         key, source = api_key_for_chat(chat_id)
         r=requests.post(BATCH_STT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-                        json={"model":BATCH_STT_MODEL,"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=BATCH_STT_TIMEOUT_SEC)
+                        json={"model":runtime_config_values()["batch_stt_model"],"input_audio":{"data":b64,"format":audio_format},"language":"ru"},timeout=BATCH_STT_TIMEOUT_SEC)
         if r.ok or attempt or not recover_missing_managed_key(chat_id, r):
             break
 
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
     data = r.json()
-    record_usage(chat_id, source, BATCH_STT_MODEL, data)
+    record_usage(chat_id, source, runtime_config_values()["batch_stt_model"], data)
     text=data.get("text","").strip()
 
     if not text: raise RuntimeError("STT_EMPTY")
@@ -3773,7 +3911,7 @@ async def make_voice(text):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
 
-    await edge_tts.Communicate(clean_tts(text) or "Готово.",VOICE).save(str(p))
+    await edge_tts.Communicate(clean_tts(text) or "Готово.", runtime_config_values()["tts_voice"]).save(str(p))
 
     return p
 

@@ -13,13 +13,13 @@ Amvera должна содержать только переменные из `U
 | `OPENROUTER_API_KEY` | Общий ключ LLM и batch STT | Required secret |
 | `QUICK_ACTIONS_BASE_URL` | Публичный HTTPS origin Mini App | Required, если Mini App включён |
 | `ADMIN_CHAT_IDS` | Доступ к admin telemetry и Realtime Beta | Optional |
-| `FAST_MODEL`, `FAST_MODEL_PROVIDERS`, `FAST_MODEL_ALLOW_PROVIDER_FALLBACK` | Быстрый router path | Optional; defaults есть |
-| `STRONG_MODEL`, `STRONG_MODEL_PROVIDERS`, `STRONG_MODEL_ALLOW_PROVIDER_FALLBACK` | Strong fallback router path | Optional; defaults есть |
-| `MODEL`, `FALLBACK_MODELS`, `AVAILABLE_MODELS`, `CHAT_MAX_TOKENS` | Существующие model override и лимиты | Optional; defaults есть |
-| `VISION_MODEL`, `VISION_FALLBACK_MODELS` | Vision path | Optional; defaults есть |
+| `FAST_MODEL`, `FAST_MODEL_PROVIDERS`, `FAST_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для fast router | Optional; editable live admin |
+| `STRONG_MODEL`, `STRONG_MODEL_PROVIDERS`, `STRONG_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для strong fallback | Optional; editable live admin |
+| `MODEL_CATALOG`, `CHAT_MAX_TOKENS` | Allowed model catalogue и лимит | Optional; catalogue editable live admin |
+| `VISION_MODEL`, `VISION_FALLBACK_MODELS` | Bootstrap defaults Vision | Optional; editable live admin |
 | `BATCH_STT_MODEL`, `BATCH_STT_TIMEOUT_SEC` | Canonical production batch STT | Optional; defaults `mistralai/voxtral-mini-transcribe`, `180` |
-| `MISTRAL_API_KEY`, `MISTRAL_REALTIME_MODEL`, `MISTRAL_CLIENT_SESSIONS_URL` | Только admin-only Experimental Realtime Beta | Optional secret/config |
-| `EDGE_VOICE`, `VOICE_REPLY_MODE` | Telegram/Mini App output voice | Optional; defaults есть |
+| `MISTRAL_API_KEY`, `MISTRAL_REALTIME_MODEL`, `MISTRAL_CLIENT_SESSIONS_URL` | Только admin-only Experimental Realtime Beta | Key is secret; model editable live admin |
+| `TTS_PROVIDER`, `TTS_FALLBACK_PROVIDER`, `EDGE_VOICE`, `VOICE_REPLY_MODE` | Bootstrap TTS and default reply mode | Optional; editable live admin |
 | `TELEGRAM_DRAFT_STREAMING_ENABLED`, `TELEGRAM_DRAFT_MIN_INTERVAL`, `TELEGRAM_DRAFT_MAX_INTERVAL`, `TELEGRAM_DRAFT_MIN_CHARS` | Streaming drafts Telegram | Optional; defaults есть |
 | `TELEGRAM_SEND_RETRIES`, `TELEGRAM_CONNECT_TIMEOUT`, `TELEGRAM_READ_TIMEOUT`, `TELEGRAM_WRITE_TIMEOUT`, `TELEGRAM_POOL_TIMEOUT`, `TELEGRAM_CONNECTION_POOL_SIZE` | Telegram HTTP reliability | Optional; defaults есть |
 | `REMINDER_TICK_SECONDS` | Reminder scheduler | Optional; clamped 15–30 sec |
@@ -32,6 +32,9 @@ Amvera должна содержать только переменные из `U
 | Переменная | Замена | Runtime rule | Amvera action |
 |---|---|---|---|
 | `STT_MODEL` | `BATCH_STT_MODEL` | Used only when `BATCH_STT_MODEL` is absent | Move its value to `BATCH_STT_MODEL`; remove legacy key after the next release |
+| `MODEL` | `FAST_MODEL` | Used only when `FAST_MODEL` is absent | Move its value to `FAST_MODEL`; remove after the next release |
+| `FALLBACK_MODELS` | `STRONG_MODEL` | First value used only when `STRONG_MODEL` is absent | Move first value to `STRONG_MODEL`; remove after the next release |
+| `AVAILABLE_MODELS` | `MODEL_CATALOG` | Used only when `MODEL_CATALOG` is absent | Move its value to `MODEL_CATALOG`; remove after the next release |
 | `BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | Historical fallback is still read | Prefer canonical name; do not add it to new deployments |
 
 ## UNUSED — removed from runtime and `.env.example`
@@ -40,6 +43,7 @@ Amvera должна содержать только переменные из `U
 |---|---|---|
 | `VOICE_CONVERSATION_ENABLED`, `VOICE_MODE`, `VOICE_SESSION_TIMEOUT_SEC` | No production code path consumed them; realtime is controlled per admin in Mini App settings | Delete if present |
 | `VAD_SPEECH_THRESHOLD`, `VAD_END_SILENCE_MS`, `VAD_MIN_SPEECH_MS` | Old server-side voice settings; current VAD is isolated to lazy-loaded browser Beta and does not read them | Delete if present |
+| `STT_PROVIDER`, `STT_FALLBACK_MODEL`, `STT_REALTIME_MODEL` | No runtime reader exists; production is OpenRouter batch STT and Beta uses `MISTRAL_REALTIME_MODEL` | Delete if present |
 
 ## Development / test only — never set in Amvera
 
@@ -55,3 +59,16 @@ Amvera должна содержать только переменные из `U
 
 The canonical batch path is OpenRouter transcription with the shared
 `OPENROUTER_API_KEY`; realtime Mistral variables never alter this path.
+
+## Admin runtime config
+
+`AI & Voice` in the Mini App settings is visible only to `ADMIN_CHAT_IDS`.
+It uses the existing `app_settings` SQLite storage, stores only safe model and
+voice values plus `updated_at` / `updated_by`, and immediately affects new
+requests without a restart. It never reads, displays or copies secrets.
+
+Effective precedence is: user-specific model/reply preference → admin override
+→ ENV bootstrap default → built-in default. `Reset to ENV` removes only the
+admin override for that field. The live-editable fields are FAST/STRONG model
+routes, Vision, batch STT model, TTS provider/fallback/voice, default voice
+reply mode, Realtime Beta model and the allowed model catalogue.

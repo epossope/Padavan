@@ -16,6 +16,8 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             valid_webapp_user=lambda value: {"id": 42} if value == "signed" else None,
             set_mode=Mock(), set_app_setting=Mock(), LOGGER=Mock(),
             TELEMETRY_ENABLED=True, ADMIN_CHAT_IDS={42},
+            set_admin_runtime_config=Mock(return_value={"fields": {}}),
+            reset_admin_runtime_config=Mock(return_value={"fields": {}}),
             record_runtime_metric=Mock(), reset_runtime_metric_series=Mock(),
             runtime_metric_export=Mock(return_value={"enabled": True, "metrics": {}}),
             mint_mistral_realtime_session=Mock(return_value={
@@ -105,6 +107,21 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "set_experimental_realtime", "args": {"enabled": True}})
         self.assertEqual(response.status, 200)
         self.core.set_app_setting.assert_called_once_with("miniapp_realtime_beta:42", "1")
+
+    async def test_admin_runtime_config_is_admin_only_and_never_accepts_secrets(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "admin_runtime_config_set",
+            "args": {"field": "fast_model", "value": "vendor/model"},
+        })
+        self.assertEqual(response.status, 200)
+        self.core.set_admin_runtime_config.assert_called_once_with(42, "fast_model", "vendor/model")
+        self.core.ADMIN_CHAT_IDS = set()
+        denied = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "admin_runtime_config_reset",
+            "args": {"field": "fast_model"},
+        })
+        self.assertEqual(denied.status, 403)
+        self.core.reset_admin_runtime_config.assert_not_called()
 
     async def test_realtime_beta_and_token_are_admin_only(self):
         self.core.ADMIN_CHAT_IDS = set()

@@ -259,6 +259,18 @@ def register_miniapp(app, core):
                 key = "miniapp_realtime_beta" if action == "set_experimental_realtime" else "miniapp_wake_enabled"
                 core.set_app_setting(f"{key}:{cid}", "1" if args["enabled"] else "0")
                 result = {"enabled": args["enabled"]}
+            elif action in {"admin_runtime_config_set", "admin_runtime_config_reset"}:
+                if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
+                    raise web.HTTPForbidden(text="Недостаточно прав")
+                field = args.get("field")
+                if not isinstance(field, str) or len(field) > 80:
+                    raise ValueError("Некорректная настройка")
+                if action == "admin_runtime_config_set":
+                    if "value" not in args:
+                        raise ValueError("Некорректное значение")
+                    result = await asyncio.to_thread(core.set_admin_runtime_config, cid, field, args["value"])
+                else:
+                    result = await asyncio.to_thread(core.reset_admin_runtime_config, cid, field)
             elif action == "conversation_job":
                 job_id = args.get("id", "")
                 try:
@@ -312,6 +324,13 @@ def register_miniapp(app, core):
         if beta_available and callable(getattr(core, "app_setting", None)):
             realtime_beta = core.app_setting(f"miniapp_realtime_beta:{cid}", "0") == "1"
             wake_enabled = core.app_setting(f"miniapp_wake_enabled:{cid}", "0") == "1"
+        admin_runtime_config = None
+        if beta_available and callable(getattr(core, "runtime_config_snapshot", None)):
+            admin_runtime_config = core.runtime_config_snapshot()
+        voice_runtime = {}
+        if callable(getattr(core, "runtime_config_values", None)):
+            runtime = core.runtime_config_values()
+            voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice")}
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
@@ -321,6 +340,8 @@ def register_miniapp(app, core):
                              "experimental_realtime": realtime_beta,
                              "experimental_realtime_available": beta_available,
                              "experimental_wake_enabled": wake_enabled,
+                             "admin_runtime_config": admin_runtime_config,
+                             "voice_runtime": voice_runtime,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
@@ -394,10 +415,12 @@ def register_miniapp(app, core):
             # These are server-configured route labels, never user data or secrets.
             # They let one client response lock one stable voice without exposing
             # the underlying provider configuration.
-            voice_name = "".join(char for char in str(getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
+            runtime = core.runtime_config_values() if callable(getattr(core, "runtime_config_values", None)) else {}
+            voice_name = "".join(char for char in str(runtime.get("tts_voice") or getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
+            engine = str(runtime.get("tts_provider") or "edge").lower()
             return web.Response(body=body, content_type="audio/mpeg", headers={
                 "Cache-Control": "no-store",
-                "X-Noema-TTS-Engine": "edge",
+                "X-Noema-TTS-Engine": engine,
                 "X-Noema-TTS-Voice": voice_name,
             })
         finally:

@@ -10,6 +10,21 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_admin_runtime_config_has_admin_precedence_and_safe_metadata(self):
+        defaults = {"fast_model": ("env/model", "ENV")}
+        with patch.object(bot, "_runtime_env_defaults", return_value=defaults), \
+             patch.object(bot, "_runtime_config_record", return_value={"overrides": {"fast_model": "admin/model"}, "updated_at": "2026-01-01T00:00:00+00:00", "updated_by": 77}):
+            snapshot = bot.runtime_config_snapshot()
+        self.assertEqual(snapshot["fields"]["fast_model"], {"value": "admin/model", "source": "ADMIN"})
+        self.assertEqual(snapshot["updated_by"], 77)
+
+    def test_admin_runtime_config_validates_safe_values_only(self):
+        with self.assertRaises(ValueError):
+            bot._normalise_runtime_config_value("fast_model", "bad model value")
+        with self.assertRaises(ValueError):
+            bot._normalise_runtime_config_value("tts_provider", "unknown-provider")
+        self.assertEqual(bot._normalise_runtime_config_value("model_catalog", "one/model, two/model"), ["one/model", "two/model"])
+
     def test_batch_stt_env_prefers_canonical_name_then_one_release_alias(self):
         values = {"BATCH_STT_MODEL": "canonical-model", "STT_MODEL": "legacy-model"}
         with patch.object(bot.os, "getenv", side_effect=lambda name: values.get(name)):
