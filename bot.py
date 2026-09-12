@@ -158,13 +158,16 @@ ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
 ACTIVE_STREAM_RESPONSES = {}
 RUNTIME_METRICS = {}
 LATENCY_METRICS = (
-    "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms",
+    "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
     "stt_first_partial_ms", "stt_final_ms", "context_build_ms",
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
-    "llm_total_ms", "tts_first_start_ms", "total_response_start_ms",
+    "llm_total_ms", "tts_first_start_ms", "total_response_start_ms", "total_ms",
 )
 TELEMETRY_ENABLED = os.getenv("TELEMETRY_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
-TELEMETRY_SERIES_LIMIT = min(10000, max(50, int(os.getenv("TELEMETRY_SERIES_LIMIT", "2048"))))
+try:
+    TELEMETRY_SERIES_LIMIT = min(10000, max(50, int(os.getenv("TELEMETRY_SERIES_LIMIT", "2048"))))
+except ValueError:
+    TELEMETRY_SERIES_LIMIT = 2048
 RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in LATENCY_METRICS}
 RUNTIME_METRICS_LOCK = threading.Lock()
 
@@ -2611,7 +2614,14 @@ def execute_tool(chat_id,name,args):
     if name not in funcs: return {"ok":False,"tool":name,"error":"unknown_tool"}
 
     kwargs={k:v for k,v in args.items() if k!="chat_id"}
-    return funcs[name](chat_id,**kwargs)
+    started = time.perf_counter()
+    try:
+        return funcs[name](chat_id,**kwargs)
+    finally:
+        elapsed = (time.perf_counter() - started) * 1000
+        record_runtime_metric("tool_execution_ms", elapsed)
+        if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
+            record_runtime_metric("memory_retrieval_ms", elapsed)
 
 # ---------- LIVE DATA ----------
 
@@ -3084,10 +3094,12 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         yield {"type": "delta", "text": live}
         yield {"type": "done", "text": live}
         return
+    context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
     tools = ToolPackResolver().resolve(TOOLS, text)
     selected = model_router().resolve(chat_id, "chat")
     models = list(dict.fromkeys([selected["primary"], selected["fallback"], *FALLBACK_MODELS, *AVAILABLE_MODELS]))
+    record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes, final_text = [], ""
     for round_index in range(5):
         message = None
@@ -3096,12 +3108,15 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             if cancel_event.is_set():
                 yield {"type": "cancelled"}
                 return
+            request_started = time.perf_counter()
             response = request_chat_stream(chat_id, model, messages, tools, "required" if round_index == 0 and asks_external_web(text) else "auto")
             if not response.ok:
                 last_error = response.status_code
                 response.close()
+                record_runtime_metric("llm_total_ms", (time.perf_counter() - request_started) * 1000)
                 continue
             accumulator = StreamAccumulator()
+            first_delta = False
             with ACTIVE_STREAM_RESPONSES_LOCK:
                 ACTIVE_STREAM_RESPONSES[cancel_event] = response
             try:
@@ -3111,6 +3126,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         yield {"type": "cancelled"}
                         return
                     for delta in accumulator.add(payload):
+                        if not first_delta:
+                            first_delta = True
+                            record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
                         final_text += delta
                         yield {"type": "delta", "text": delta}
                 message = accumulator.message()
@@ -3127,6 +3145,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                     if ACTIVE_STREAM_RESPONSES.get(cancel_event) is response:
                         ACTIVE_STREAM_RESPONSES.pop(cancel_event, None)
                 response.close()
+                record_runtime_metric("llm_total_ms", (time.perf_counter() - request_started) * 1000)
         if message is None:
             raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
         calls = message.get("tool_calls") or []
@@ -3311,6 +3330,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
             started = time.perf_counter()
             r=request_chat(chat_id, model, messages, tools, tool_choice)
+            record_runtime_metric("llm_total_ms", (time.perf_counter()-started)*1000)
             print(f"LLM request chat_id={chat_id} model={model} seconds={time.perf_counter()-started:.2f} status={r.status_code}")
 
             if r.ok:
@@ -3342,7 +3362,9 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
         for model in models:
 
+            fallback_started = time.perf_counter()
             r=request_chat(chat_id, model, messages, tools, "auto")
+            record_runtime_metric("llm_total_ms", (time.perf_counter()-fallback_started)*1000)
 
             if r.ok:
                 data = r.json()
@@ -3413,6 +3435,7 @@ def ask(chat_id,text):
 
 
 
+    context_started = time.perf_counter()
     msgs=[{"role":"system","content":system_prompt(chat_id)}]
 
     ctx=_LAST_RETRIEVAL.get(chat_id)
@@ -3428,6 +3451,7 @@ def ask(chat_id,text):
         msgs.append({"role":"system","content":note})
 
     msgs+=conversation_context(chat_id)+[{"role":"user","content":text}]
+    record_runtime_metric("context_build_ms", (time.perf_counter()-context_started)*1000)
 
     writes=[]
 
@@ -3579,7 +3603,7 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
 
 # ---------- VOICE ----------
 
-def transcribe(chat_id, path):
+def _transcribe_unmeasured(chat_id, path):
 
     b64=base64.b64encode(Path(path).read_bytes()).decode()
     suffix = Path(path).suffix.lower().lstrip(".")
@@ -3606,6 +3630,15 @@ def transcribe(chat_id, path):
     if not text: raise RuntimeError("STT_EMPTY")
 
     return text
+
+
+def transcribe(chat_id, path):
+    """Keep STT behavior unchanged while recording a numeric end-to-end duration."""
+    started = time.perf_counter()
+    try:
+        return _transcribe_unmeasured(chat_id, path)
+    finally:
+        record_runtime_metric("stt_final_ms", (time.perf_counter() - started) * 1000)
 
 
 
