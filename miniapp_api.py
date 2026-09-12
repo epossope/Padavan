@@ -21,7 +21,9 @@ def register_miniapp(app, core):
     widget_types = set(default_widgets) | {"people"}
     client_latency_metrics = {
         "wake_ms", "stt_first_partial_ms", "stt_final_ms", "llm_ttft_ms",
-        "tts_first_start_ms", "total_response_start_ms", "total_ms",
+        "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
+        "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+        "speech_text_length_chars", "total_response_start_ms", "total_ms",
     }
     client_voice_robustness_metrics = {
         "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
@@ -130,6 +132,12 @@ def register_miniapp(app, core):
             clean[name] = value
         return clean
 
+    async def register_signed_user(user):
+        """Register a verified Mini App profile without blocking request UI."""
+        register = getattr(core, "register_bot_user", None)
+        if callable(register):
+            await asyncio.to_thread(register, user["id"], user)
+
     def widgets_for(cid):
         try:
             value = json.loads(core.app_setting(f"miniapp_home_widgets:{cid}", "null"))
@@ -176,6 +184,10 @@ def register_miniapp(app, core):
             if not user or not isinstance(user.get("id"), int):
                 raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
             cid = user["id"]
+            # A Mini App can be a person's first Noema interaction. Register
+            # the signed Telegram profile before any state/LLM work so admin
+            # accounting never depends on a separate API-key row.
+            await register_signed_user(user)
             action = payload.get("action", "state")
             args = payload.get("args", {})
             if not isinstance(args, dict):
@@ -257,6 +269,18 @@ def register_miniapp(app, core):
                 key = "miniapp_realtime_beta" if action == "set_experimental_realtime" else "miniapp_wake_enabled"
                 core.set_app_setting(f"{key}:{cid}", "1" if args["enabled"] else "0")
                 result = {"enabled": args["enabled"]}
+            elif action in {"admin_runtime_config_set", "admin_runtime_config_reset"}:
+                if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
+                    raise web.HTTPForbidden(text="Недостаточно прав")
+                field = args.get("field")
+                if not isinstance(field, str) or len(field) > 80:
+                    raise ValueError("Некорректная настройка")
+                if action == "admin_runtime_config_set":
+                    if "value" not in args:
+                        raise ValueError("Некорректное значение")
+                    result = await asyncio.to_thread(core.set_admin_runtime_config, cid, field, args["value"])
+                else:
+                    result = await asyncio.to_thread(core.reset_admin_runtime_config, cid, field)
             elif action == "conversation_job":
                 job_id = args.get("id", "")
                 try:
@@ -310,6 +334,13 @@ def register_miniapp(app, core):
         if beta_available and callable(getattr(core, "app_setting", None)):
             realtime_beta = core.app_setting(f"miniapp_realtime_beta:{cid}", "0") == "1"
             wake_enabled = core.app_setting(f"miniapp_wake_enabled:{cid}", "0") == "1"
+        admin_runtime_config = None
+        if beta_available and callable(getattr(core, "runtime_config_snapshot", None)):
+            admin_runtime_config = core.runtime_config_snapshot()
+        voice_runtime = {}
+        if callable(getattr(core, "runtime_config_values", None)):
+            runtime = core.runtime_config_values()
+            voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice")}
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
@@ -319,6 +350,8 @@ def register_miniapp(app, core):
                              "experimental_realtime": realtime_beta,
                              "experimental_realtime_available": beta_available,
                              "experimental_wake_enabled": wake_enabled,
+                             "admin_runtime_config": admin_runtime_config,
+                             "voice_runtime": voice_runtime,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
@@ -327,6 +360,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(form.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         upload = form.get("audio")
         if not getattr(upload, "file", None):
             raise web.HTTPBadRequest()
@@ -355,6 +389,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(form.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         upload = form.get("audio")
         if not getattr(upload, "file", None):
             raise web.HTTPBadRequest()
@@ -383,13 +418,24 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized()
+        await register_signed_user(user)
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 2000:
             raise web.HTTPBadRequest(text="Некорректный текст")
         path = await core.make_voice(text)
         try:
             body = await asyncio.to_thread(path.read_bytes)
-            return web.Response(body=body, content_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+            # These are server-configured route labels, never user data or secrets.
+            # They let one client response lock one stable voice without exposing
+            # the underlying provider configuration.
+            runtime = core.runtime_config_values() if callable(getattr(core, "runtime_config_values", None)) else {}
+            voice_name = "".join(char for char in str(runtime.get("tts_voice") or getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
+            engine = str(runtime.get("tts_provider") or "edge").lower()
+            return web.Response(body=body, content_type="audio/mpeg", headers={
+                "Cache-Control": "no-store",
+                "X-Noema-TTS-Engine": engine,
+                "X-Noema-TTS-Voice": voice_name,
+            })
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -398,6 +444,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data"))
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        await register_signed_user(user)
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 12000:
             raise web.HTTPBadRequest(text="Некорректное сообщение")
@@ -483,6 +530,7 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        await register_signed_user(user)
         if user["id"] not in getattr(core, "ADMIN_CHAT_IDS", set()):
             raise web.HTTPForbidden(text="Недостаточно прав")
         try:
