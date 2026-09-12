@@ -190,6 +190,12 @@ const visualFixture={
  if(swipeOffset==='none')errors.push('Edge swipe did not follow the finger');
  await touch.waitForTimeout(140);if(await touch.evaluate(()=>page)!=='home')errors.push('Edge swipe did not return to the preceding screen');
  await touch.evaluate(()=>go('archive'));
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:8,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:74,y:224}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:2,y:224}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(210);
+ if(await touch.evaluate(()=>page)!=='archive')errors.push('Cancelled edge swipe unexpectedly navigated back');
+ if(await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform)!=='none')errors.push('Cancelled edge swipe left the screen offset');
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:12,y:350}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
