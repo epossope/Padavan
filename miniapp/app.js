@@ -23,7 +23,7 @@ async function api(action,args={}){
    const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Нет соединения с Noema.');return result.data}
   finally{telemetry.record('ui_action_ms',performance.now()-started,{action})}
 }
-async function load(){data=await api('state');render()}
+async function load(){data=await api('state');window.NoemaTelemetryEnabled=Boolean(data.settings?.telemetry_enabled);render()}
 function empty(text='Здесь пока тихо. Добавь первую запись.'){return `<div class="empty">${text}</div>`}
 function card(title,body,target,name){return NoemaUI.card(title,body,target,name)}
 function taskRows(items){return items.map(t=>`<div class="row"><button class="check ${t.status!=='open'?'done':''}" data-toggle="${t.id}" aria-label="Изменить статус задачи">${t.status!=='open'?'✓':''}</button><div class="body"><p>${esc(t.text)}</p><small>${date(t.due_date)}</small></div>${page==='tasks'?`<button class="delete" data-delete="delete_task" data-id="${t.id}" aria-label="Удалить задачу">×</button>`:''}</div>`).join('')||empty('Планы свободны. Чем займёмся?')}
