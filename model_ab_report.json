@@ -1,0 +1,92 @@
+{
+  "measurement_only": true,
+  "requests_per_candidate": 15,
+  "fast": {
+    "model": "qwen/qwen3.5-flash-02-23",
+    "provider_request": {
+      "only": [
+        "alibaba"
+      ],
+      "order": [
+        "alibaba"
+      ],
+      "allow_fallbacks": false,
+      "require_parameters": true
+    },
+    "count": 15,
+    "successful": 10,
+    "errors": {
+      "404": 5
+    },
+    "ttft_ms": {
+      "count": 10,
+      "avg": 785.0,
+      "p50": 660.7,
+      "p95": 1058.2,
+      "max": 1058.2
+    },
+    "total_ms": {
+      "count": 10,
+      "avg": 1207.3,
+      "p50": 1082.2,
+      "p95": 1815.9,
+      "max": 1815.9
+    },
+    "tool_call_success": {
+      "count": 0,
+      "total": 0
+    },
+    "russian_plain": {
+      "count": 10,
+      "total": 10
+    },
+    "cost_usd": 0.00023862,
+    "providers": {
+      "not_exposed": 10
+    }
+  },
+  "strong": {
+    "model": "deepseek/deepseek-v3.2",
+    "provider_request": {
+      "only": [
+        "streamlake",
+        "deepinfra"
+      ],
+      "order": [
+        "streamlake",
+        "deepinfra"
+      ],
+      "allow_fallbacks": true,
+      "require_parameters": true
+    },
+    "count": 15,
+    "successful": 15,
+    "errors": {},
+    "ttft_ms": {
+      "count": 15,
+      "avg": 1662.1,
+      "p50": 1502.8,
+      "p95": 2592.3,
+      "max": 2592.3
+    },
+    "total_ms": {
+      "count": 15,
+      "avg": 2233.0,
+      "p50": 2255.5,
+      "p95": 3115.6,
+      "max": 3115.6
+    },
+    "tool_call_success": {
+      "count": 5,
+      "total": 5
+    },
+    "russian_plain": {
+      "count": 10,
+      "total": 10
+    },
+    "cost_usd": 0.00044969,
+    "providers": {
+      "not_exposed": 15
+    }
+  }
+}

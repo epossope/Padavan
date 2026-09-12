@@ -6,7 +6,8 @@ import os
 import tempfile
 import threading
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -25,12 +26,95 @@ def register_miniapp(app, core):
     client_voice_robustness_metrics = {
         "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
         "barge_in_rms", "barge_in_vad_probability", "audio_capture_sample_rate_hz",
-        "stt_stream_sample_rate_hz", "vad_engine", "vad_fallback_reason_code",
+        "stt_stream_sample_rate_hz", "vad_engine", "vad_engine_name",
+        "vad_fallback_reason", "vad_fallback_reason_code",
         "noise_floor_rms", "speech_start_probability", "speech_start_rms",
         "realtime_empty_final_count", "realtime_fallback_batch_count",
-        "batch_fallback_success_count", "stt_ws_connect_ms",
+        "batch_fallback_success_count", "stt_ws_connect_ms", "vosk_load_ms",
+        "silero_load_ms", "get_user_media_ms", "mic_permission_ms",
+        "conversation_ready_ms",
     }
     client_telemetry_metrics = client_latency_metrics | client_voice_robustness_metrics
+    jobs = {}
+    job_locks = {}
+    jobs_lock = threading.Lock()
+
+    def ensure_jobs_table():
+        if not callable(getattr(core, "conn", None)):
+            return
+        with core.conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS miniapp_jobs(
+                id TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, completed_at TEXT, notified_at TEXT,
+                error_code TEXT NOT NULL DEFAULT ''
+            )""")
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(miniapp_jobs)")}
+            if "notified_at" not in columns:
+                c.execute("ALTER TABLE miniapp_jobs ADD COLUMN notified_at TEXT")
+
+    ensure_jobs_table()
+
+    def persist_job(job_id, cid, status, error_code=""):
+        now = datetime.now(timezone.utc).isoformat()
+        completed_at = now if status in {"done", "error"} else None
+        with jobs_lock:
+            previous = jobs.get(job_id, {})
+            jobs[job_id] = {
+                "id": job_id, "chat_id": cid, "status": status,
+                "created_at": previous.get("created_at", now),
+                "completed_at": completed_at, "notified_at": previous.get("notified_at"),
+                "error_code": error_code,
+            }
+        if not callable(getattr(core, "conn", None)):
+            return
+        with core.conn() as c:
+            if status == "running":
+                c.execute("INSERT INTO miniapp_jobs(id,chat_id,status,created_at,error_code) VALUES(?,?,?,?,?)",
+                          (job_id, cid, status, now, ""))
+            else:
+                c.execute("UPDATE miniapp_jobs SET status=?,completed_at=?,error_code=? WHERE id=? AND chat_id=?",
+                          (status, completed_at, error_code[:80], job_id, cid))
+
+    def job_status(job_id, cid):
+        if callable(getattr(core, "conn", None)):
+            with core.conn() as c:
+                row = c.execute("SELECT id,status,created_at,completed_at,error_code FROM miniapp_jobs WHERE id=? AND chat_id=?",
+                                (job_id, cid)).fetchone()
+            if row:
+                return dict(row)
+        with jobs_lock:
+            job = jobs.get(job_id)
+        if not job or job["chat_id"] != cid:
+            raise ValueError("Запрос не найден")
+        return {key: value for key, value in job.items() if key != "chat_id"}
+
+    def claim_completion_notification(job_id, cid):
+        """Reserve one generic completion notice without ever storing answer text."""
+        now = datetime.now(timezone.utc).isoformat()
+        if callable(getattr(core, "conn", None)):
+            with core.conn() as c:
+                cursor = c.execute(
+                    "UPDATE miniapp_jobs SET notified_at=? WHERE id=? AND chat_id=? "
+                    "AND status='done' AND (notified_at IS NULL OR notified_at='')",
+                    (now, job_id, cid),
+                )
+            return bool(cursor.rowcount)
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if not job or job["chat_id"] != cid or job["status"] != "done" or job.get("notified_at"):
+                return False
+            job["notified_at"] = now
+            return True
+
+    async def notify_completion(job_id, cid):
+        telegram_app = app.get("telegram_app")
+        bot = getattr(telegram_app, "bot", None)
+        if bot is None or not claim_completion_notification(job_id, cid):
+            return
+        try:
+            await bot.send_message(chat_id=cid, text="Ответ готов. Открой Noema, чтобы продолжить разговор.")
+        except Exception:
+            core.LOGGER.warning("Mini App completion notice failed for chat %s", cid)
 
     def telemetry_values(args):
         values = args.get("metrics")
@@ -165,6 +249,21 @@ def register_miniapp(app, core):
                     raise ValueError("Неизвестный режим")
                 core.set_mode(cid, args["mode"])
                 result = {"ok": True}
+            elif action in {"set_experimental_realtime", "set_experimental_wake"}:
+                if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
+                    raise web.HTTPForbidden(text="Недостаточно прав")
+                if type(args.get("enabled")) is not bool:
+                    raise ValueError("Некорректный режим Beta")
+                key = "miniapp_realtime_beta" if action == "set_experimental_realtime" else "miniapp_wake_enabled"
+                core.set_app_setting(f"{key}:{cid}", "1" if args["enabled"] else "0")
+                result = {"enabled": args["enabled"]}
+            elif action == "conversation_job":
+                job_id = args.get("id", "")
+                try:
+                    uuid.UUID(str(job_id))
+                except (ValueError, TypeError, AttributeError):
+                    raise ValueError("Некорректный запрос")
+                result = job_status(str(job_id), cid)
             elif action == "task_toggle":
                 result = core.toggle_task_status(cid, int(args["id"]))
             elif action == "clear_history":
@@ -206,12 +305,20 @@ def register_miniapp(app, core):
         files = core.get_files(cid, limit=100)["files"]
         for item in files:
             item.pop("local_path", None)
+        beta_available = cid in getattr(core, "ADMIN_CHAT_IDS", set())
+        realtime_beta = wake_enabled = False
+        if beta_available and callable(getattr(core, "app_setting", None)):
+            realtime_beta = core.app_setting(f"miniapp_realtime_beta:{cid}", "0") == "1"
+            wake_enabled = core.app_setting(f"miniapp_wake_enabled:{cid}", "0") == "1"
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
                 "history": core.history(cid, 50), "rules": core.behavior_rules_for(cid),
                 "settings": {"timezone": core.timezone_name_for(cid), "mode": core.get_mode(cid),
                              "home_widgets": widgets_for(cid),
+                             "experimental_realtime": realtime_beta,
+                             "experimental_realtime_available": beta_available,
+                             "experimental_wake_enabled": wake_enabled,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
@@ -268,6 +375,24 @@ def register_miniapp(app, core):
         finally:
             Path(name).unlink(missing_ok=True)
 
+    async def speech(request):
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            raise web.HTTPBadRequest()
+        user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
+        if not user or not isinstance(user.get("id"), int):
+            raise web.HTTPUnauthorized()
+        text = str(payload.get("text", "")).strip()
+        if not text or len(text) > 2000:
+            raise web.HTTPBadRequest(text="Некорректный текст")
+        path = await core.make_voice(text)
+        try:
+            body = await asyncio.to_thread(path.read_bytes)
+            return web.Response(body=body, content_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+        finally:
+            Path(path).unlink(missing_ok=True)
+
     async def chat_stream(request):
         payload = await request.json()
         user = core.valid_webapp_user(payload.get("init_data"))
@@ -276,41 +401,77 @@ def register_miniapp(app, core):
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 12000:
             raise web.HTTPBadRequest(text="Некорректное сообщение")
-        cid = user["id"]
+        cid, job_id = user["id"], str(uuid.uuid4())
         response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no"})
         await response.prepare(request)
         queue, loop, cancelled = asyncio.Queue(), asyncio.get_running_loop(), threading.Event()
+        subscribed = threading.Event()
+        subscribed.set()
+        persist_job(job_id, cid, "running")
+
+        def miniapp_is_open():
+            transport = request.transport
+            return subscribed.is_set() and transport is not None and not transport.is_closing()
 
         def produce():
+            completed = False
+            notify_after_disconnect = False
             try:
-                for event in core.stream_agent_response(cid, text, cancelled):
-                    loop.call_soon_threadsafe(queue.put_nowait, event)
+                with job_locks.setdefault(cid, threading.Lock()):
+                    for event in core.stream_agent_response(cid, text, cancelled):
+                        if subscribed.is_set():
+                            loop.call_soon_threadsafe(queue.put_nowait, event)
+                        if event.get("type") == "done":
+                            persist_job(job_id, cid, "done")
+                            completed = True
+                            notify_after_disconnect = not miniapp_is_open()
+                        elif event.get("type") == "cancelled":
+                            persist_job(job_id, cid, "error", "CANCELLED")
+                            completed = True
             except Exception as exc:
                 core.LOGGER.exception("Mini App stream failed for chat %s", cid)
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": str(exc)})
+                persist_job(job_id, cid, "error", type(exc).__name__)
+                completed = True
+                if subscribed.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": str(exc)})
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                # A well-behaved canonical stream emits ``done``.  Keep the
+                # durable job from being stranded in ``running`` if a legacy
+                # stream returns normally without that terminal marker.
+                if not completed:
+                    persist_job(job_id, cid, "done")
+                    notify_after_disconnect = not miniapp_is_open()
+                if notify_after_disconnect:
+                    loop.call_soon_threadsafe(lambda: asyncio.create_task(notify_completion(job_id, cid)))
+                if subscribed.is_set():
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        async with locks.setdefault(cid, asyncio.Lock()):
-            worker = threading.Thread(target=produce, name=f"miniapp-stream-{cid}", daemon=True)
-            worker.start()
-            try:
-                while True:
-                    event = await queue.get()
-                    if event is None:
-                        break
-                    await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
-            except (ConnectionResetError, asyncio.CancelledError):
-                if hasattr(core, "cancel_stream"):
-                    core.cancel_stream(cancelled)
-                else:
-                    cancelled.set()
-            finally:
-                if hasattr(core, "cancel_stream"):
-                    core.cancel_stream(cancelled)
-                else:
-                    cancelled.set()
-        with contextlib.suppress(ConnectionResetError):
+        threading.Thread(target=produce, name=f"miniapp-job-{job_id[:8]}", daemon=True).start()
+        try:
+            await response.write((json.dumps({"type": "job", "job_id": job_id}) + "\n").encode("utf-8"))
+            next_watchdog_at = time.monotonic() + 8
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
+                except asyncio.TimeoutError:
+                    # This is intentionally generic: no unsupported claim about
+                    # a search or a tool is shown before the core emits one.
+                    await response.write(json.dumps({"type": "progress", "text": "Ответ ещё готовится…"}, ensure_ascii=False).encode("utf-8") + b"\n")
+                    next_watchdog_at = time.monotonic() + 8
+                    continue
+                if event is None:
+                    break
+                if event.get("type") == "tool":
+                    await response.write(json.dumps({"type": "progress", "text": "Действие выполнено, готовлю ответ…"}, ensure_ascii=False).encode("utf-8") + b"\n")
+                await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+        except (ConnectionResetError, asyncio.CancelledError):
+            # The worker deliberately keeps running: its final answer is added by
+            # the canonical agent pipeline even if this screen has gone away.
+            subscribed.clear()
+            with contextlib.suppress(ValueError):
+                if job_status(job_id, cid).get("status") == "done":
+                    await notify_completion(job_id, cid)
+        with contextlib.suppress(ConnectionResetError, asyncio.CancelledError):
             await response.write_eof()
         return response
 
@@ -322,6 +483,8 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        if user["id"] not in getattr(core, "ADMIN_CHAT_IDS", set()):
+            raise web.HTTPForbidden(text="Недостаточно прав")
         try:
             session = await asyncio.to_thread(core.mint_mistral_realtime_session)
         except RuntimeError as exc:
@@ -333,6 +496,7 @@ def register_miniapp(app, core):
 
     app.router.add_post("/api/v1/miniapp/voice", voice)
     app.router.add_post("/api/v1/miniapp/voice/transcribe", voice_transcribe)
+    app.router.add_post("/api/v1/miniapp/speech", speech)
     app.router.add_post("/api/v1/miniapp/chat-stream", chat_stream)
     app.router.add_post("/api/v1/miniapp/voice/realtime-token", realtime_token)
     app.router.add_get("/app", index)
