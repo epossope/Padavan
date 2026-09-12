@@ -116,6 +116,8 @@ class TelemetrySeriesTests(unittest.TestCase):
         llm = exported["metrics"]["llm_total_ms"]
         self.assertEqual(llm, {"count": 5, "avg": 30.0, "p50": 30.0, "p95": 48.0, "max": 50.0})
         self.assertEqual(exported["metrics"]["tool_execution_ms"]["count"], 0)
+        self.assertIn("voice_robustness", exported["groups"])
+        self.assertIn("barge_in_duration_ms", exported["groups"]["voice_robustness"])
         self.assertNotIn("untracked_metric", exported["metrics"])
         serialized = repr(exported).lower()
         self.assertNotIn("chat_id", serialized)
@@ -168,6 +170,7 @@ class TelemetryCommandTests(unittest.IsolatedAsyncioTestCase):
         report = admin.effective_message.reply_text.await_args.args[0]
         self.assertIn("count 2", report)
         self.assertIn("avg 20.0 ms", report)
+        self.assertIn("Voice robustness", report)
         self.assertNotIn("private text", report)
         self.assertNotIn("payload", report)
         outsider = self.update(chat_id=99)

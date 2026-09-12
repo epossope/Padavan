@@ -108,6 +108,14 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core.record_runtime_metric.assert_any_call("tts_first_start_ms", 123.4)
         self.core.record_runtime_metric.assert_any_call("total_ms", 456.0)
 
+        voice_diagnostic = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "telemetry_record",
+            "args": {"metrics": {"barge_in_duration_ms": 250, "barge_in_vad_probability": 0.82}},
+        })
+        self.assertEqual(voice_diagnostic.status, 200)
+        self.core.record_runtime_metric.assert_any_call("barge_in_duration_ms", 250.0)
+        self.core.record_runtime_metric.assert_any_call("barge_in_vad_probability", 0.82)
+
         rejected = await self.client.post('/api/v1/miniapp', json={
             "init_data": "signed", "action": "telemetry_record",
             "args": {"metrics": {"text": "private message"}},
@@ -126,4 +134,12 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         source = (Path(__file__).parent.parent / "miniapp" / "voice-conversation.js").read_text(encoding="utf-8")
         self.assertIn("if(name==='total_ms')", source)
         self.assertNotIn("if(name==='total')metrics.push", source)
-        self.assertIn("const sample={};for(const metricName of clientLatencyMetrics)", source)
+        self.assertIn("const sample={};for(const metricName of latencyMetrics)", source)
+        self.assertIn("class SileroVADProvider", source)
+        self.assertIn("bargeStableMs:250", source)
+        self.assertIn("speakingVadProbability:.82", source)
+        self.assertIn("echoCancellation:true,noiseSuppression:true,autoGainControl:true", source)
+        self.assertIn("barge_in_reason_code", source)
+        self.assertIn("audio_format:{encoding:'pcm_s16le',sample_rate:16000}", source)
+        self.assertNotIn("алёна", source.lower())
+        self.assertNotIn("нина", source.lower())
