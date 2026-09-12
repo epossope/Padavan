@@ -293,6 +293,17 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--app-safe-top", css)
         self.assertIn("--app-safe-bottom", css)
 
+    def test_ui_assets_are_versioned_and_home_editing_survives_mixed_cache(self):
+        root = Path(__file__).parent.parent / "miniapp"
+        index = (root / "index.html").read_text(encoding="utf-8")
+        app_source = (root / "app.js").read_text(encoding="utf-8")
+        screen_source = (root / "screens.js").read_text(encoding="utf-8")
+        mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
+        self.assertEqual(index.count("?v=ui-1.3.1"), 11)
+        self.assertIn("window.homeEditing=Boolean(window.homeEditing)", app_source)
+        self.assertIn("window.homeEditing=Boolean(window.homeEditing)", screen_source)
+        self.assertNotIn("if(homeEditing", mobile_source)
+
     def test_effective_ai_snapshot_and_collapsed_admin_sections_are_wired(self):
         api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")
         app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")

@@ -5,7 +5,8 @@ let data=emptyState(),page='home',filter='all',search='',busy=false;
 const {icon,iconButton,segmented}=NoemaUI;
 const defaultWidgets=['tasks','next_event','notes','reminders','budget','recent_saved'];
 const widgetNames={tasks:'Задачи',next_event:'Ближайшее',notes:'Заметки',reminders:'Напоминания',budget:'Бюджет',recent_saved:'Недавно сохранено',people:'Люди'};
-let weatherData=null,monthBudget=null,taskTab='today',navHistory=[],layoutDraft=[],archiveResults=null,statusMessage='',stateLoadedAt=0,stateRefreshPromise=null,homeEditing=false;
+let weatherData=null,monthBudget=null,taskTab='today',navHistory=[],layoutDraft=[],archiveResults=null,statusMessage='',stateLoadedAt=0,stateRefreshPromise=null;
+window.homeEditing=Boolean(window.homeEditing);
 const preview=!tg?.initData;
 const telemetry=window.NoemaTelemetry=window.NoemaTelemetry||{events:[],latest:{}};
 telemetry.record=telemetry.record||function(name,value,detail={}){const sample={name,value:Math.max(0,Math.round(Number(value)||0)),at:Date.now(),...detail};this.latest[name]=sample;this.events.push(sample);if(this.events.length>80)this.events.splice(0,this.events.length-80);return sample};
@@ -152,7 +153,7 @@ function localDateTime(value){if(!value)return '';const d=new Date(value);const 
 function openEdit(type,id){let item,values,action,title,form;if(type==='task'){item=data.tasks.find(x=>x.id===id);values={text:item?.text,due_date:item?.due_date,priority:item?.priority,task_id:id};action='update_task';title='Изменить задачу';form='task'}if(type==='note'){item=data.notes.find(x=>x.id===id);values={title:item?.title,text:item?.text,note_id:id};action='update_note';title='Изменить заметку';form='note'}if(type==='reminder'){item=data.reminders.find(x=>x.id===id);values={text:item?.text,remind_at:localDateTime(item?.remind_at_utc),reminder_id:id};action='update_reminder';title='Изменить напоминание';form='reminder'}if(type==='expense'){item=(budgetData?.items||data.expenses).find(x=>x.id===id);values={amount:item?.amount,description:item?.description,category:item?.category,expense_id:id};action='update_expense';title='Изменить операцию';form=item?.kind==='income'?'income':'expense'}if(type==='person'){item=data.people.find(x=>x.id===id);values={name:item?.name,relationship:item?.relationship,birthday:item?.birthday,age:item?.age,home_city:item?.home_city,current_location:item?.current_location,projects:item?.projects,notes:item?.notes,person_id:id};action='update_person';title='Изменить человека';form='person'}if(type==='rule'){item=data.rules.find(x=>x.id===id);values={description:item?.description,rule_id:id};action='update_behavior_rule';title='Изменить правило';form='rule'}if(item)openForm(form,values,action,title)}
 async function mutate(action,args){if(busy)return;busy=true;try{await api(action,args);await load();if(page==='budget')await loadBudget();say('')}catch(e){say(e.message)}finally{busy=false}}
 document.addEventListener('click',async e=>{const b=e.target.closest('button,[role=button]');if(!b)return;
-  if(b.dataset.page&&!(homeEditing&&b.closest('.home-grid')))go(b.dataset.page);
+  if(b.dataset.page&&!(window.homeEditing&&b.closest('.home-grid')))go(b.dataset.page);
   if(b.id==='record')await recordVoice(b);
   if(b.dataset.filter){filter=b.dataset.filter;render()}
   if(b.dataset.form)openForm(b.dataset.form);

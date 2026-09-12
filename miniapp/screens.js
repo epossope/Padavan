@@ -1,4 +1,5 @@
 /* Screen composition uses shared primitives in ui.js and existing backend actions. */
+window.homeEditing=Boolean(window.homeEditing);
 const {sectionHeader,searchField,chip}=NoemaUI;
 let taskFilter='all',noteFilter='all',peopleFilter='all';
 const priorityLabels={high:'Высокий',urgent:'Высокий',normal:'Обычный',medium:'Средний',low:'Низкий'};
@@ -25,9 +26,9 @@ home=function(){
   people:[list(data.people.slice(0,3).map(p=>p.name),'people')||empty('Нет сохранённых контактов'),'people','people']
  };
  const widgets=(data.settings.home_widgets||defaultWidgets).filter(type=>bodies[type]),hidden=Object.keys(bodies).filter(type=>!widgets.includes(type));
- const editHead=homeEditing?`<div class="home-edit-head"><small>Перетаскивай карточки</small><button type="button" data-home-done>Готово</button></div>`:'';
- const hiddenTray=homeEditing?`<div class="home-hidden"><small>Скрытые</small><div class="chip-row">${hidden.map(type=>`<button type="button" class="chip" data-home-show="${type}">+ ${esc(widgetNames[type])}</button>`).join('')||'<span>Нет</span>'}</div></div>`:'';
- return `<section class="card hero"><div class="hero-calendar"><h3>${icon('calendar')} Сегодня</h3><div class="hero-date"><span class="date-number">${d.getDate()}</span><p>${d.toLocaleDateString('ru-RU',{month:'long'})}<br>${d.toLocaleDateString('ru-RU',{weekday:'long'})}</p></div></div><div class="weather">${weather}</div><canvas class="membrane" width="420" height="420" aria-hidden="true"></canvas></section>${editHead}<div class="grid home-grid ${homeEditing?'editing':''}">${widgets.map(type=>`<div data-widget="${type}">${card(widgetNames[type],`<div class="widget-content">${bodies[type][0]}</div>`,bodies[type][1],bodies[type][2])}${homeEditing?`<button type="button" class="home-widget-hide" data-home-hide="${type}" aria-label="Скрыть ${esc(widgetNames[type])}">×</button>`:''}</div>`).join('')}</div>${hiddenTray}`;
+ const editHead=window.homeEditing?`<div class="home-edit-head"><small>Перетаскивай карточки</small><button type="button" data-home-done>Готово</button></div>`:'';
+ const hiddenTray=window.homeEditing?`<div class="home-hidden"><small>Скрытые</small><div class="chip-row">${hidden.map(type=>`<button type="button" class="chip" data-home-show="${type}">+ ${esc(widgetNames[type])}</button>`).join('')||'<span>Нет</span>'}</div></div>`:'';
+ return `<section class="card hero"><div class="hero-calendar"><h3>${icon('calendar')} Сегодня</h3><div class="hero-date"><span class="date-number">${d.getDate()}</span><p>${d.toLocaleDateString('ru-RU',{month:'long'})}<br>${d.toLocaleDateString('ru-RU',{weekday:'long'})}</p></div></div><div class="weather">${weather}</div><canvas class="membrane" width="420" height="420" aria-hidden="true"></canvas></section>${editHead}<div class="grid home-grid ${window.homeEditing?'editing':''}">${widgets.map(type=>`<div data-widget="${type}">${card(widgetNames[type],`<div class="widget-content">${bodies[type][0]}</div>`,bodies[type][1],bodies[type][2])}${window.homeEditing?`<button type="button" class="home-widget-hide" data-home-hide="${type}" aria-label="Скрыть ${esc(widgetNames[type])}">×</button>`:''}</div>`).join('')}</div>${hiddenTray}`;
 };
 const originalSettings=settings;
 settings=function(){const html=originalSettings().replace('<h1>Настройки</h1><p class="subtle">Фокус, ясность и контроль.</p>','').replace('<p class="subtle">Подключение iPhone и управление AI доступны в настройках бота.</p>','').replace(/<button data-delete="delete_behavior_rule" data-id="(\d+)" aria-label="Удалить правило">×<\/button>/g,'<button class="icon" data-edit="rule" data-id="$1" aria-label="Изменить правило">'+icon('settings')+'</button><button class="icon" data-delete="delete_behavior_rule" data-id="$1" aria-label="Удалить правило">'+icon('trash')+'</button>');return `<div class="settings-stack">${html}</div>`};
@@ -116,7 +117,7 @@ render=function(){
  for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
  renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread&&thread.scrollHeight-thread.scrollTop-thread.clientHeight<72)thread.scrollTop=thread.scrollHeight});tg?.BackButton.hide()
 };
-go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')homeEditing=false;page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
+go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')window.homeEditing=false;page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
 function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';render()}
 async function saveHomeWidgets(widgets){const previous=[...(data.settings.home_widgets||defaultWidgets)];data.settings.home_widgets=[...widgets];render();if(preview)return;try{await api('home_layout',{widgets})}catch(e){data.settings.home_widgets=previous;render();say(e.message)}}
 function openLayout(){layoutDraft=[...(data.settings.home_widgets||defaultWidgets)];drawLayout();document.querySelector('#layout-editor').showModal()}
@@ -142,7 +143,7 @@ document.addEventListener('click',async e=>{
  if(b.dataset.addWidget){layoutDraft.push(b.dataset.addWidget);drawLayout()}
  if(b.dataset.homeHide){await saveHomeWidgets((data.settings.home_widgets||defaultWidgets).filter(type=>type!==b.dataset.homeHide))}
  if(b.dataset.homeShow){await saveHomeWidgets([...(data.settings.home_widgets||defaultWidgets),b.dataset.homeShow])}
- if(b.hasAttribute('data-home-done')){homeEditing=false;render()}
+ if(b.hasAttribute('data-home-done')){window.homeEditing=false;render()}
  if(b.dataset.taskTab){taskTab=b.dataset.taskTab;taskFilter='all';render()}
  if(b.dataset.taskFilter){taskFilter=b.dataset.taskFilter;render()}
  if(b.dataset.noteFilter){noteFilter=b.dataset.noteFilter;render()}
