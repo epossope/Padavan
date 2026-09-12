@@ -18,6 +18,74 @@ TOOL_PACKS = {
 }
 
 
+_REASONING_TAG = re.compile(r"^<\s*(/?)\s*(think|analysis|reasoning)\b[^>]*>$", re.IGNORECASE)
+_REASONING_TAG_PREFIXES = (
+    "<think", "</think", "<analysis", "</analysis", "<reasoning", "</reasoning",
+)
+
+
+class VisibleContentFilter:
+    """Remove provider reasoning tags without leaking split streaming chunks."""
+
+    def __init__(self):
+        self.hidden_depth = 0
+        self.tag_buffer = ""
+        self.finished = False
+
+    def feed(self, value: str) -> str:
+        if self.finished or not isinstance(value, str) or not value:
+            return ""
+        visible = []
+        for char in value:
+            if self.tag_buffer:
+                self.tag_buffer += char
+                if char == ">":
+                    tag, self.tag_buffer = self.tag_buffer, ""
+                    match = _REASONING_TAG.match(tag)
+                    if match:
+                        if match.group(1):
+                            self.hidden_depth = max(0, self.hidden_depth - 1)
+                        else:
+                            self.hidden_depth += 1
+                    elif self.hidden_depth == 0:
+                        visible.append(tag)
+                elif len(self.tag_buffer) > 160:
+                    if self.hidden_depth == 0:
+                        visible.append(self.tag_buffer)
+                    self.tag_buffer = ""
+            elif char == "<":
+                self.tag_buffer = char
+            elif self.hidden_depth == 0:
+                visible.append(char)
+        return "".join(visible)
+
+    def finish(self) -> str:
+        if self.finished:
+            return ""
+        self.finished = True
+        tail, self.tag_buffer = self.tag_buffer, ""
+        if self.hidden_depth or not tail:
+            return ""
+        compact = re.sub(r"\s+", "", tail).lower()
+        if any(prefix.startswith(compact) or compact.startswith(prefix) for prefix in _REASONING_TAG_PREFIXES):
+            return ""
+        return tail
+
+
+def sanitize_visible_content(value: str) -> str:
+    content_filter = VisibleContentFilter()
+    return content_filter.feed(str(value or "")) + content_filter.finish()
+
+
+def sanitize_assistant_message(message: dict) -> dict:
+    """Keep tool calls and final content, but discard provider-only reasoning."""
+    clean = dict(message or {})
+    clean.pop("reasoning", None)
+    clean.pop("reasoning_details", None)
+    clean["content"] = sanitize_visible_content(clean.get("content") or "")
+    return clean
+
+
 class ToolPackResolver:
     """Cheap conservative routing: no extra LLM request and no lost common actions."""
     RULES = {
@@ -49,6 +117,7 @@ class StreamAccumulator:
     calls: dict[int, dict] = field(default_factory=dict)
     finish_reason: str | None = None
     usage: dict = field(default_factory=dict)
+    visible_filter: VisibleContentFilter = field(default_factory=VisibleContentFilter, repr=False)
 
     def add(self, payload: dict) -> list[str]:
         if payload.get("usage"):
@@ -59,8 +128,10 @@ class StreamAccumulator:
         emitted = []
         content = delta.get("content")
         if isinstance(content, str) and content:
-            self.content.append(content)
-            emitted.append(content)
+            visible = self.visible_filter.feed(content)
+            if visible:
+                self.content.append(visible)
+                emitted.append(visible)
         for part in delta.get("tool_calls") or []:
             index = int(part.get("index", 0))
             call = self.calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
@@ -73,7 +144,14 @@ class StreamAccumulator:
                 call["function"]["arguments"] += fn["arguments"]
         return emitted
 
+    def finish(self) -> str:
+        tail = self.visible_filter.finish()
+        if tail:
+            self.content.append(tail)
+        return tail
+
     def message(self) -> dict:
+        self.finish()
         result = {"role": "assistant", "content": "".join(self.content)}
         if self.calls:
             result["tool_calls"] = [self.calls[i] for i in sorted(self.calls)]
