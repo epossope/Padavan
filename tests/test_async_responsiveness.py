@@ -114,7 +114,7 @@ class TelemetrySeriesTests(unittest.TestCase):
 
         exported = bot.runtime_metric_export()
         llm = exported["metrics"]["llm_total_ms"]
-        self.assertEqual(llm, {"count": 5, "p50": 30.0, "p95": 48.0, "max": 50.0})
+        self.assertEqual(llm, {"count": 5, "avg": 30.0, "p50": 30.0, "p95": 48.0, "max": 50.0})
         self.assertEqual(exported["metrics"]["tool_execution_ms"]["count"], 0)
         self.assertNotIn("untracked_metric", exported["metrics"])
         serialized = repr(exported).lower()
@@ -125,6 +125,54 @@ class TelemetrySeriesTests(unittest.TestCase):
         bot.TELEMETRY_ENABLED = False
         bot.record_runtime_metric("llm_total_ms", 12)
         self.assertEqual(bot.runtime_metric_export()["metrics"]["llm_total_ms"]["count"], 0)
+
+
+class TelemetryCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.original_enabled = bot.TELEMETRY_ENABLED
+        self.original_admins = bot.ADMIN_CHAT_IDS
+        bot.TELEMETRY_ENABLED = True
+        bot.ADMIN_CHAT_IDS = {42}
+        bot.reset_runtime_metric_series()
+
+    def tearDown(self):
+        bot.reset_runtime_metric_series()
+        bot.TELEMETRY_ENABLED = self.original_enabled
+        bot.ADMIN_CHAT_IDS = self.original_admins
+
+    @staticmethod
+    def update(chat_id=42):
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=chat_id),
+            effective_message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+    async def test_reset_clears_only_numeric_samples_and_returns_timestamp(self):
+        bot.record_runtime_metric("llm_total_ms", 77, text="not telemetry")
+        update = self.update()
+        await bot.telemetry_reset_command(update, SimpleNamespace())
+        exported = bot.runtime_metric_export()
+        self.assertTrue(exported["enabled"])
+        self.assertTrue(exported["started_at"].endswith("Z"))
+        self.assertEqual(exported["metrics"]["llm_total_ms"]["count"], 0)
+        message = update.effective_message.reply_text.await_args.args[0]
+        self.assertIn("Telemetry reset", message)
+        self.assertNotIn("not telemetry", message)
+
+    async def test_status_and_report_are_admin_only_and_content_free(self):
+        bot.record_runtime_metric("llm_total_ms", 10, text="private text")
+        bot.record_runtime_metric("llm_total_ms", 30, audio="payload")
+        admin = self.update()
+        await bot.telemetry_status_command(admin, SimpleNamespace())
+        await bot.telemetry_report_command(admin, SimpleNamespace())
+        report = admin.effective_message.reply_text.await_args.args[0]
+        self.assertIn("count 2", report)
+        self.assertIn("avg 20.0 ms", report)
+        self.assertNotIn("private text", report)
+        self.assertNotIn("payload", report)
+        outsider = self.update(chat_id=99)
+        await bot.telemetry_report_command(outsider, SimpleNamespace())
+        outsider.effective_message.reply_text.assert_not_awaited()
 
 
 if __name__ == "__main__":

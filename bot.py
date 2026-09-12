@@ -170,6 +170,9 @@ except ValueError:
     TELEMETRY_SERIES_LIMIT = 2048
 RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in LATENCY_METRICS}
 RUNTIME_METRICS_LOCK = threading.Lock()
+# This is deliberately process-local: benchmark metadata must not create or
+# mutate user records in SQLite. A restart simply requires a new reset.
+TELEMETRY_BENCHMARK_STARTED_AT = None
 
 
 
@@ -799,9 +802,14 @@ def record_runtime_metric(name, value_ms, **detail):
 
 
 def reset_runtime_metric_series():
+    """Clear only in-memory numeric samples and mark a fresh benchmark start."""
+    global TELEMETRY_BENCHMARK_STARTED_AT
+    started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     with RUNTIME_METRICS_LOCK:
         for values in RUNTIME_METRIC_SERIES.values():
             values.clear()
+        TELEMETRY_BENCHMARK_STARTED_AT = started_at
+    return started_at
 
 
 def _latency_percentile(values, percentile):
@@ -819,12 +827,15 @@ def _latency_percentile(values, percentile):
 def runtime_metric_export():
     with RUNTIME_METRICS_LOCK:
         series = {name: list(values) for name, values in RUNTIME_METRIC_SERIES.items()}
+        started_at = TELEMETRY_BENCHMARK_STARTED_AT
     return {
         "enabled": TELEMETRY_ENABLED,
         "series_limit": TELEMETRY_SERIES_LIMIT,
+        "started_at": started_at,
         "metrics": {
             name: {
                 "count": len(values),
+                "avg": round(sum(values) / len(values), 1) if values else None,
                 "p50": _latency_percentile(values, 0.50),
                 "p95": _latency_percentile(values, 0.95),
                 "max": round(max(values), 1) if values else None,
@@ -3798,6 +3809,66 @@ async def start(update,context):
     initialize_briefing(chat_id)
 
 
+def telemetry_command_allowed(update):
+    """Commands expose aggregates only, and only to the already configured admins."""
+    chat = getattr(update, "effective_chat", None)
+    return bool(chat and chat.id in ADMIN_CHAT_IDS)
+
+
+def telemetry_counts_text(exported):
+    return "\n".join(
+        f"<code>{name}</code>: {metric['count']}"
+        for name, metric in exported["metrics"].items()
+    )
+
+
+def telemetry_report_text(exported):
+    lines = [
+        "<b>Telemetry report</b>",
+        f"Collection: <b>{'enabled' if exported['enabled'] else 'disabled'}</b>",
+        f"Started: <code>{exported['started_at'] or 'not reset in this process'}</code>",
+        "",
+    ]
+    for name, metric in exported["metrics"].items():
+        lines.append(
+            f"<code>{name}</code> — count {metric['count']} · avg {metric['avg']} ms · "
+            f"p50 {metric['p50']} ms · p95 {metric['p95']} ms · max {metric['max']} ms"
+        )
+    return "\n".join(lines)
+
+
+async def telemetry_reset_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    started_at = reset_runtime_metric_series()
+    await update.effective_message.reply_text(
+        "<b>Telemetry reset</b>\n"
+        f"Collection: <b>{'enabled' if TELEMETRY_ENABLED else 'disabled'}</b>\n"
+        f"Started: <code>{started_at}</code>\n\n"
+        "Only in-memory numeric latency samples were cleared.",
+        parse_mode="HTML",
+    )
+
+
+async def telemetry_status_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    exported = runtime_metric_export()
+    await update.effective_message.reply_text(
+        "<b>Telemetry status</b>\n"
+        f"Collection: <b>{'enabled' if exported['enabled'] else 'disabled'}</b>\n"
+        f"Started: <code>{exported['started_at'] or 'not reset in this process'}</code>\n\n"
+        "<b>Samples</b>\n" + telemetry_counts_text(exported),
+        parse_mode="HTML",
+    )
+
+
+async def telemetry_report_command(update, context):
+    if not telemetry_command_allowed(update):
+        return
+    await update.effective_message.reply_text(telemetry_report_text(runtime_metric_export()), parse_mode="HTML")
+
+
 async def set_today_emoji(update, context):
     """Save a custom emoji supplied by the bot owner as the Today button icon."""
     chat_id = update.effective_chat.id
@@ -5979,6 +6050,12 @@ async def main_async():
     app.add_handler(TypeHandler(Update, stopped_generation_handler), group=-1)
 
     app.add_handler(CommandHandler("start",start))
+
+    # Measurement-only admin controls. They never expose message, audio,
+    # identity, or secret material and do not touch persistent user data.
+    app.add_handler(CommandHandler("telemetry_reset", telemetry_reset_command))
+    app.add_handler(CommandHandler("telemetry_status", telemetry_status_command))
+    app.add_handler(CommandHandler("telemetry_report", telemetry_report_command))
 
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
 
