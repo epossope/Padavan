@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from aiohttp import web
@@ -12,6 +13,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core = SimpleNamespace(
             valid_webapp_user=lambda value: {"id": 42} if value == "signed" else None,
             set_mode=Mock(), set_app_setting=Mock(), LOGGER=Mock(),
+            TELEMETRY_ENABLED=True, ADMIN_CHAT_IDS={42},
+            record_runtime_metric=Mock(), reset_runtime_metric_series=Mock(),
+            runtime_metric_export=Mock(return_value={"enabled": True, "metrics": {}}),
             mint_mistral_realtime_session=Mock(return_value={
                 "token": "rt_scoped", "expires_at": "soon",
                 "model": "voxtral-mini-transcribe-realtime-2602",
@@ -94,3 +98,32 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         payload = await response.json()
         self.assertEqual(payload["data"]["token"], "rt_scoped")
         self.assertNotIn("api_key", json.dumps(payload).lower())
+
+    async def test_telemetry_accepts_only_numeric_allowlisted_latency(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "telemetry_record",
+            "args": {"metrics": {"tts_first_start_ms": 123.4, "total_ms": 456}},
+        })
+        self.assertEqual(response.status, 200)
+        self.core.record_runtime_metric.assert_any_call("tts_first_start_ms", 123.4)
+        self.core.record_runtime_metric.assert_any_call("total_ms", 456.0)
+
+        rejected = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "telemetry_record",
+            "args": {"metrics": {"text": "private message"}},
+        })
+        self.assertEqual(rejected.status, 400)
+
+    async def test_telemetry_export_and_reset_are_admin_only(self):
+        exported = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "telemetry_export", "args": {}})
+        self.assertEqual(exported.status, 200)
+        self.core.runtime_metric_export.assert_called_once()
+        reset = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "telemetry_reset", "args": {}})
+        self.assertEqual(reset.status, 200)
+        self.core.reset_runtime_metric_series.assert_called_once()
+
+    def test_voice_metrics_finalize_on_total_ms_and_strip_payload_fields(self):
+        source = (Path(__file__).parent.parent / "miniapp" / "voice-conversation.js").read_text(encoding="utf-8")
+        self.assertIn("if(name==='total_ms')", source)
+        self.assertNotIn("if(name==='total')metrics.push", source)
+        self.assertIn("const sample={};for(const metricName of clientLatencyMetrics)", source)

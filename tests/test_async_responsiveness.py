@@ -97,5 +97,35 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(bot.REMINDER_TICK_SECONDS, 30)
 
 
+class TelemetrySeriesTests(unittest.TestCase):
+    def setUp(self):
+        self.original_enabled = bot.TELEMETRY_ENABLED
+        bot.TELEMETRY_ENABLED = True
+        bot.reset_runtime_metric_series()
+
+    def tearDown(self):
+        bot.reset_runtime_metric_series()
+        bot.TELEMETRY_ENABLED = self.original_enabled
+
+    def test_export_has_bounded_numeric_latency_aggregates_only(self):
+        for value in (10, 20, 30, 40, 50):
+            bot.record_runtime_metric("llm_total_ms", value, chat_id=42, text="never exported")
+        bot.record_runtime_metric("untracked_metric", 999)
+
+        exported = bot.runtime_metric_export()
+        llm = exported["metrics"]["llm_total_ms"]
+        self.assertEqual(llm, {"count": 5, "p50": 30.0, "p95": 48.0, "max": 50.0})
+        self.assertEqual(exported["metrics"]["tool_execution_ms"]["count"], 0)
+        self.assertNotIn("untracked_metric", exported["metrics"])
+        serialized = repr(exported).lower()
+        self.assertNotIn("chat_id", serialized)
+        self.assertNotIn("never exported", serialized)
+
+    def test_disabled_telemetry_does_not_append_samples(self):
+        bot.TELEMETRY_ENABLED = False
+        bot.record_runtime_metric("llm_total_ms", 12)
+        self.assertEqual(bot.runtime_metric_export()["metrics"]["llm_total_ms"]["count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

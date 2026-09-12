@@ -18,6 +18,24 @@ def register_miniapp(app, core):
     weather_cache = {}
     default_widgets = ["tasks", "next_event", "notes", "reminders", "budget", "recent_saved"]
     widget_types = set(default_widgets) | {"people"}
+    client_latency_metrics = {
+        "wake_ms", "stt_first_partial_ms", "stt_final_ms",
+        "tts_first_start_ms", "total_response_start_ms", "total_ms",
+    }
+
+    def telemetry_values(args):
+        values = args.get("metrics")
+        if not isinstance(values, dict) or len(values) > len(client_latency_metrics):
+            raise ValueError("Некорректная телеметрия")
+        clean = {}
+        for name, value in values.items():
+            if name not in client_latency_metrics or isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("Некорректная телеметрия")
+            value = float(value)
+            if not 0 <= value <= 900000:
+                raise ValueError("Некорректная телеметрия")
+            clean[name] = value
+        return clean
 
     def widgets_for(cid):
         try:
@@ -74,6 +92,19 @@ def register_miniapp(app, core):
                 raise ValueError("Некорректные параметры")
             if action == "state":
                 result = await asyncio.to_thread(state, cid, args)
+            elif action == "telemetry_record":
+                # Store numeric timings only.  No user text, audio, identifiers or secrets enter telemetry.
+                for name, value in telemetry_values(args).items():
+                    core.record_runtime_metric(name, value)
+                result = {"enabled": bool(getattr(core, "TELEMETRY_ENABLED", False))}
+            elif action in {"telemetry_export", "telemetry_reset"}:
+                if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
+                    raise web.HTTPForbidden(text="Недостаточно прав")
+                if action == "telemetry_reset":
+                    core.reset_runtime_metric_series()
+                    result = {"ok": True}
+                else:
+                    result = core.runtime_metric_export()
             elif action == "home_layout":
                 widgets = args.get("widgets")
                 if not isinstance(widgets, list) or len(widgets) > len(widget_types) or any(not isinstance(x, str) or x not in widget_types for x in widgets) or len(set(widgets)) != len(widgets):
@@ -172,6 +203,7 @@ def register_miniapp(app, core):
                 "history": core.history(cid, 50), "rules": core.behavior_rules_for(cid),
                 "settings": {"timezone": core.timezone_name_for(cid), "mode": core.get_mode(cid),
                              "home_widgets": widgets_for(cid),
+                             "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
     async def voice(request):
