@@ -52,6 +52,7 @@ const visualFixture={
  const browser=await chromium.launch({headless:true});const errors=[];
  for(const [width,height] of [[320,700],[360,800],[375,812],[390,844],[414,896],[430,932],[900,1100]]){
   const page=await browser.newPage({viewport:{width,height},deviceScaleFactor:1});
+  const uniform={headers:[],searches:[],chips:[],cardRadii:[]};
   page.on('pageerror',e=>errors.push(e.message));
   await page.goto('http://127.0.0.1:8091/app');await page.locator('#splash.hidden').waitFor();await page.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);await page.waitForTimeout(500);
   const viewport=await page.locator('meta[name=viewport]').getAttribute('content');
@@ -65,6 +66,10 @@ const visualFixture={
     if(await page.locator('#header [data-back]').count())errors.push(`${route} still exposes a header back arrow ${width}`);
     const header=await page.locator('#header').boundingBox();
     if(header.height>34)errors.push(`${route} header is visually oversized ${width}`);
+    uniform.headers.push(header.height);
+    if(await page.locator('.search-field').count())uniform.searches.push((await page.locator('.search-field').boundingBox()).height);
+    if(await page.locator('.chip').count())uniform.chips.push((await page.locator('.chip').first().boundingBox()).height);
+    if(route!=='chat'&&await page.locator('#content .card').count())uniform.cardRadii.push(Number.parseFloat(await page.locator('#content .card').first().evaluate(el=>getComputedStyle(el).borderRadius)));
    }
    if(route==='settings'&&await page.locator('#dock').isVisible())errors.push('Membrane visible in settings');
    if(route==='settings'){
@@ -127,6 +132,9 @@ const visualFixture={
      await page.screenshot({path:path.resolve('ui-proof','ui-polish-v1.2',`after-${route}.png`),fullPage:false});
     }
    }
+  }
+  for(const [name,values,tolerance] of [['headers',uniform.headers,1],['searches',uniform.searches,1],['chips',uniform.chips,1],['card radii',uniform.cardRadii,1]]){
+   if(values.length&&Math.max(...values)-Math.min(...values)>tolerance)errors.push(`Internal ${name} are inconsistent ${width}: ${values.join(',')}`);
   }
   await page.evaluate(()=>go('home'));
   const stable=await page.evaluate(()=>{const canvas=document.querySelector('#dock canvas');render();render();return canvas===document.querySelector('#dock canvas')});if(!stable)errors.push('Dock canvas recreated on render');

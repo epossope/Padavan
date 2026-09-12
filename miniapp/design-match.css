@@ -905,3 +905,41 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
   .chat-voice-orb{flex-basis:82px;width:82px;height:82px;min-height:82px}
   .chat-voice-orb canvas{width:82px;height:82px}
 }
+
+/* V1.2 shared finish — one visual grammar across every internal workspace. */
+:root{
+  --v12-card-radius:14px;
+  --v12-control-height:27px;
+  --v12-action-size:24px;
+  --v12-edge:rgba(238,238,235,.09);
+  --v12-surface:linear-gradient(132deg,rgba(255,255,255,.038),rgba(255,255,255,.006) 56%,rgba(255,255,255,.018));
+}
+.subpage:not(.chat-screen) #content .card{
+  border-color:var(--v12-edge);border-radius:var(--v12-card-radius);background:var(--v12-surface);
+}
+.subpage .chip,.subpage .secondary,.subpage .primary,.subpage .pill{
+  min-height:var(--v12-control-height);border-color:var(--v12-edge);
+  background:linear-gradient(132deg,rgba(255,255,255,.032),rgba(255,255,255,.004));
+  box-shadow:inset 0 1px rgba(255,255,255,.018);
+}
+.subpage .chip.selected,.subpage .pill.selected,.subpage .segments button.selected{
+  border-color:rgba(255,255,255,.34);background:linear-gradient(132deg,rgba(255,255,255,.13),rgba(255,255,255,.018));
+  box-shadow:inset 0 0 12px rgba(255,255,255,.08),0 0 9px rgba(255,255,255,.045);
+}
+.subpage #content .icon:not(.chat-voice-orb){
+  width:var(--v12-action-size);height:var(--v12-action-size);min-height:var(--v12-action-size);padding:5px;
+}
+.subpage #content .icon:not(.chat-voice-orb) svg{width:12px;height:12px;stroke-width:1.05}
+.subpage .card-head>svg{width:13px;height:13px;stroke-width:1.05}
+.subpage .empty{padding:10px 0;font-size:10px}
+.subpage .details{border-color:rgba(238,238,235,.065)}
+.reminder-row{gap:5px}
+.reminder-row>.icon{margin-left:-1px}
+.reminder-row>.icon:last-child{margin-left:-4px}
+.settings-stack .setting,.runtime-section,.effective-config>div,.operation-row,.profile-interaction{
+  border-color:rgba(238,238,235,.065);
+}
+.focus-pill:before{
+  inset:-1px -3px -2px -4px;border-radius:31% 69% 57% 43%/43% 35% 65% 57%;
+  transform:rotate(-2deg) skewX(-3deg);
+}
