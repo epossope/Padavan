@@ -97,9 +97,11 @@ try:
 except ValueError:
     USER_MONTHLY_LIMIT_USD = 2.0
 
-MODEL = os.getenv("MODEL", "minimax/minimax-m3:free").strip()
+FAST_CHAT_MODEL = os.getenv("FAST_CHAT_MODEL", "qwen/qwen3.5-flash-02-23").strip()
+STRONG_CHAT_MODEL = os.getenv("STRONG_CHAT_MODEL", "deepseek/deepseek-v3.2").strip()
+MODEL = os.getenv("MODEL", FAST_CHAT_MODEL).strip()
 
-FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", "").split(",") if x.strip()]
+FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", STRONG_CHAT_MODEL).split(",") if x.strip()]
 
 VISION_MODEL = os.getenv("VISION_MODEL", "google/gemini-2.5-flash-lite").strip()
 
@@ -1422,6 +1424,27 @@ def init_db():
 def model_router():
     """Construct cheaply so every request observes the latest SQLite setting."""
     return ModelRouter(conn, MODEL, FALLBACK_MODELS, VISION_MODEL)
+
+
+def provider_preferences_for(model):
+    """Keep the A/B-tested model/provider routes beside the normal router.
+
+    Returning None preserves OpenRouter's usual routing for custom per-chat
+    models. The payload contains no credentials and does not alter any user
+    model preference.
+    """
+    if model == FAST_CHAT_MODEL:
+        return {
+            "only": ["alibaba"], "order": ["alibaba"],
+            "allow_fallbacks": False, "require_parameters": True,
+        }
+    if model == STRONG_CHAT_MODEL:
+        return {
+            "only": ["streamlake", "deepinfra"],
+            "order": ["streamlake", "deepinfra"],
+            "allow_fallbacks": True, "require_parameters": True,
+        }
+    return None
 
 
 def available_models_for(chat_id):
@@ -3086,6 +3109,7 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
     payload={"model":model,"messages":messages,"temperature":0.25,"max_tokens":int(os.getenv("CHAT_MAX_TOKENS", "1800"))}
 
     if tools: payload["tools"]=tools; payload["tool_choice"]=tool_choice
+    if provider := provider_preferences_for(model): payload["provider"] = provider
 
     key, _ = api_key_for_chat(chat_id)
     return requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
@@ -3100,6 +3124,8 @@ def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
+    if provider := provider_preferences_for(model):
+        payload["provider"] = provider
     key, _ = api_key_for_chat(chat_id)
     return requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                          json=payload, timeout=(20, 180), stream=True)

@@ -8,6 +8,24 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_ab_router_pins_fast_and_strong_provider_chains(self):
+        self.assertEqual(bot.provider_preferences_for(bot.FAST_CHAT_MODEL), {
+            "only": ["alibaba"], "order": ["alibaba"],
+            "allow_fallbacks": False, "require_parameters": True,
+        })
+        self.assertEqual(bot.provider_preferences_for(bot.STRONG_CHAT_MODEL), {
+            "only": ["streamlake", "deepinfra"], "order": ["streamlake", "deepinfra"],
+            "allow_fallbacks": True, "require_parameters": True,
+        })
+        self.assertIsNone(bot.provider_preferences_for("custom/model"))
+
+    def test_streaming_request_adds_provider_preferences_for_fast_model(self):
+        response = Mock()
+        with patch.object(bot, "api_key_for_chat", return_value=("test-key", "")), \
+             patch.object(bot.requests, "post", return_value=response) as post:
+            bot.request_chat_stream(42, bot.FAST_CHAT_MODEL, [{"role": "user", "content": "тест"}])
+        self.assertEqual(post.call_args.kwargs["json"]["provider"]["only"], ["alibaba"])
+
     def test_mistral_session_mints_scoped_token(self):
         response = Mock(ok=True)
         response.json.return_value = {"client_secret": {"value": "rt_short", "expires_at": "soon"}}

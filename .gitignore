@@ -16,3 +16,5 @@ data/
 # Backups / temp artifacts
 *.backup
 *.partial_backup
+model_ab_report*.json
+model_ab_error*.log
