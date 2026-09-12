@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -115,6 +117,25 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completed)
         self.assertGreaterEqual(telegram.send_message_draft.await_count, 2)
         final_send.assert_awaited_once()
+
+    async def test_output_modes_keep_text_voice_and_combined_contracts(self):
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), effective_message=message)
+
+        async def voice_file(_text):
+            handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            handle.write(b"ID3")
+            handle.close()
+            return Path(handle.name)
+
+        for mode, text_count, voice_count in (("text", 1, 0), ("voice", 0, 1), ("voice_and_text", 1, 1)):
+            message.reply_text.reset_mock()
+            message.reply_voice.reset_mock()
+            with patch.object(bot, "get_mode", return_value=mode), \
+                 patch.object(bot, "make_voice", new=AsyncMock(side_effect=voice_file)):
+                await bot.send_answer(update, "Готово.")
+            self.assertEqual(message.reply_text.await_count, text_count, mode)
+            self.assertEqual(message.reply_voice.await_count, voice_count, mode)
 
 
 if __name__ == "__main__":

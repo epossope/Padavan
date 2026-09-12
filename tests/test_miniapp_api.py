@@ -1,8 +1,10 @@
+import asyncio
 import json
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from miniapp_api import register_miniapp
@@ -26,7 +28,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "done", "text": "Привет"},
             ]),
         )
+        self.telegram = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
         app = web.Application()
+        app["telegram_app"] = self.telegram
         register_miniapp(app, self.core)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -102,6 +106,43 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.core.set_app_setting.assert_called_once_with("miniapp_realtime_beta:42", "1")
 
+    async def test_realtime_beta_and_token_are_admin_only(self):
+        self.core.ADMIN_CHAT_IDS = set()
+        toggle = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "set_experimental_realtime", "args": {"enabled": True},
+        })
+        self.assertEqual(toggle.status, 403)
+        token = await self.client.post('/api/v1/miniapp/voice/realtime-token', json={"init_data": "signed"})
+        self.assertEqual(token.status, 403)
+        self.core.set_app_setting.assert_not_called()
+        self.core.mint_mistral_realtime_session.assert_not_called()
+
+    async def test_disconnected_miniapp_job_notifies_once_after_completion(self):
+        release = threading.Event()
+
+        def slow_stream(_cid, _text, _cancelled):
+            yield {"type": "delta", "text": "Готовлю"}
+            release.wait(1)
+            yield {"type": "done", "text": "Готово"}
+
+        self.core.stream_agent_response = slow_stream
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет"})
+        self.assertEqual(response.status, 200)
+        first_line = await response.content.readline()
+        self.assertEqual(json.loads(first_line)["type"], "job")
+        connection = response.connection
+        connection.close()
+        response.close()
+        await asyncio.sleep(.1)
+        release.set()
+        for _ in range(20):
+            if self.telegram.bot.send_message.await_count:
+                break
+            await asyncio.sleep(.05)
+        self.telegram.bot.send_message.assert_awaited_once_with(
+            chat_id=42, text="Ответ готов. Открой Noema, чтобы продолжить разговор."
+        )
+
     async def test_realtime_token_requires_signed_miniapp_user(self):
         response = await self.client.post('/api/v1/miniapp/voice/realtime-token', json={"init_data": "bad"})
         self.assertEqual(response.status, 401)
@@ -171,6 +212,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pagehide", source)
         self.assertIn("realtime_beta=1", source)
         self.assertIn("[data-realtime-conversation]", source)
+        self.assertIn("wakeEnabled", source)
+        self.assertIn("prepareAssets", source)
+        self.assertIn("if(!this.wakeEnabled())", source)
         self.assertIn("audio_format:{encoding:'pcm_s16le',sample_rate:16000}", source)
         self.assertNotIn("алёна", source.lower())
         self.assertNotIn("нина", source.lower())
@@ -185,6 +229,10 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("class SentenceChunker", app_source)
         self.assertIn("/miniapp/speech", app_source)
         self.assertIn("experimental_realtime", app_source)
+        self.assertIn("experimental_realtime_available", app_source)
+        self.assertIn("set_experimental_wake", app_source)
+        self.assertIn("data.settings?.mode!=='voice'||m.role!=='assistant'", app_source)
+        self.assertIn("await voiceController.ask(text)", app_source)
         self.assertIn("chat-voice-orb", screen_source)
         self.assertNotIn("chat-ambient", screen_source)
         self.assertNotIn("data-conversation", screen_source)

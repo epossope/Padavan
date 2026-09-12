@@ -2525,14 +2525,28 @@ def update_expense(chat_id, expense_id, amount, description="", category="про
     return {"ok": bool(cur.rowcount), "tool": "update_expense", "updated": cur.rowcount}
 
 
-def update_person(chat_id, person_id, name="", relationship="", birthday="", projects="", notes=""):
+def update_person(chat_id, person_id, name="", relationship="", birthday="", age=None,
+                  home_city=None, current_location=None, projects="", notes=""):
     name = str(name or "").strip()[:160]
     if not name:
         return {"ok": False, "tool": "update_person", "error": "empty_name"}
+    has_age = age is not None
+    try:
+        age = int(age) if age is not None and str(age).strip() else None
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "update_person", "error": "invalid_age"}
     with conn() as c:
-        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,projects=?,notes=?,updated_at=? WHERE id=? AND chat_id=?",
-                        (name, str(relationship or "")[:160], str(birthday or "")[:32], str(projects or "")[:1000],
-                         str(notes or "")[:3000], datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
+        existing = c.execute("SELECT age,home_city,current_location FROM people WHERE id=? AND chat_id=?",
+                             (int(person_id), chat_id)).fetchone()
+        if not existing:
+            return {"ok": False, "tool": "update_person", "error": "not_found"}
+        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,updated_at=? WHERE id=? AND chat_id=?",
+                        (name, str(relationship or "")[:160], str(birthday or "")[:32],
+                         age if has_age else existing["age"],
+                         str(existing["home_city"] if home_city is None else home_city or "")[:160],
+                         str(existing["current_location"] if current_location is None else current_location or "")[:160],
+                         str(projects or "")[:1000], str(notes or "")[:3000],
+                         datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
     return {"ok": bool(cur.rowcount), "tool": "update_person", "updated": cur.rowcount}
 
 
@@ -3342,8 +3356,19 @@ async def stream_answer_to_telegram(update, context, text):
             await context.bot.send_message_draft(chat_id, draft_id, "", api_kwargs={"can_stop": True, "keep_on_stop": False})
         except Exception:
             draft_available = False
+        next_watchdog_at = time.monotonic() + 8
         while True:
-            event = await queue.get()
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
+            except asyncio.TimeoutError:
+                if draft_available:
+                    with contextlib.suppress(Exception):
+                        await context.bot.send_message_draft(
+                            chat_id, draft_id, "Готовлю ответ…",
+                            api_kwargs={"can_stop": True, "keep_on_stop": False},
+                        )
+                next_watchdog_at = time.monotonic() + 8
+                continue
             if event is None:
                 break
             if isinstance(event, Exception):
@@ -3361,6 +3386,14 @@ async def stream_answer_to_telegram(update, context, text):
                         draft_available = False
             elif kind == "done":
                 final = event.get("text") or accumulated
+            elif kind == "tool" and draft_available:
+                # ``tool`` is emitted only after the canonical core actually
+                # executed it, so this status is truthful.
+                with contextlib.suppress(Exception):
+                    await context.bot.send_message_draft(
+                        chat_id, draft_id, "Действие выполнено, готовлю ответ…",
+                        api_kwargs={"can_stop": True, "keep_on_stop": False},
+                    )
             elif kind == "cancelled":
                 cancelled.set()
         if cancelled.is_set():
@@ -3798,12 +3831,9 @@ async def safe_error(update,e):
 
 
 def activity_labels(text):
-    low = (text or "").lower()
-    if any(word in low for word in ("найди", "купи", "товар", "вазу", "интернет")):
-        return ["🔎 Ищу варианты…", "🔎 Проверяю источники…", "🧠 Собираю ответ…"]
-    if any(word in low for word in ("где", "помни", "сохранял", "фото", "картинк")):
-        return ["📚 Ищу в памяти…", "🧠 Проверяю данные…", "✍️ Готовлю ответ…"]
-    return ["🧠 Думаю…", "📚 Проверяю данные…", "✍️ Готовлю ответ…"]
+    # A tool has not run yet when this card appears, so never infer a search
+    # or retrieval merely from the wording of the request.
+    return ["🧠 Готовлю ответ…", "🧠 Ответ ещё готовится…"]
 
 
 async def begin_activity(message, labels):

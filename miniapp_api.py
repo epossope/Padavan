@@ -45,8 +45,12 @@ def register_miniapp(app, core):
         with core.conn() as c:
             c.execute("""CREATE TABLE IF NOT EXISTS miniapp_jobs(
                 id TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, status TEXT NOT NULL,
-                created_at TEXT NOT NULL, completed_at TEXT, error_code TEXT NOT NULL DEFAULT ''
+                created_at TEXT NOT NULL, completed_at TEXT, notified_at TEXT,
+                error_code TEXT NOT NULL DEFAULT ''
             )""")
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(miniapp_jobs)")}
+            if "notified_at" not in columns:
+                c.execute("ALTER TABLE miniapp_jobs ADD COLUMN notified_at TEXT")
 
     ensure_jobs_table()
 
@@ -58,7 +62,8 @@ def register_miniapp(app, core):
             jobs[job_id] = {
                 "id": job_id, "chat_id": cid, "status": status,
                 "created_at": previous.get("created_at", now),
-                "completed_at": completed_at, "error_code": error_code,
+                "completed_at": completed_at, "notified_at": previous.get("notified_at"),
+                "error_code": error_code,
             }
         if not callable(getattr(core, "conn", None)):
             return
@@ -82,6 +87,34 @@ def register_miniapp(app, core):
         if not job or job["chat_id"] != cid:
             raise ValueError("Запрос не найден")
         return {key: value for key, value in job.items() if key != "chat_id"}
+
+    def claim_completion_notification(job_id, cid):
+        """Reserve one generic completion notice without ever storing answer text."""
+        now = datetime.now(timezone.utc).isoformat()
+        if callable(getattr(core, "conn", None)):
+            with core.conn() as c:
+                cursor = c.execute(
+                    "UPDATE miniapp_jobs SET notified_at=? WHERE id=? AND chat_id=? "
+                    "AND status='done' AND (notified_at IS NULL OR notified_at='')",
+                    (now, job_id, cid),
+                )
+            return bool(cursor.rowcount)
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if not job or job["chat_id"] != cid or job["status"] != "done" or job.get("notified_at"):
+                return False
+            job["notified_at"] = now
+            return True
+
+    async def notify_completion(job_id, cid):
+        telegram_app = app.get("telegram_app")
+        bot = getattr(telegram_app, "bot", None)
+        if bot is None or not claim_completion_notification(job_id, cid):
+            return
+        try:
+            await bot.send_message(chat_id=cid, text="Ответ готов. Открой Noema, чтобы продолжить разговор.")
+        except Exception:
+            core.LOGGER.warning("Mini App completion notice failed for chat %s", cid)
 
     def telemetry_values(args):
         values = args.get("metrics")
@@ -216,10 +249,13 @@ def register_miniapp(app, core):
                     raise ValueError("Неизвестный режим")
                 core.set_mode(cid, args["mode"])
                 result = {"ok": True}
-            elif action == "set_experimental_realtime":
+            elif action in {"set_experimental_realtime", "set_experimental_wake"}:
+                if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
+                    raise web.HTTPForbidden(text="Недостаточно прав")
                 if type(args.get("enabled")) is not bool:
                     raise ValueError("Некорректный режим Beta")
-                core.set_app_setting(f"miniapp_realtime_beta:{cid}", "1" if args["enabled"] else "0")
+                key = "miniapp_realtime_beta" if action == "set_experimental_realtime" else "miniapp_wake_enabled"
+                core.set_app_setting(f"{key}:{cid}", "1" if args["enabled"] else "0")
                 result = {"enabled": args["enabled"]}
             elif action == "conversation_job":
                 job_id = args.get("id", "")
@@ -269,9 +305,11 @@ def register_miniapp(app, core):
         files = core.get_files(cid, limit=100)["files"]
         for item in files:
             item.pop("local_path", None)
-        realtime_beta = False
-        if callable(getattr(core, "app_setting", None)):
+        beta_available = cid in getattr(core, "ADMIN_CHAT_IDS", set())
+        realtime_beta = wake_enabled = False
+        if beta_available and callable(getattr(core, "app_setting", None)):
             realtime_beta = core.app_setting(f"miniapp_realtime_beta:{cid}", "0") == "1"
+            wake_enabled = core.app_setting(f"miniapp_wake_enabled:{cid}", "0") == "1"
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
@@ -279,6 +317,8 @@ def register_miniapp(app, core):
                 "settings": {"timezone": core.timezone_name_for(cid), "mode": core.get_mode(cid),
                              "home_widgets": widgets_for(cid),
                              "experimental_realtime": realtime_beta,
+                             "experimental_realtime_available": beta_available,
+                             "experimental_wake_enabled": wake_enabled,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
@@ -369,8 +409,13 @@ def register_miniapp(app, core):
         subscribed.set()
         persist_job(job_id, cid, "running")
 
+        def miniapp_is_open():
+            transport = request.transport
+            return subscribed.is_set() and transport is not None and not transport.is_closing()
+
         def produce():
             completed = False
+            notify_after_disconnect = False
             try:
                 with job_locks.setdefault(cid, threading.Lock()):
                     for event in core.stream_agent_response(cid, text, cancelled):
@@ -379,6 +424,7 @@ def register_miniapp(app, core):
                         if event.get("type") == "done":
                             persist_job(job_id, cid, "done")
                             completed = True
+                            notify_after_disconnect = not miniapp_is_open()
                         elif event.get("type") == "cancelled":
                             persist_job(job_id, cid, "error", "CANCELLED")
                             completed = True
@@ -394,21 +440,37 @@ def register_miniapp(app, core):
                 # stream returns normally without that terminal marker.
                 if not completed:
                     persist_job(job_id, cid, "done")
+                    notify_after_disconnect = not miniapp_is_open()
+                if notify_after_disconnect:
+                    loop.call_soon_threadsafe(lambda: asyncio.create_task(notify_completion(job_id, cid)))
                 if subscribed.is_set():
                     loop.call_soon_threadsafe(queue.put_nowait, None)
 
         threading.Thread(target=produce, name=f"miniapp-job-{job_id[:8]}", daemon=True).start()
         try:
             await response.write((json.dumps({"type": "job", "job_id": job_id}) + "\n").encode("utf-8"))
+            next_watchdog_at = time.monotonic() + 8
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
+                except asyncio.TimeoutError:
+                    # This is intentionally generic: no unsupported claim about
+                    # a search or a tool is shown before the core emits one.
+                    await response.write(json.dumps({"type": "progress", "text": "Ответ ещё готовится…"}, ensure_ascii=False).encode("utf-8") + b"\n")
+                    next_watchdog_at = time.monotonic() + 8
+                    continue
                 if event is None:
                     break
+                if event.get("type") == "tool":
+                    await response.write(json.dumps({"type": "progress", "text": "Действие выполнено, готовлю ответ…"}, ensure_ascii=False).encode("utf-8") + b"\n")
                 await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
         except (ConnectionResetError, asyncio.CancelledError):
             # The worker deliberately keeps running: its final answer is added by
             # the canonical agent pipeline even if this screen has gone away.
             subscribed.clear()
+            with contextlib.suppress(ValueError):
+                if job_status(job_id, cid).get("status") == "done":
+                    await notify_completion(job_id, cid)
         with contextlib.suppress(ConnectionResetError, asyncio.CancelledError):
             await response.write_eof()
         return response
@@ -421,6 +483,8 @@ def register_miniapp(app, core):
         user = core.valid_webapp_user(payload.get("init_data")) if isinstance(payload, dict) else None
         if not user or not isinstance(user.get("id"), int):
             raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
+        if user["id"] not in getattr(core, "ADMIN_CHAT_IDS", set()):
+            raise web.HTTPForbidden(text="Недостаточно прав")
         try:
             session = await asyncio.to_thread(core.mint_mistral_realtime_session)
         except RuntimeError as exc:
