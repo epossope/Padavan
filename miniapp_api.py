@@ -21,7 +21,9 @@ def register_miniapp(app, core):
     widget_types = set(default_widgets) | {"people"}
     client_latency_metrics = {
         "wake_ms", "stt_first_partial_ms", "stt_final_ms", "llm_ttft_ms",
-        "tts_first_start_ms", "total_response_start_ms", "total_ms",
+        "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
+        "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+        "speech_text_length_chars", "total_response_start_ms", "total_ms",
     }
     client_voice_robustness_metrics = {
         "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
@@ -389,7 +391,15 @@ def register_miniapp(app, core):
         path = await core.make_voice(text)
         try:
             body = await asyncio.to_thread(path.read_bytes)
-            return web.Response(body=body, content_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+            # These are server-configured route labels, never user data or secrets.
+            # They let one client response lock one stable voice without exposing
+            # the underlying provider configuration.
+            voice_name = "".join(char for char in str(getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
+            return web.Response(body=body, content_type="audio/mpeg", headers={
+                "Cache-Control": "no-store",
+                "X-Noema-TTS-Engine": "edge",
+                "X-Noema-TTS-Voice": voice_name,
+            })
         finally:
             Path(path).unlink(missing_ok=True)
 

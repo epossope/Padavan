@@ -233,10 +233,29 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("set_experimental_wake", app_source)
         self.assertIn("data.settings?.mode!=='voice'||m.role!=='assistant'", app_source)
         self.assertIn("await voiceController.ask(text)", app_source)
-        self.assertIn("chat-voice-orb", screen_source)
+        self.assertIn("chat-voice-orb", app_source)
+        self.assertIn("sanitizeSpeechText", app_source)
+        self.assertIn("beginResponse(started)", app_source)
+        self.assertIn("this.route='browser'", app_source)
+        self.assertIn("X-Noema-TTS-Voice", (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8"))
         self.assertNotIn("chat-ambient", screen_source)
         self.assertNotIn("data-conversation", screen_source)
         self.assertIn("realtime_beta=1", realtime_source)
+
+    async def test_production_tts_metrics_are_numeric_allowlisted(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "telemetry_record",
+            "args": {"metrics": {
+                "tts_queue_wait_ms": 12, "tts_prepare_ms": 34,
+                "tts_first_chunk_ms": 56, "tts_voice_name": 101,
+                "tts_engine_name": 1, "speech_text_length_chars": 78,
+            }},
+        })
+        self.assertEqual(response.status, 200)
+        self.core.record_runtime_metric.assert_any_call("tts_queue_wait_ms", 12.0)
+        self.core.record_runtime_metric.assert_any_call("tts_prepare_ms", 34.0)
+        self.core.record_runtime_metric.assert_any_call("tts_voice_name", 101.0)
+        self.core.record_runtime_metric.assert_any_call("speech_text_length_chars", 78.0)
 
     def test_miniapp_and_telegram_share_the_canonical_streaming_pipeline(self):
         api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")

@@ -178,7 +178,9 @@ LATENCY_METRICS = (
     "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
     "stt_first_partial_ms", "stt_final_ms", "context_build_ms",
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
-    "llm_total_ms", "tts_first_start_ms", "total_response_start_ms", "total_ms",
+    "llm_total_ms", "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
+    "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+    "speech_text_length_chars", "total_response_start_ms", "total_ms",
 )
 VOICE_ROBUSTNESS_METRICS = (
     "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",

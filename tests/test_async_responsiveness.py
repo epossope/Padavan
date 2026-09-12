@@ -116,6 +116,11 @@ class TelemetrySeriesTests(unittest.TestCase):
         llm = exported["metrics"]["llm_total_ms"]
         self.assertEqual(llm, {"count": 5, "avg": 30.0, "p50": 30.0, "p95": 48.0, "max": 50.0})
         self.assertEqual(exported["metrics"]["tool_execution_ms"]["count"], 0)
+        self.assertIn("tts_queue_wait_ms", exported["groups"]["latency"])
+        self.assertIn("tts_prepare_ms", exported["groups"]["latency"])
+        self.assertIn("tts_first_chunk_ms", exported["groups"]["latency"])
+        self.assertIn("tts_engine_name", exported["groups"]["latency"])
+        self.assertIn("speech_text_length_chars", exported["groups"]["latency"])
         self.assertIn("voice_robustness", exported["groups"])
         self.assertIn("barge_in_duration_ms", exported["groups"]["voice_robustness"])
         self.assertNotIn("untracked_metric", exported["metrics"])

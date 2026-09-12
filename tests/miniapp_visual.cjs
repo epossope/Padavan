@@ -16,9 +16,13 @@ const path=require('path');
    if(route==='settings'&&await page.locator('#dock').isVisible())errors.push('Membrane visible in settings');
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.chat-ambient').boundingBox();if(Math.abs(sphere.x+sphere.width/2-width/2)>3)errors.push(`Chat sphere not centered ${width}`);
-    const sphereStyle=await page.locator('.chat-ambient').evaluate(el=>({position:getComputedStyle(el).position,opacity:Number(getComputedStyle(el).opacity),beforeComposer:Boolean(el.compareDocumentPosition(document.querySelector('.composer'))&Node.DOCUMENT_POSITION_FOLLOWING)}));
-    if(sphereStyle.position!=='relative'||sphereStyle.opacity<.7||!sphereStyle.beforeComposer)errors.push(`Chat sphere is not foreground content ${width}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x+sphere.width>box.x+box.width+1||sphere.x<sphere.width)errors.push(`Chat sphere is not docked on composer right ${width}`);
+    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild}));
+    if(Number.parseFloat(sphereStyle.width)<52||!sphereStyle.hasCanvas||!sphereStyle.isLast)errors.push(`Chat voice sphere is not the compact right-side action ${width}`);
+    if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
+    await page.evaluate(()=>say('Слушаю…'));
+    if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);
+    await page.evaluate(()=>say(''));
     if(Number.parseFloat(await page.locator('#chat-input').evaluate(el=>getComputedStyle(el).fontSize))<16)errors.push(`Chat input can trigger iPhone zoom ${width}`);
    }
    if(route==='home'){
@@ -46,5 +50,5 @@ const path=require('path');
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
- await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('6 viewports × 8 screens + zoom guard + overlay dock + centered chat sphere + direct mouse/touch sorting: passed');
+ await browser.close();if(errors.length)throw Error(errors.join('\n'));console.log('6 viewports × 8 screens + zoom guard + overlay dock + compact composer sphere + direct mouse/touch sorting: passed');
 })().catch(e=>{console.error(e);process.exitCode=1});
