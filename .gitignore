@@ -18,3 +18,24 @@ data/
 *.partial_backup
 model_ab_report*.json
 model_ab_error*.log
+
+# Amvera deployment source exclusions. Amvera honours this file before the
+# build archive is assembled; these files remain available in local worktrees.
+.git/
+tests/
+ui-proof/
+design-recovery-baseline/
+*.bat
+miniapp/preview-*.png
+DEPLOY_AMVERA.md
+DESIGN_RECOVERY_REPORT.md
+IPHONE_SHORTCUTS.md
+LATENCY_DIAGNOSIS.md
+MINIAPP.md
+MODEL_AB_REPORT.md
+TZ_PREDEPLOY.md
+UI_HARDENING_REPORT.md
+VOSK_WAKE_REPORT.md
+miniapp/models/README.md
+111.rar
+Noema_Telegram_Prototype_v8_CLEAN.zip

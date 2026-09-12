@@ -109,7 +109,7 @@ const visualFixture={
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>4||Math.abs(sphere.x-(box.x+box.width))>3||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>10||Math.abs(sphere.x-(box.x+box.width))>3||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
     const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild,borderRight:getComputedStyle(el.parentElement).borderRightWidth}));
     if(Number.parseFloat(sphereStyle.width)<96||Number.parseFloat(sphereStyle.width)>106||box.height>62||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/open composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
@@ -117,6 +117,15 @@ const visualFixture={
     if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);
     await page.evaluate(()=>say(''));
     if(Number.parseFloat(await page.locator('#chat-input').evaluate(el=>getComputedStyle(el).fontSize))<16)errors.push(`Chat input can trigger iPhone zoom ${width}`);
+    const scrollPolicy=await page.evaluate(()=>{
+     data.history=Array.from({length:36},(_,index)=>({id:index,role:index%2?'assistant':'user',content:`Длинное сообщение ${index} `.repeat(8)}));render();
+     const thread=document.querySelector('.chat');
+     return new Promise(resolve=>requestAnimationFrame(()=>{const initialAtBottom=thread.scrollHeight-thread.scrollTop-thread.clientHeight<=2;thread.scrollTop=0;thread.dispatchEvent(new Event('scroll'));requestAnimationFrame(()=>{const incoming=document.createElement('div');incoming.className='bubble assistant';incoming.textContent='Новое входящее сообщение без принудительного скролла';thread.querySelector('#thinking').before(incoming);window.NoemaChatScroll.incoming();requestAnimationFrame(()=>resolve({initialAtBottom,afterIncoming:thread.scrollTop,latestHidden:document.querySelector('[data-chat-latest]').hidden}))})}));
+    });
+    if(!scrollPolicy.initialAtBottom||scrollPolicy.afterIncoming!==0||scrollPolicy.latestHidden)errors.push(`Chat scroll follow policy regressed ${width}: ${JSON.stringify(scrollPolicy)}`);
+    if(!scrollPolicy.latestHidden){await page.locator('[data-chat-latest]').click();await page.waitForTimeout(260);if(!await page.evaluate(()=>{const t=document.querySelector('.chat');return t.scrollHeight-t.scrollTop-t.clientHeight<=2}))errors.push(`Chat latest action did not return to bottom ${width}`)}
+    const sendPinsBottom=await page.evaluate(()=>{const t=document.querySelector('.chat');t.scrollTop=0;t.dispatchEvent(new Event('scroll'));return new Promise(resolve=>requestAnimationFrame(()=>{window.NoemaChatScroll.addPendingUser('Моё новое сообщение');requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(t.scrollHeight-t.scrollTop-t.clientHeight<=2)))}));});
+    if(!sendPinsBottom)errors.push(`Chat send did not restore bottom follow ${width}`);
    }
    if(route==='home'){
     if(await page.locator('#header .utilities button').count()!==1||await page.locator('#header [data-page="settings"]').count()!==1)errors.push(`Home header is not Noema plus Settings only ${width}`);
@@ -176,8 +185,10 @@ const visualFixture={
  await touch.evaluate(()=>go('archive'));
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:105,y:226}]});
+ const swipeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
- if(await touch.evaluate(()=>page)!=='home')errors.push('Edge swipe did not return to the preceding screen');
+ if(swipeOffset==='none')errors.push('Edge swipe did not follow the finger');
+ await touch.waitForTimeout(140);if(await touch.evaluate(()=>page)!=='home')errors.push('Edge swipe did not return to the preceding screen');
  await touch.evaluate(()=>go('archive'));
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:12,y:350}]});

@@ -115,7 +115,7 @@ render=function(){
   content.querySelector('.subtle')?.remove();
  }
  for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
- renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread&&thread.scrollHeight-thread.scrollTop-thread.clientHeight<72)thread.scrollTop=thread.scrollHeight});tg?.BackButton.hide()
+ renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')window.NoemaChatScroll?.bind?.();else window.NoemaChatScroll?.detach?.();tg?.BackButton.hide()
 };
 go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')window.homeEditing=false;page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
 function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';render()}
@@ -133,6 +133,7 @@ document.addEventListener('click',async e=>{
  const b=e.target.closest('button,[role=button]');if(!b)return;
  if(b.hasAttribute('data-back'))back();
  if(b.hasAttribute('data-keyboard'))go('chat');
+ if(b.hasAttribute('data-chat-latest'))window.NoemaChatScroll?.scrollToBottom(false);
  if(b.hasAttribute('data-voice'))await recordVoice(b);
  if(b.hasAttribute('data-layout'))openLayout();
  if(b.hasAttribute('data-close-layout'))document.querySelector('#layout-editor').close();
