@@ -8,23 +8,33 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    def test_ab_router_pins_fast_and_strong_provider_chains(self):
-        self.assertEqual(bot.provider_preferences_for(bot.FAST_CHAT_MODEL), {
-            "only": ["alibaba"], "order": ["alibaba"],
-            "allow_fallbacks": False, "require_parameters": True,
-        })
-        self.assertEqual(bot.provider_preferences_for(bot.STRONG_CHAT_MODEL), {
-            "only": ["streamlake", "deepinfra"], "order": ["streamlake", "deepinfra"],
-            "allow_fallbacks": True, "require_parameters": True,
-        })
+    def test_ab_router_uses_configured_provider_chains_only(self):
+        with patch.object(bot, "FAST_MODEL_PROVIDERS", ("fast-one",)), \
+             patch.object(bot, "STRONG_MODEL_PROVIDERS", ("strong-one", "strong-two")), \
+             patch.object(bot, "FAST_MODEL_ALLOW_PROVIDER_FALLBACK", False), \
+             patch.object(bot, "STRONG_MODEL_ALLOW_PROVIDER_FALLBACK", True):
+            self.assertEqual(bot.provider_preferences_for(bot.FAST_MODEL), {
+                "only": ["fast-one"], "order": ["fast-one"],
+                "allow_fallbacks": False, "require_parameters": True,
+            })
+            self.assertEqual(bot.provider_preferences_for(bot.STRONG_MODEL), {
+                "only": ["strong-one", "strong-two"], "order": ["strong-one", "strong-two"],
+                "allow_fallbacks": True, "require_parameters": True,
+            })
         self.assertIsNone(bot.provider_preferences_for("custom/model"))
+
+    def test_empty_provider_env_uses_normal_openrouter_routing(self):
+        with patch.object(bot, "FAST_MODEL_PROVIDERS", ()), patch.object(bot, "STRONG_MODEL_PROVIDERS", ()):
+            self.assertIsNone(bot.provider_preferences_for(bot.FAST_MODEL))
+            self.assertIsNone(bot.provider_preferences_for(bot.STRONG_MODEL))
 
     def test_streaming_request_adds_provider_preferences_for_fast_model(self):
         response = Mock()
         with patch.object(bot, "api_key_for_chat", return_value=("test-key", "")), \
              patch.object(bot.requests, "post", return_value=response) as post:
-            bot.request_chat_stream(42, bot.FAST_CHAT_MODEL, [{"role": "user", "content": "тест"}])
-        self.assertEqual(post.call_args.kwargs["json"]["provider"]["only"], ["alibaba"])
+            with patch.object(bot, "FAST_MODEL_PROVIDERS", ("configured-fast",)):
+                bot.request_chat_stream(42, bot.FAST_MODEL, [{"role": "user", "content": "тест"}])
+        self.assertEqual(post.call_args.kwargs["json"]["provider"]["only"], ["configured-fast"])
 
     def test_mistral_session_mints_scoped_token(self):
         response = Mock(ok=True)

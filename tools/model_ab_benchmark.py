@@ -18,8 +18,6 @@ from dotenv import load_dotenv
 
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
-FAST = "qwen/qwen3.5-flash-02-23"
-STRONG = "deepseek/deepseek-v3.2"
 READ_ONLY_TOOL = [{"type": "function", "function": {
     "name": "lookup_today_plan",
     "description": "Тестовый read-only запрос плана на сегодня. Ничего не изменяет.",
@@ -38,6 +36,26 @@ PLAIN_PROMPTS = [
     "Ответь одним коротким предложением по-русски: как завершить задачу?",
 ]
 TOOL_PROMPT = "Используй инструмент lookup_today_plan ровно один раз. Не объясняй выбор и не вызывай другие инструменты."
+
+
+def env_providers(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def provider_routing(prefix: str, default_fallback: bool) -> dict:
+    providers = env_providers(f"{prefix}_PROVIDERS")
+    if not providers:
+        return {}
+    return {
+        "only": providers, "order": providers,
+        "allow_fallbacks": env_bool(f"{prefix}_ALLOW_PROVIDER_FALLBACK", default_fallback),
+        "require_parameters": True,
+    }
 
 
 def percentile(values: list[float], p: float) -> float | None:
@@ -155,11 +173,13 @@ def main() -> None:
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not key:
         raise SystemExit("OPENROUTER_API_KEY is not configured")
+    fast_model = os.getenv("FAST_MODEL", "qwen/qwen3.5-flash-02-23").strip()
+    strong_model = os.getenv("STRONG_MODEL", "deepseek/deepseek-v3.2").strip()
     report = {
         "measurement_only": True,
         "requests_per_candidate": 15,
-        "fast": benchmark_candidate(key, FAST, {"only": ["alibaba"], "order": ["alibaba"], "allow_fallbacks": False, "require_parameters": True}),
-        "strong": benchmark_candidate(key, STRONG, {"only": ["streamlake", "deepinfra"], "order": ["streamlake", "deepinfra"], "allow_fallbacks": True, "require_parameters": True}),
+        "fast": benchmark_candidate(key, fast_model, provider_routing("FAST_MODEL", False)),
+        "strong": benchmark_candidate(key, strong_model, provider_routing("STRONG_MODEL", True)),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, default=dict))
 
