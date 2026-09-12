@@ -73,7 +73,9 @@ from url_enricher import HttpUrlEnricher
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
-from streaming_runtime import AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver, iter_sse_json
+from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
+                               iter_sse_json, sanitize_assistant_message,
+                               sanitize_visible_content)
 
 
 
@@ -1649,6 +1651,10 @@ def set_mode(chat_id, mode):
 
 def add_message(chat_id, role, content):
 
+    if role == "assistant":
+
+        content = sanitize_visible_content(content)
+
     with conn() as c:
 
         c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
@@ -1666,7 +1672,10 @@ def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_cha
         existing_through = int(summary_row["through_message_id"]) if summary_row else 0
         if len(rows) > summary_after and older and older[-1]["id"] > existing_through:
             # Deterministic compacting is deliberately conservative: exact state is still read through tools/DB.
-            transcript = "\n".join(f'{r["role"]}: {str(r["content"] or "")[:500]}' for r in older)
+            transcript = "\n".join(
+                f'{r["role"]}: {(sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:500]}'
+                for r in older
+            )
             compact = transcript[-summary_chars:]
             c.execute("INSERT INTO conversation_summaries(chat_id,summary,through_message_id,version,updated_at) VALUES(?,?,?,?,?) "
                       "ON CONFLICT(chat_id) DO UPDATE SET summary=excluded.summary,through_message_id=excluded.through_message_id,version=excluded.version,updated_at=excluded.updated_at",
@@ -1675,7 +1684,10 @@ def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_cha
     result = []
     if summary_row and summary_row["summary"]:
         result.append({"role": "system", "content": "Краткий контекст прошлой беседы (не источник точных данных):\n" + str(summary_row["summary"])})
-    result.extend({"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in rows[-recent_limit:])
+    result.extend({
+        "role": r["role"],
+        "content": (sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:1400],
+    } for r in rows[-recent_limit:])
     return result
 
 
@@ -1690,7 +1702,10 @@ def history(chat_id, n=18):
 
     # A long OCR/vision response must not make the next ordinary message exceed
     # a model's context window. The full original is safely kept in knowledge.
-    return [{"role": r["role"], "content": str(r["content"] or "")[:1400]} for r in reversed(rs)]
+    return [{
+        "role": r["role"],
+        "content": (sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:1400],
+    } for r in reversed(rs)]
 
 
 
@@ -2105,6 +2120,52 @@ def vision_models_for(chat_id):
         return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
     primary = model_router().resolve(chat_id, "vision")
     return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
+
+
+def effective_user_ai_config(chat_id):
+    """Explain the existing USER -> ADMIN -> ENV -> DEFAULT resolution safely."""
+    snapshot = runtime_config_snapshot()
+    fields = snapshot["fields"]
+    try:
+        with conn() as c:
+            row = c.execute(
+                "SELECT primary_model,fallback_model,vision_model FROM user_settings WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    user = dict(row) if row else {}
+    primary_override = str(user.get("primary_model") or "").strip()
+    fallback_override = str(user.get("fallback_model") or "").strip()
+    vision_override = str(user.get("vision_model") or "").strip()
+    fast = fields["fast_model"]
+    strong = fields["strong_model"]
+    vision_default = fields["vision_model"]
+    effective_vision = vision_models_for(chat_id)[0]
+    vision_is_user = bool(vision_override and has_personal_api_key(chat_id))
+    vision_source = "USER" if vision_is_user else vision_default["source"]
+    if not vision_is_user and effective_vision != vision_default["value"]:
+        # Compatibility value written by the previous admin Vision screen.
+        vision_source = "ADMIN"
+    return {
+        "effective_model": {
+            "value": primary_override or fast["value"],
+            "source": "USER" if primary_override else fast["source"],
+        },
+        "effective_fallback": {
+            "value": fallback_override or strong["value"],
+            "source": "USER" if fallback_override else strong["source"],
+        },
+        "fast_default": dict(fast),
+        "strong_fallback": dict(strong),
+        "vision": {"value": effective_vision, "source": vision_source},
+        "tts": {
+            "provider": fields["tts_provider"]["value"],
+            "provider_source": fields["tts_provider"]["source"],
+            "voice": fields["tts_voice"]["value"],
+            "voice_source": fields["tts_voice"]["source"],
+        },
+    }
 
 
 def usage_provider(payload, model):
@@ -3423,7 +3484,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     config = runtime_config_values()
     models = list(dict.fromkeys([selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]]))
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
-    writes, final_text = [], ""
+    writes = []
     for round_index in range(5):
         message = None
         last_error = None
@@ -3452,8 +3513,13 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         if not first_delta:
                             first_delta = True
                             record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
-                        final_text += delta
                         yield {"type": "delta", "text": delta}
+                tail = accumulator.finish()
+                if tail:
+                    if not first_delta:
+                        first_delta = True
+                        record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
+                    yield {"type": "delta", "text": tail}
                 message = accumulator.message()
                 if accumulator.usage:
                     record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
@@ -3473,7 +3539,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
         calls = message.get("tool_calls") or []
         if not calls:
-            answer = (message.get("content") or "").strip() or write_confirmation(writes)
+            answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
             add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
             yield {"type": "done", "text": answer, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
@@ -3640,7 +3706,7 @@ async def stream_answer_to_telegram(update, context, text):
                 cancelled.set()
         if cancelled.is_set():
             return False
-        final = final or accumulated
+        final = sanitize_visible_content(final or accumulated).strip()
         if draft_available and final and throttle.should_send(final, force=True):
             with contextlib.suppress(Exception):
                 await context.bot.send_message_draft(chat_id, draft_id, final[-4096:], api_kwargs={"can_stop": False})
@@ -3681,7 +3747,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 choice = data["choices"][0]
                 if choice.get("finish_reason") == "length":
                     print(f"LLM truncation chat_id={chat_id} model={model}")
-                return choice["message"]
+                return sanitize_assistant_message(choice["message"])
 
             last=(r.status_code,r.text)
 
@@ -3711,7 +3777,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
             if r.ok:
                 data = r.json()
                 record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
-                return data["choices"][0]["message"]
+                return sanitize_assistant_message(data["choices"][0]["message"])
 
             last=(r.status_code,r.text)
 
@@ -3810,7 +3876,7 @@ def ask(chat_id,text):
 
         if not calls:
 
-            ans=(msg.get("content") or "").strip() or write_confirmation(writes)
+            ans=sanitize_visible_content(msg.get("content") or "").strip() or write_confirmation(writes)
 
             add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans)
             print(f"Request complete chat_id={chat_id} route=llm seconds={time.perf_counter()-started:.2f}")
@@ -4615,11 +4681,24 @@ async def callback(update,context):
         return await q.edit_message_text("Модели и ключи уже настроены Noema.", reply_markup=settings_keyboard(q.message.chat_id))
 
     if q.data == "settings:model":
-        selected = model_router().resolve(q.message.chat_id, "chat")
-        lines = ["<b>🧠 Текущая модель</b>", html.escape(selected["primary"]), "", "Выберите модель:"]
-        buttons = []
+        current = effective_user_ai_config(q.message.chat_id)
+        selected = current["effective_model"]
+        lines = [
+            "<b>🧠 Модель</b>",
+            f"Сейчас: <code>{html.escape(str(selected['value']))}</code>",
+            f"Источник: <b>{html.escape(str(selected['source']))}</b>",
+            "",
+            f"FAST default: <code>{html.escape(str(current['fast_default']['value']))}</code>",
+            f"STRONG fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
+            "",
+            "Выберите модель или вернитесь в автоматический router mode:",
+        ]
+        buttons = [[InlineKeyboardButton(
+            ("●" if selected["source"] != "USER" else "○") + " Авто",
+            callback_data="model:auto",
+        )]]
         for model in available_models_for(q.message.chat_id):
-            mark = "●" if model == selected["primary"] else "○"
+            mark = "●" if selected["source"] == "USER" and model == selected["value"] else "○"
             buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
         buttons += [
             [InlineKeyboardButton("➕ Добавить модель", callback_data="model:add")],
@@ -4675,6 +4754,21 @@ async def callback(update,context):
             f"Vision-модель возвращена к стандартной: <code>{html.escape(shared_vision_model())}</code>.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]))
 
+    if q.data == "model:auto":
+        model_router().set_primary(q.message.chat_id, "")
+        current = effective_user_ai_config(q.message.chat_id)["effective_model"]
+        await q.edit_message_text(
+            f"<b>🧠 Автоматический режим</b>\n"
+            f"Сейчас: <code>{html.escape(str(current['value']))}</code>\n"
+            f"Источник: <b>{html.escape(str(current['source']))}</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Изменить", callback_data="settings:model")],
+                [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
+            ]),
+        )
+        return
+
     if q.data.startswith("model:set:"):
         model = q.data.split(":", 2)[2]
         if model not in available_models_for(q.message.chat_id):
@@ -4683,7 +4777,8 @@ async def callback(update,context):
             ]))
         model_router().set_primary(q.message.chat_id, model)
         await q.edit_message_text(
-            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n\nСледующее сообщение сразу будет обработано этой моделью.",
+            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n"
+            f"Источник: <b>USER</b>\n\nСледующее сообщение сразу будет обработано этой моделью.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Изменить", callback_data="settings:model")],

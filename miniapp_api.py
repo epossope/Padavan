@@ -341,6 +341,9 @@ def register_miniapp(app, core):
         if callable(getattr(core, "runtime_config_values", None)):
             runtime = core.runtime_config_values()
             voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice")}
+        effective_ai = None
+        if callable(getattr(core, "effective_user_ai_config", None)):
+            effective_ai = core.effective_user_ai_config(cid)
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
@@ -351,6 +354,7 @@ def register_miniapp(app, core):
                              "experimental_realtime_available": beta_available,
                              "experimental_wake_enabled": wake_enabled,
                              "admin_runtime_config": admin_runtime_config,
+                             "effective_ai": effective_ai,
                              "voice_runtime": voice_runtime,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
