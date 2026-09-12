@@ -2,10 +2,21 @@
 
 ## Voice robustness
 
-The Mini App uses Silero VAD v5 in the browser as the primary speech classifier.
-It is loaded only when a conversation starts. If the browser cannot load the
-model or ONNX runtime, the same session falls back to a conservative local RMS
-gate; it does not upload audio to obtain a VAD decision.
+Vosk/Silero/realtime are an explicitly enabled Experimental/Beta mode. The
+normal production sphere uses batch STT and never downloads these browser
+models. Once Beta is enabled, its Vosk model and Silero/ONNX runtime start in
+the background; Silero VAD is initialized against the microphone after the
+user explicitly starts a Beta conversation. If the browser cannot load the
+model or ONNX runtime, the same Beta session falls back to a conservative local
+RMS gate; it does not upload audio to obtain a VAD decision.
+
+After that first Beta gesture, one `MediaStream`, AudioContext, Vosk recognizer
+and Silero instance survive SPA navigation and explicit conversation off/on cycles.
+The state flow is `OFF → PREPARING → READY → LISTENING → SPEAKING`. `READY`
+is hands-free wake listening; `PREPARING` is shown on the button and does not
+offer an exit action until preparation completes. The realtime STT WebSocket
+starts in parallel with the microphone request. The stream is released only on
+Mini App `pagehide` (or when the browser itself ends its track).
 
 The gate is intentionally stricter while Noema is speaking:
 
@@ -34,10 +45,10 @@ recognition. The user sees a failure only when both paths produce no usable
 transcript.
 
 The Vosk wake grammar remains the experimentally verified restricted grammar:
-`но эмо`, `найма`, `наем`, `[unk]`. The written aliases are removed only at the
-start of an explicit wake/name phrase; ordinary names are never globally
-rewritten. Voxtral Realtime does not document a hotword/context-bias parameter,
-so none is sent. Its documented batch endpoint has context biasing separately.
+`эма`, `эмма`, `[unk]`. The written aliases are removed only at the start of an
+explicit wake/name phrase; ordinary names are never globally rewritten.
+Voxtral Realtime does not document a hotword/context-bias parameter, so none is
+sent. Its documented batch endpoint has context biasing separately.
 
 ### Telemetry
 
@@ -47,11 +58,16 @@ numeric samples:
 - `barge_in_reason_code` (`1` = sustained qualified speech);
 - `barge_in_duration_ms`, `barge_in_peak_rms`, `barge_in_rms`, and
   `barge_in_vad_probability` for every accepted barge-in;
-- `vad_engine` (`1` = Silero active, `0` = RMS fallback) and bounded fallback
-  reason codes (`1` = runtime load failure, `2` = stale Silero probability,
-  `3` = Silero still loading);
+- `vad_engine` / `vad_engine_name` (`1` = Silero active, `0` = RMS fallback)
+  and bounded `vad_fallback_reason` / `vad_fallback_reason_code` values
+  (`0` = no fallback, `1` = runtime/model load failure, `2` = stale or
+  unavailable Silero probability, `3` = runtime still loading);
 - `noise_floor_rms`, speech-start RMS/probability, actual capture sample rate,
   fixed 16 kHz STT stream rate and websocket connection time;
+- Vosk/Silero background load time, the first `getUserMedia` / permission time,
+  and gesture-to-`READY` time. `mic_permission_ms` is the same bounded
+  gesture-to-MediaStream measurement as `get_user_media_ms`, so it includes
+  the browser permission prompt but does not inspect its contents;
 - aggregate counters for empty realtime finals and batch fallback attempts and
   successes.
 

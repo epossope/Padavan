@@ -38,7 +38,7 @@ budget=function(){
  return `<div class="period-picker"><label for="budget-month">Период</label><span>${icon('calendar')}</span><input type="month" id="budget-month" value="${budgetMonth||data.day.slice(0,7)}"></div>${segmented([['day','День'],['week','Неделя'],['month','Месяц'],['year','Год']],budgetPeriod,'budget-period')}<div class="toolbar compact-actions"><button class="secondary" data-form="expense">${icon('plus')}<span>Расход</span></button><button class="secondary" data-form="income">${icon('plus')}<span>Доход</span></button></div>${card('Баланс периода',budgetLoading?'<div class="skeleton" aria-label="Загрузка"></div>':summary||empty('Операций за период нет'))}${values.length?card('Расходы по дням · RUB',`<div class="bars" role="img" aria-label="Расходы по дням">${values.map(([day,value])=>`<div class="bar-group" title="${esc(day)}: ${money(value)}"><small>${day.slice(8)}</small><i style="height:${Math.max(8,value/max*100)}%"></i><span>${Math.round(value).toLocaleString('ru-RU')}</span></div>`).join('')}</div>`):''}${items.slice(0,100).map(e=>`<article class="card row"><div class="body"><p>${esc(e.description)}</p><small>${date(e.spent_at)} · ${esc(e.category)}</small></div><span class="mono">${e.kind==='income'?'+':'−'}${Number(e.amount).toLocaleString('ru-RU')} ${esc(e.currency)}</span>${iconButton('settings','Изменить операцию',`data-edit="expense" data-id="${e.id}"`)}${iconButton('trash','Удалить операцию',`data-delete="delete_expense" data-id="${e.id}"`)}</article>`).join('')}${items.length>100?'<p class="subtle">Показаны первые 100 операций. Сузь период для просмотра остальных.</p>':''}`;
 };
 function renderDock(){
- const dock=document.querySelector('#dock');dock.hidden=['settings','chat'].includes(page);document.querySelector('#shell').classList.toggle('no-dock',dock.hidden);
+ const dock=document.querySelector('#dock');dock.hidden=page==='chat';document.querySelector('#shell').classList.toggle('no-dock',dock.hidden);
  if(dock.hidden)return;
  const task=data.tasks.find(t=>t.status==='open'&&t.due_date&&t.due_date.slice(0,10)<data.day)||data.tasks.find(t=>t.status==='open');
  const reminder=data.reminders.filter(r=>!r.acknowledged).sort((a,b)=>a.remind_at_utc.localeCompare(b.remind_at_utc))[0];
@@ -50,7 +50,7 @@ function renderDock(){
 }
 const persistentMembranes=new Map();
 render=function(){
- for(const name of ['hero','voice-area','chat-ambient']){const canvas=content.querySelector(`.${name} canvas.membrane`);if(canvas)persistentMembranes.set(name,canvas)}
+ for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`);if(canvas)persistentMembranes.set(name,canvas)}
  const screens={home,archive,notes:archive,people,tasks,reminders,budget,settings,chat};
  content.innerHTML=(screens[page]||home)();
  const title={home:'Noema',archive:'Архив',notes:'Заметки',people:'Люди',tasks:'Задачи',reminders:'Календарь',budget:'Бюджет',settings:'Настройки',chat:'Чат'}[page];
@@ -76,16 +76,14 @@ render=function(){
  if(page==='chat'){
   content.querySelector('.subtle')?.remove();
   const form=content.querySelector('.composer');
-  const ambient=document.createElement('div');ambient.className='chat-ambient';ambient.innerHTML='<canvas class="membrane" width="360" height="360" aria-hidden="true"></canvas>';form.before(ambient);
-  form.insertAdjacentHTML('beforebegin','<button class="conversation-toggle secondary" type="button" data-conversation><span>Разговор</span><small data-conversation-status></small></button>');
-  form.insertAdjacentHTML('afterbegin',iconButton('mic','Записать голосовое сообщение','type="button" id="record"'));
+  form.insertAdjacentHTML('afterbegin','<button class="chat-voice-orb" type="button" data-voice aria-label="Голосовой запрос"><canvas class="membrane" width="96" height="96" aria-hidden="true"></canvas></button>');
   form.querySelector('[type=submit]').innerHTML=icon('arrow');
  }
- for(const name of ['hero','voice-area','chat-ambient']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
- renderDock();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread)thread.scrollTop=thread.scrollHeight});if(tg){page==='home'?tg.BackButton.hide():tg.BackButton.show()}
+ for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
+ renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread)thread.scrollTop=thread.scrollHeight});if(tg){page==='home'?tg.BackButton.hide():tg.BackButton.show()}
 };
-go=function(next){if(busy){say('Дождись завершения запроса или закончи голосовую запись.');return}if(next!==page)navHistory.push(page);page=next;search='';filter=next==='notes'?'notes':'all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
-function back(){if(busy)return;if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter=page==='notes'?'notes':'all';render()}
+go=function(next){if(next!==page)navHistory.push(page);page=next;search='';filter=next==='notes'?'notes':'all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
+function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter=page==='notes'?'notes':'all';render()}
 function openLayout(){layoutDraft=[...(data.settings.home_widgets||defaultWidgets)];drawLayout();document.querySelector('#layout-editor').showModal()}
 function drawLayout(){document.querySelector('#layout-items').innerHTML=layoutDraft.map((type,i)=>`<div class="layout-row" draggable="true" data-index="${i}"><select aria-label="Виджет ${i+1}" data-replace="${i}">${Object.entries(widgetNames).filter(([k])=>k===type||!layoutDraft.includes(k)).map(([k,v])=>`<option value="${k}" ${k===type?'selected':''}>${v}</option>`).join('')}</select><button data-move="${i}" data-step="-1" aria-label="Выше" ${i===0?'disabled':''}>↑</button><button data-move="${i}" data-step="1" aria-label="Ниже" ${i===layoutDraft.length-1?'disabled':''}>↓</button><button data-hide="${i}" aria-label="Скрыть ${widgetNames[type]}">×</button></div>`).join('')+`<div class="toolbar">${Object.entries(widgetNames).filter(([k])=>!layoutDraft.includes(k)).map(([k,v])=>`<button class="secondary" data-add-widget="${k}">+ ${v}</button>`).join('')}</div>`}
 let held=false,dragIndex=null;

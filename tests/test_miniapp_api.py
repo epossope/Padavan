@@ -89,9 +89,18 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет"})
         self.assertEqual(response.status, 200)
         body = await response.text()
+        job_id = next(event["job_id"] for event in map(json.loads, body.splitlines()) if event["type"] == "job")
         self.assertIn('"type": "delta"', body)
         self.assertIn('"text": "При"', body)
         self.assertIn('"type": "done"', body)
+        status = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "conversation_job", "args": {"id": job_id}})
+        self.assertEqual(status.status, 200)
+        self.assertEqual((await status.json())["data"]["status"], "done")
+
+    async def test_realtime_beta_is_explicitly_opt_in(self):
+        response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "set_experimental_realtime", "args": {"enabled": True}})
+        self.assertEqual(response.status, 200)
+        self.core.set_app_setting.assert_called_once_with("miniapp_realtime_beta:42", "1")
 
     async def test_realtime_token_requires_signed_miniapp_user(self):
         response = await self.client.post('/api/v1/miniapp/voice/realtime-token', json={"init_data": "bad"})
@@ -154,9 +163,38 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("realtime_fallback_batch_count", source)
         self.assertIn("batch_fallback_success_count", source)
         self.assertIn("vad_fallback_reason_code", source)
+        self.assertIn("vosk_load_ms", source)
+        self.assertIn("silero_load_ms", source)
+        self.assertIn("conversation_ready_ms", source)
+        self.assertIn("this.setState('PREPARING')", source)
+        self.assertIn("streamIsLive", source)
+        self.assertIn("pagehide", source)
+        self.assertIn("realtime_beta=1", source)
+        self.assertIn("[data-realtime-conversation]", source)
         self.assertIn("audio_format:{encoding:'pcm_s16le',sample_rate:16000}", source)
         self.assertNotIn("алёна", source.lower())
         self.assertNotIn("нина", source.lower())
+
+    def test_production_voice_is_global_batch_path_and_realtime_is_beta_only(self):
+        root = Path(__file__).parent.parent / "miniapp"
+        app_source = (root / "app.js").read_text(encoding="utf-8")
+        screen_source = (root / "screens.js").read_text(encoding="utf-8")
+        realtime_source = (root / "voice-conversation.js").read_text(encoding="utf-8")
+        self.assertIn("class VoiceController", app_source)
+        self.assertIn("/voice/transcribe", app_source)
+        self.assertIn("class SentenceChunker", app_source)
+        self.assertIn("/miniapp/speech", app_source)
+        self.assertIn("experimental_realtime", app_source)
+        self.assertIn("chat-voice-orb", screen_source)
+        self.assertNotIn("chat-ambient", screen_source)
+        self.assertNotIn("data-conversation", screen_source)
+        self.assertIn("realtime_beta=1", realtime_source)
+
+    def test_miniapp_and_telegram_share_the_canonical_streaming_pipeline(self):
+        api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")
+        bot_source = (Path(__file__).parent.parent / "bot.py").read_text(encoding="utf-8")
+        self.assertIn("core.stream_agent_response(cid, text, cancelled)", api_source)
+        self.assertIn("for event in stream_agent_response(chat_id, text, cancelled)", bot_source)
 
     async def test_telemetry_accepts_voice_reliability_measurements(self):
         response = await self.client.post('/api/v1/miniapp', json={
@@ -164,6 +202,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             "args": {"metrics": {
                 "vad_engine": 1, "noise_floor_rms": 0.013,
                 "realtime_fallback_batch_count": 1, "stt_ws_connect_ms": 245,
+                "vosk_load_ms": 420, "conversation_ready_ms": 650,
             }},
         })
         self.assertEqual(response.status, 200)
@@ -171,3 +210,5 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core.record_runtime_metric.assert_any_call("noise_floor_rms", 0.013)
         self.core.record_runtime_metric.assert_any_call("realtime_fallback_batch_count", 1.0)
         self.core.record_runtime_metric.assert_any_call("stt_ws_connect_ms", 245.0)
+        self.core.record_runtime_metric.assert_any_call("vosk_load_ms", 420.0)
+        self.core.record_runtime_metric.assert_any_call("conversation_ready_ms", 650.0)

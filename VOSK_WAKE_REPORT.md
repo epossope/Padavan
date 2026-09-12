@@ -8,6 +8,12 @@ App serves that exact archive at
 `/app/assets/models/vosk-model-small-ru-0.22.tar.gz`; the browser/WASM smoke
 test loaded it successfully with `Vosk.createModel`.
 
+When Experimental/Beta is explicitly enabled in Settings, the voice session
+starts the same `Vosk.createModel` load in the background. Normal production
+tap-to-talk does not download this model. In Beta the recognizer remains
+available across SPA screen changes until the Mini App closes. `vosk_load_ms`
+records that Beta startup duration as a numeric telemetry value only.
+
 The current restricted wake grammar is:
 
 ```json
