@@ -37,7 +37,7 @@ budget=function(){
  return `<div class="period-picker"><label for="budget-month">Период</label><span>${icon('calendar')}</span><input type="month" id="budget-month" value="${budgetMonth||data.day.slice(0,7)}"></div>${segmented([['day','День'],['week','Неделя'],['month','Месяц'],['year','Год']],budgetPeriod,'budget-period')}<div class="toolbar compact-actions"><button class="secondary" data-form="expense">${icon('plus')}<span>Расход</span></button><button class="secondary" data-form="income">${icon('plus')}<span>Доход</span></button></div>${card('Баланс периода',budgetLoading?'<div class="skeleton" aria-label="Загрузка"></div>':summary||empty('Операций за период нет'))}${values.length?card('Расходы по дням · RUB',`<div class="bars" role="img" aria-label="Расходы по дням">${values.map(([day,value])=>`<div class="bar-group" title="${esc(day)}: ${money(value)}"><small>${day.slice(8)}</small><i style="height:${Math.max(8,value/max*100)}%"></i><span>${Math.round(value).toLocaleString('ru-RU')}</span></div>`).join('')}</div>`):''}${items.slice(0,100).map(e=>`<article class="card row"><div class="body"><p>${esc(e.description)}</p><small>${date(e.spent_at)} · ${esc(e.category)}</small></div><span class="mono">${e.kind==='income'?'+':'−'}${Number(e.amount).toLocaleString('ru-RU')} ${esc(e.currency)}</span>${iconButton('settings','Изменить операцию',`data-edit="expense" data-id="${e.id}"`)}${iconButton('trash','Удалить операцию',`data-delete="delete_expense" data-id="${e.id}"`)}</article>`).join('')}${items.length>100?'<p class="subtle">Показаны первые 100 операций. Сузь период для просмотра остальных.</p>':''}`;
 };
 function renderDock(){
- const dock=document.querySelector('#dock');dock.hidden=page==='chat';document.querySelector('#shell').classList.toggle('no-dock',dock.hidden);
+ const dock=document.querySelector('#dock');dock.hidden=page==='chat'||page==='settings';document.querySelector('#shell').classList.toggle('no-dock',dock.hidden);
  if(dock.hidden)return;
  const task=data.tasks.find(t=>t.status==='open'&&t.due_date&&t.due_date.slice(0,10)<data.day)||data.tasks.find(t=>t.status==='open');
  const reminder=data.reminders.filter(r=>!r.acknowledged).sort((a,b)=>a.remind_at_utc.localeCompare(b.remind_at_utc))[0];
@@ -74,12 +74,9 @@ render=function(){
  content.querySelectorAll('.delete').forEach(b=>b.innerHTML=icon('trash'));
  if(page==='chat'){
   content.querySelector('.subtle')?.remove();
-  const form=content.querySelector('.composer');
-  form.insertAdjacentHTML('afterbegin','<button class="chat-voice-orb" type="button" data-voice aria-label="Голосовой запрос"><canvas class="membrane" width="96" height="96" aria-hidden="true"></canvas></button>');
-  form.querySelector('[type=submit]').innerHTML=icon('arrow');
  }
  for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
- renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread)thread.scrollTop=thread.scrollHeight});if(tg){page==='home'?tg.BackButton.hide():tg.BackButton.show()}
+ renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')requestAnimationFrame(()=>{const thread=content.querySelector('.chat');if(thread&&thread.scrollHeight-thread.scrollTop-thread.clientHeight<72)thread.scrollTop=thread.scrollHeight});if(tg){page==='home'?tg.BackButton.hide():tg.BackButton.show()}
 };
 go=function(next){if(next!==page)navHistory.push(page);page=next;search='';filter=next==='notes'?'notes':'all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
 function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter=page==='notes'?'notes':'all';render()}
