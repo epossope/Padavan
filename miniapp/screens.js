@@ -188,5 +188,5 @@ function prepareTelegramViewport(){
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshStateOnResume()});
 window.addEventListener('focus',refreshStateOnResume);
-async function init(){prepareTelegramViewport();try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.BackButton.onClick(back);render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}}catch(e){say(e.message)}finally{document.querySelector('#splash').classList.add('hidden')}}
+async function init(){prepareTelegramViewport();try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.BackButton.onClick(back);const launchPage=new URLSearchParams(location.search).get('screen');if(['settings','chat','tasks','archive','people','budget','reminders'].includes(launchPage)){page=launchPage;navHistory=['home']}render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}}catch(e){say(e.message)}finally{document.querySelector('#splash').classList.add('hidden')}}
 init();

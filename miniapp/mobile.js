@@ -28,32 +28,38 @@
 
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
- let edgeSwipe=null,edgeSwipeFinishing=false;
+ let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
  function edgeSwipeStartZone(){return Math.min(96,Math.max(44,innerWidth*.25))}
- function finishEdgeSwipe(commit){
+ function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
+ function renderEdgeSwipe(){edgeSwipeFrame=0;if(!edgeSwipe||edgeSwipe.axis!=='x')return;const shell=document.querySelector('#shell');if(!shell)return;edgeSwipe.rendered=clampedSwipeDistance(edgeSwipe.dx);shell.classList.add('edge-swipe-active');shell.style.setProperty('--edge-swipe-x',edgeSwipe.rendered+'px');shell.style.setProperty('--edge-swipe-progress',Math.min(1,edgeSwipe.rendered/innerWidth))}
+ function scheduleEdgeSwipe(){if(!edgeSwipeFrame)edgeSwipeFrame=requestAnimationFrame(renderEdgeSwipe)}
+ function finishEdgeSwipe(commit,velocity=0){
   if(edgeSwipeFinishing)return;
   const shell=document.querySelector('#shell');if(!shell)return;
+  if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0;renderEdgeSwipe()}
   edgeSwipeFinishing=true;
-  const distance=commit?innerWidth:0;
-  shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',distance+'px');
-  setTimeout(()=>{shell.classList.remove('edge-swipe-settling');shell.style.removeProperty('--edge-swipe-x');edgeSwipeFinishing=false;if(commit)back()},commit?170:180)
+  const current=Math.max(0,edgeSwipe?.rendered||0),distance=commit?innerWidth:0,remaining=Math.abs(distance-current);
+  const projectedSpeed=Math.max(.55,Math.abs(velocity)*1.35),duration=Math.round(Math.min(commit?310:250,Math.max(commit?170:150,remaining/projectedSpeed)));
+  shell.style.setProperty('--edge-swipe-duration',duration+'ms');shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',distance+'px');shell.style.setProperty('--edge-swipe-progress',commit?1:0);
+  let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);shell.classList.remove('edge-swipe-settling');if(commit){shell.classList.add('edge-swipe-reset');back();shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');void shell.offsetWidth;shell.classList.remove('edge-swipe-reset')}else{shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress')}shell.style.removeProperty('--edge-swipe-duration');edgeSwipeFinishing=false};
+  const onEnd=event=>{if(event.target===shell&&event.propertyName==='transform')complete()};shell.addEventListener('transitionend',onEnd);edgeSwipeTimer=setTimeout(complete,duration+80)
  }
- function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false);edgeSwipe=null}
+ function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false,edgeSwipe.velocity);else if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0}edgeSwipe=null}
  document.addEventListener('pointerdown',e=>{
   if(edgeSwipeFinishing||e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>edgeSwipeStartZone()||e.target.closest('input,textarea,select,dialog,.chip-row,.segments,.bars,.trend,.distribution-body,[contenteditable=true]'))return;
-  edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,captured:false,dx:0,dy:0,lastX:e.clientX,lastAt:performance.now(),velocity:0};
+  edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,captured:false,dx:0,dy:0,lastX:e.clientX,lastAt:performance.now(),startedAt:performance.now(),velocity:0,rendered:0};
  },{passive:true,capture:true});
  document.addEventListener('pointermove',e=>{
   if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
-  const now=performance.now();edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;edgeSwipe.velocity=(e.clientX-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.lastX=e.clientX;edgeSwipe.lastAt=now;
+  const now=performance.now(),instant=(e.clientX-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;edgeSwipe.velocity=edgeSwipe.velocity*.68+instant*.32;edgeSwipe.lastX=e.clientX;edgeSwipe.lastAt=now;
   if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=6)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.15&&edgeSwipe.dx>0?'x':'cancel';
   if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return}
-  if(edgeSwipe.axis==='x'){e.preventDefault();if(!edgeSwipe.captured){e.target.setPointerCapture?.(e.pointerId);edgeSwipe.captured=true;document.activeElement?.blur?.()}const shell=document.querySelector('#shell');shell?.classList.add('edge-swipe-active');shell?.style.setProperty('--edge-swipe-x',Math.min(edgeSwipe.dx,innerWidth*.82)+'px')}
+  if(edgeSwipe.axis==='x'){e.preventDefault();if(!edgeSwipe.captured){e.target.setPointerCapture?.(e.pointerId);edgeSwipe.captured=true}scheduleEdgeSwipe()}
  },{passive:false,capture:true});
  document.addEventListener('pointerup',e=>{
   if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
-  const {dx,axis,velocity}=edgeSwipe;edgeSwipe=null;
-  if(axis!=='x')return;const commit=dx>=innerWidth*.23||(dx>22&&velocity>.32);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit)
+  const {dx,axis,velocity,startedAt}=edgeSwipe;
+  if(axis!=='x'){edgeSwipe=null;return}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=dx>=innerWidth*.25||(dx>24&&releaseVelocity>.32);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null
  },{passive:true,capture:true});
  document.addEventListener('pointercancel',cancelEdgeSwipe,{passive:true,capture:true});
 })();
