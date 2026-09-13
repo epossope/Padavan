@@ -16,6 +16,10 @@
   try{if(cancel){render();return}if(!preview)await api('home_layout',{widgets});data.settings.home_widgets=widgets}
   catch(e){say('Не удалось сохранить порядок. Попробуй ещё раз.');render()}finally{saving=false}
  }
+ function exitHomeEditMode(){if(!window.homeEditing||drag||saving)return false;clearTimeout(timer);pending=null;window.homeEditing=false;held=true;render();setTimeout(()=>held=false,120);return true}
+ window.NoemaHomeEdit={exit:exitHomeEditMode,isDragging:()=>Boolean(drag)};
+ document.addEventListener('pointerdown',e=>{if(!window.homeEditing||drag||saving||e.button!==0)return;if(!e.target.closest('#content')||e.target.closest('.home-grid>[data-widget],.home-edit-head,.home-hidden,[data-home-done],[data-home-hide],[data-home-show]'))return;exitHomeEditMode()},{capture:true});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')exitHomeEditMode()});
  document.addEventListener('pointerdown',e=>{const node=e.target.closest('.grid>[data-widget]');if(!node||busy||saving||e.button!==0||e.target.closest('.home-widget-hide'))return;pending={node,id:e.pointerId,x:e.clientX,y:e.clientY,widget:node.dataset.widget};if(window.homeEditing){beginDrag(node,pending);return}timer=setTimeout(()=>{if(!pending)return;pending=null;window.homeEditing=true;held=true;render();tg?.HapticFeedback?.impactOccurred('light');setTimeout(()=>held=false,350)},420)});
  document.addEventListener('pointermove',e=>{if(!pending)return;if(!drag){if(Math.hypot(e.clientX-pending.x,e.clientY-pending.y)>10){clearTimeout(timer);pending=null}return}e.preventDefault();drag.x=e.clientX;drag.y=e.clientY},{passive:false});
  document.addEventListener('pointerup',()=>finish());document.addEventListener('pointercancel',()=>finish(true));document.addEventListener('touchmove',e=>{if(drag)e.preventDefault()},{passive:false});document.addEventListener('contextmenu',e=>{if(e.target.closest('[data-widget]'))e.preventDefault()});

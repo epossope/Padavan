@@ -144,7 +144,7 @@ document.addEventListener('click',async e=>{
  if(b.dataset.addWidget){layoutDraft.push(b.dataset.addWidget);drawLayout()}
  if(b.dataset.homeHide){await saveHomeWidgets((data.settings.home_widgets||defaultWidgets).filter(type=>type!==b.dataset.homeHide))}
  if(b.dataset.homeShow){await saveHomeWidgets([...(data.settings.home_widgets||defaultWidgets),b.dataset.homeShow])}
- if(b.hasAttribute('data-home-done')){window.homeEditing=false;render()}
+ if(b.hasAttribute('data-home-done'))window.NoemaHomeEdit?.exit?.()
  if(b.dataset.taskTab){taskTab=b.dataset.taskTab;taskFilter='all';render()}
  if(b.dataset.taskFilter){taskFilter=b.dataset.taskFilter;render()}
  if(b.dataset.noteFilter){noteFilter=b.dataset.noteFilter;render()}

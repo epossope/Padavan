@@ -120,7 +120,7 @@ const visualFixture={
     const scrollPolicy=await page.evaluate(()=>{
      data.history=Array.from({length:36},(_,index)=>({id:index,role:index%2?'assistant':'user',content:`Длинное сообщение ${index} `.repeat(8)}));render();
      const thread=document.querySelector('.chat');
-     return new Promise(resolve=>requestAnimationFrame(()=>{const initialAtBottom=thread.scrollHeight-thread.scrollTop-thread.clientHeight<=2;thread.scrollTop=0;thread.dispatchEvent(new Event('scroll'));requestAnimationFrame(()=>{const incoming=document.createElement('div');incoming.className='bubble assistant';incoming.dataset.messageKey='incoming-test';incoming.textContent='Новое входящее сообщение без принудительного скролла';thread.append(incoming);window.NoemaChatScroll.incoming({newMessage:true});requestAnimationFrame(()=>resolve({initialAtBottom,afterIncoming:thread.scrollTop,latestHidden:document.querySelector('[data-chat-latest]').hidden}))})}));
+     return new Promise(resolve=>requestAnimationFrame(()=>{const initialAtBottom=thread.scrollHeight-thread.scrollTop-thread.clientHeight<=2;thread.scrollTop=0;thread.dispatchEvent(new Event('scroll'));requestAnimationFrame(()=>{const incoming=document.createElement('div');incoming.className='bubble assistant';incoming.dataset.messageKey='incoming-test';incoming.textContent='Новое входящее сообщение без принудительного скролла';thread.querySelector('.chat-inner').insertBefore(incoming,thread.querySelector('[data-chat-bottom-sentinel]'));window.NoemaChatScroll.incoming({newMessage:true});requestAnimationFrame(()=>resolve({initialAtBottom,afterIncoming:thread.scrollTop,latestHidden:document.querySelector('[data-chat-latest]').hidden}))})}));
     });
     if(!scrollPolicy.initialAtBottom||scrollPolicy.afterIncoming!==0||scrollPolicy.latestHidden)errors.push(`Chat scroll follow policy regressed ${width}: ${JSON.stringify(scrollPolicy)}`);
     const preservedAnchor=await page.evaluate(()=>new Promise(resolve=>{
@@ -174,8 +174,12 @@ const visualFixture={
   if(await page.locator('[data-widget="tasks"]').count()||await page.locator('[data-home-show="tasks"]').count()!==1)errors.push(`Home hide control failed ${width}`);
   await page.locator('[data-home-show="tasks"]').click();
   if(await page.locator('[data-widget="tasks"]').count()!==1)errors.push(`Home restore chip failed ${width}`);
-  await page.locator('[data-home-done]').click();
-  if(await page.locator('.home-grid.editing').count()||await page.locator('.home-widget-hide').count())errors.push(`Home Done did not leave edit mode ${width}`);
+    await page.locator('[data-home-done]').click();
+    if(await page.locator('.home-grid.editing').count()||await page.locator('.home-widget-hide').count())errors.push(`Home Done did not leave edit mode ${width}`);
+    await page.locator('[data-widget="tasks"]').dispatchEvent('pointerdown',{pointerType:'touch',button:0});await page.waitForTimeout(460);await page.locator('[data-widget="tasks"]').dispatchEvent('pointerup',{pointerType:'touch',button:0});await page.waitForTimeout(30);
+    if(!await page.locator('.home-grid.editing').count())errors.push(`Second Home edit session did not start ${width}`);
+    await page.locator('.hero').dispatchEvent('pointerdown',{pointerType:'touch',button:0});await page.waitForTimeout(30);
+    if(await page.locator('.home-grid.editing').count()||await page.locator('.home-widget-hide').count())errors.push(`Empty Home tap did not exit edit mode ${width}`);
   await page.evaluate(()=>go('settings'));if(await page.getByRole('button',{name:'Настроить виджеты',exact:true}).count())errors.push('Widget settings remained in Settings');
   await page.close();
  }

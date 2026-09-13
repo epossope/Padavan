@@ -299,7 +299,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (root / "app.js").read_text(encoding="utf-8")
         screen_source = (root / "screens.js").read_text(encoding="utf-8")
         mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
-        self.assertEqual(index.count("?v=ui-1.3.4"), 11)
+        self.assertEqual(index.count("?v=ui-1.3.5"), 11)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", app_source)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", screen_source)
         self.assertNotIn("if(homeEditing", mobile_source)
