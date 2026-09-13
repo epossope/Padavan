@@ -19,7 +19,7 @@
  document.addEventListener('pointerdown',e=>{const node=e.target.closest('.grid>[data-widget]');if(!node||busy||saving||e.button!==0||e.target.closest('.home-widget-hide'))return;pending={node,id:e.pointerId,x:e.clientX,y:e.clientY,widget:node.dataset.widget};if(window.homeEditing){beginDrag(node,pending);return}timer=setTimeout(()=>{if(!pending)return;pending=null;window.homeEditing=true;held=true;render();tg?.HapticFeedback?.impactOccurred('light');setTimeout(()=>held=false,350)},420)});
  document.addEventListener('pointermove',e=>{if(!pending)return;if(!drag){if(Math.hypot(e.clientX-pending.x,e.clientY-pending.y)>10){clearTimeout(timer);pending=null}return}e.preventDefault();drag.x=e.clientX;drag.y=e.clientY},{passive:false});
  document.addEventListener('pointerup',()=>finish());document.addEventListener('pointercancel',()=>finish(true));document.addEventListener('touchmove',e=>{if(drag)e.preventDefault()},{passive:false});document.addEventListener('contextmenu',e=>{if(e.target.closest('[data-widget]'))e.preventDefault()});
- function viewport(){const v=window.visualViewport;document.documentElement.style.setProperty('--visible-height',(v?.height||innerHeight)+'px');document.documentElement.style.setProperty('--keyboard-inset',Math.max(0,innerHeight-(v?.height||innerHeight)-(v?.offsetTop||0))+'px')}
+ function viewport(){const v=window.visualViewport;document.documentElement.style.setProperty('--visible-height',(v?.height||innerHeight)+'px');document.documentElement.style.setProperty('--keyboard-inset',Math.max(0,innerHeight-(v?.height||innerHeight)-(v?.offsetTop||0))+'px');window.NoemaChatScroll?.handleViewportResize?.()}
  window.visualViewport?.addEventListener('resize',viewport);window.visualViewport?.addEventListener('scroll',viewport);window.addEventListener('resize',viewport);viewport();
 
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
@@ -35,15 +35,15 @@
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false);edgeSwipe=null}
  document.addEventListener('pointerdown',e=>{
-  if(edgeSwipeFinishing||e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>32||e.target.closest('input,textarea,select,dialog,.chip-row,.segments,.bars,[contenteditable=true]'))return;
+  if(edgeSwipeFinishing||e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>24||e.target.closest('input,textarea,select,dialog,.chip-row,.segments,.bars,[contenteditable=true]'))return;
   edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,dx:0,dy:0,lastX:e.clientX,lastAt:performance.now(),velocity:0};
  },{passive:true,capture:true});
  document.addEventListener('pointermove',e=>{
   if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
   const now=performance.now();edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;edgeSwipe.velocity=(e.clientX-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.lastX=e.clientX;edgeSwipe.lastAt=now;
-  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=7)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.12&&edgeSwipe.dx>0?'x':'cancel';
+  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=8)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.18&&edgeSwipe.dx>0?'x':'cancel';
   if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return}
-  if(edgeSwipe.axis==='x'){e.preventDefault();const shell=document.querySelector('#shell');shell?.classList.add('edge-swipe-active');shell?.style.setProperty('--edge-swipe-x',Math.min(edgeSwipe.dx,innerWidth*.82)+'px')}
+  if(edgeSwipe.axis==='x'){e.preventDefault();document.activeElement?.blur?.();const shell=document.querySelector('#shell');shell?.classList.add('edge-swipe-active');shell?.style.setProperty('--edge-swipe-x',Math.min(edgeSwipe.dx,innerWidth*.82)+'px')}
  },{passive:false,capture:true});
  document.addEventListener('pointerup',e=>{
   if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
