@@ -1,6 +1,7 @@
 // Local read-only UI regression checks. No Telegram session or real user data.
 const {chromium}=require(process.env.PLAYWRIGHT_PATH||'C:/Users/tanke/Desktop/NoemaDiz/node_modules/playwright');
 const path=require('path');
+const baseUrl=process.env.NOEMA_TEST_URL||'http://127.0.0.1:8091/app';
 const visualFixture={
  data:{
   day:'2026-09-12',plan:{tasks:[],reminders:[]},
@@ -54,7 +55,7 @@ const visualFixture={
   const page=await browser.newPage({viewport:{width,height},deviceScaleFactor:1});
   const uniform={headers:[],searches:[],chips:[],cardRadii:[]};
   page.on('pageerror',e=>errors.push(e.message));
-  await page.goto('http://127.0.0.1:8091/app');await page.locator('#splash.hidden').waitFor();await page.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);await page.waitForTimeout(500);
+  await page.goto(baseUrl);await page.locator('#splash.hidden').waitFor();await page.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);await page.waitForTimeout(500);
   const viewport=await page.locator('meta[name=viewport]').getAttribute('content');
   if(!/maximum-scale=1/.test(viewport)||!/user-scalable=no/.test(viewport)||!/viewport-fit=cover/.test(viewport))errors.push('Viewport zoom hardening missing');
   if(await page.evaluate(()=>window.visualViewport&&window.visualViewport.scale!==1))errors.push(`Unexpected initial zoom ${width}`);
@@ -110,8 +111,10 @@ const visualFixture={
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox(),inputArea=await page.locator('.chat-input-area').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
     const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x<inputArea.x+inputArea.width-1||sphere.x+sphere.width>width+2||sphere.y+sphere.height<inputArea.y+inputArea.height+4||sphere.y+sphere.height>inputArea.y+inputArea.height+16)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
-    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el.closest('.chat-sphere-slot')===el.parentElement,borderRight:getComputedStyle(document.querySelector('.chat-input-area')).borderRightWidth}));
-    if(Number.parseFloat(sphereStyle.width)<76||Number.parseFloat(sphereStyle.width)>92||box.height<78||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/grid composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
+    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>{const composer=el.closest('.chat-composer'),input=document.querySelector('.chat-input-area'),canvas=el.querySelector('canvas'),style=getComputedStyle(el),canvasStyle=getComputedStyle(canvas);return {width:style.width,hasCanvas:Boolean(canvas),isLast:el.closest('.chat-sphere-slot')===el.parentElement,borderRight:getComputedStyle(input).borderRightWidth,composerWidth:composer.getBoundingClientRect().width,contentWidth:document.querySelector('#content').getBoundingClientRect().width,inputWidth:input.getBoundingClientRect().width,slotWidth:el.closest('.chat-sphere-slot').getBoundingClientRect().width,grid:getComputedStyle(composer).gridTemplateColumns,orbBackground:style.backgroundImage,orbFilter:style.filter,canvasBackground:canvasStyle.backgroundImage,canvasFilter:canvasStyle.filter,wrap:getComputedStyle(document.querySelector('#chat-input')).overflowWrap}});
+    if(Number.parseFloat(sphereStyle.width)<76||Number.parseFloat(sphereStyle.width)>92||box.height<78||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px'||Math.abs(sphereStyle.composerWidth-sphereStyle.contentWidth)>1||Math.abs(sphereStyle.inputWidth+sphereStyle.slotWidth-sphereStyle.composerWidth)>1||sphereStyle.orbBackground!=='none'||sphereStyle.orbFilter!=='none'||sphereStyle.canvasBackground!=='none'||sphereStyle.canvasFilter!=='none'||sphereStyle.wrap!=='anywhere')errors.push(`Chat voice sphere/grid composer contract failed ${width}: ${JSON.stringify(sphereStyle)}`);
+    const stateGeometry=await page.evaluate(async()=>{const orb=document.querySelector('.chat-voice-orb'),states={};for(const state of ['idle','listening','thinking','responding']){window.NoemaMembrane?.setState(state);await new Promise(resolve=>requestAnimationFrame(resolve));const rect=orb.getBoundingClientRect();states[state]=[rect.x,rect.y,rect.width,rect.height]}return states});
+    if(new Set(Object.values(stateGeometry).map(value=>value.join(','))).size!==1)errors.push(`Chat sphere state changed layout ${width}: ${JSON.stringify(stateGeometry)}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
     await page.evaluate(()=>say('Слушаю…'));
     if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);
@@ -131,8 +134,8 @@ const visualFixture={
     if(!scrollPolicy.latestHidden){await page.locator('[data-chat-latest]').click();await page.waitForTimeout(260);if(!await page.evaluate(()=>{const t=document.querySelector('.chat');return t.scrollHeight-t.scrollTop-t.clientHeight<=2}))errors.push(`Chat latest action did not return to bottom ${width}`)}
     const sendPinsBottom=await page.evaluate(()=>{const t=document.querySelector('.chat');t.scrollTop=0;t.dispatchEvent(new Event('scroll'));return new Promise(resolve=>requestAnimationFrame(()=>{window.NoemaChatScroll.addPendingUser('Моё новое сообщение');requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(t.scrollHeight-t.scrollTop-t.clientHeight<=2)))}));});
     if(!sendPinsBottom)errors.push(`Chat send did not restore bottom follow ${width}`);
-    const multiline=await page.evaluate(()=>{const input=document.querySelector('#chat-input');input.value='Первая строка\nВторая строка\nТретья строка';input.dispatchEvent(new Event('input',{bubbles:true}));return {tag:input.tagName,height:input.getBoundingClientRect().height,composer:input.closest('.composer').getBoundingClientRect().height};});
-    if(multiline.tag!=='TEXTAREA'||multiline.height<=46||multiline.composer<=52)errors.push(`Chat multiline composer did not grow upward ${width}`);
+    const composerCases=await page.evaluate(()=>{const input=document.querySelector('#chat-input'),measure=value=>{input.value=value;input.dispatchEvent(new Event('input',{bubbles:true}));return {height:input.getBoundingClientRect().height,clientHeight:input.clientHeight,scrollHeight:input.scrollHeight,scrollWidth:input.scrollWidth,clientWidth:input.clientWidth,composer:input.closest('.composer').getBoundingClientRect().height}};return {empty:measure(''),short:measure('Короткая фраза'),word:measure('оченьдлинноесловобезпробелов'.repeat(12)),two:measure('Первая строка\nВторая строка'),five:measure('1\n2\n3\n4\n5'),overflow:measure('1\n2\n3\n4\n5\n6\n7\n8')}});
+    if(composerCases.empty.height>54||composerCases.short.height>54||composerCases.word.scrollWidth>composerCases.word.clientWidth+1||composerCases.two.height<=composerCases.empty.height||composerCases.five.height>122||composerCases.overflow.height>122||composerCases.overflow.scrollHeight<=composerCases.overflow.clientHeight||composerCases.two.composer<=52)errors.push(`Chat textarea sizing regressed ${width}: ${JSON.stringify(composerCases)}`);
    }
    if(route==='home'){
     if(await page.locator('#header .utilities button').count()!==1||await page.locator('#header [data-page="settings"]').count()!==1)errors.push(`Home header is not Noema plus Settings only ${width}`);
@@ -184,7 +187,7 @@ const visualFixture={
   await page.close();
  }
  const touch=await browser.newPage({viewport:{width:390,height:844},hasTouch:true,isMobile:true});
- await touch.goto('http://127.0.0.1:8091/app');await touch.locator('#splash.hidden').waitFor();await touch.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);
+ await touch.goto(baseUrl);await touch.locator('#splash.hidden').waitFor();await touch.evaluate(fixture=>{data=fixture.data;weatherData=fixture.weather;budgetData=fixture.budget;render()},visualFixture);
  let a=await touch.locator('[data-widget=tasks]').boundingBox(),cdp=await touch.context().newCDPSession(touch);
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:a.x+a.width/2,y:a.y+a.height/2}]});await touch.waitForTimeout(500);await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
  if(!await touch.locator('.home-grid.editing').count())errors.push('Touch long press did not enter edit mode');
@@ -193,13 +196,21 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
+ for(const startX of [2,10,18]){
+  await touch.evaluate(()=>go('archive'));
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:startX,y:220}]});
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:startX+100,y:226}]});
+  const swipeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+  if(swipeOffset==='none')errors.push(`Edge swipe from ${startX}px did not follow the finger`);
+  if(await touch.evaluate(()=>page)!=='home')errors.push(`Edge swipe from ${startX}px did not return to the preceding screen`);
+ }
  await touch.evaluate(()=>go('archive'));
- await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:5,y:220}]});
- await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:105,y:226}]});
- const swipeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
- await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
- if(swipeOffset==='none')errors.push('Edge swipe did not follow the finger');
- await touch.waitForTimeout(140);if(await touch.evaluate(()=>page)!=='home')errors.push('Edge swipe did not return to the preceding screen');
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:130,y:226}]});
+ const outsideEdgeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(220);
+ if(outsideEdgeOffset!=='none'||await touch.evaluate(()=>page)!=='archive')errors.push('Swipe beginning at 30px incorrectly acquired the back gesture');
  await touch.evaluate(()=>go('archive'));
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:8,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:74,y:224}]});
@@ -222,7 +233,7 @@ const visualFixture={
    BackButton:{onClick(){},hide(){},show(){}}
   }}
  });
- await fullscreen.goto('http://127.0.0.1:8091/app');await fullscreen.locator('#splash.hidden').waitFor();
+ await fullscreen.goto(baseUrl);await fullscreen.locator('#splash.hidden').waitFor();
  const fullscreenBoot=await fullscreen.evaluate(()=>({calls:window.__telegramBoot,safeTop:getComputedStyle(document.documentElement).getPropertyValue('--app-safe-top').trim(),safeBottom:getComputedStyle(document.documentElement).getPropertyValue('--app-safe-bottom').trim()}));
  if(fullscreenBoot.calls.ready!==1||fullscreenBoot.calls.expand!==1||fullscreenBoot.calls.fullscreen!==1)errors.push('Telegram fullscreen boot sequence failed');
  if(fullscreenBoot.safeTop!=='19px'||fullscreenBoot.safeBottom!=='13px')errors.push('Telegram safe area was not applied');
@@ -233,7 +244,7 @@ const visualFixture={
   window.__telegramBoot={ready:0,expand:0};
   window.Telegram={WebApp:{initData:'',ready(){window.__telegramBoot.ready++},expand(){window.__telegramBoot.expand++},onEvent(){},setHeaderColor(){},setBackgroundColor(){},BackButton:{onClick(){},hide(){},show(){}}}}
  });
- await fallback.goto('http://127.0.0.1:8091/app');await fallback.locator('#splash.hidden').waitFor();
+ await fallback.goto(baseUrl);await fallback.locator('#splash.hidden').waitFor();
  const fallbackBoot=await fallback.evaluate(()=>window.__telegramBoot);
  if(fallbackBoot.ready!==1||fallbackBoot.expand!==1)errors.push('Telegram expand fallback failed');
  await fallback.close();
