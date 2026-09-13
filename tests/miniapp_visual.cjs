@@ -108,10 +108,10 @@ const visualFixture={
    }
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
-    const box=await page.locator('.composer').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(Math.abs((sphere.y+sphere.height)-(box.y+box.height))>10||Math.abs(sphere.x-(box.x+box.width))>3||sphere.x+sphere.width>width+2)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
-    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el===document.querySelector('.composer').lastElementChild,borderRight:getComputedStyle(el.parentElement).borderRightWidth}));
-    if(Number.parseFloat(sphereStyle.width)<72||Number.parseFloat(sphereStyle.width)>82||box.height>56||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/open composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
+    const box=await page.locator('.composer').boundingBox(),inputArea=await page.locator('.chat-input-area').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x<inputArea.x+inputArea.width-1||sphere.x+sphere.width>width+2||sphere.y+sphere.height<inputArea.y+inputArea.height+4||sphere.y+sphere.height>inputArea.y+inputArea.height+16)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
+    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>({width:getComputedStyle(el).width,hasCanvas:Boolean(el.querySelector('canvas')),isLast:el.closest('.chat-sphere-slot')===el.parentElement,borderRight:getComputedStyle(document.querySelector('.chat-input-area')).borderRightWidth}));
+    if(Number.parseFloat(sphereStyle.width)<76||Number.parseFloat(sphereStyle.width)>92||box.height<78||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px')errors.push(`Chat voice sphere/grid composer contract failed ${width}: sphere=${sphereStyle.width}, composer=${box.height}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
     await page.evaluate(()=>say('Слушаю…'));
     if(await page.locator('#composer-status:not([hidden])').count()!==1||await page.locator('#notice.visible').count())errors.push(`Chat status is not contained by composer ${width}`);

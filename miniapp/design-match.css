@@ -256,6 +256,24 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
 .chat-screen .chat-latest{bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 96px)}
 @media(max-width:370px){.chat-screen .composer{--chat-sphere-slot:74px;min-height:74px;margin-right:0}.chat-screen .composer:before{inset:auto var(--chat-sphere-slot) 8px 0;height:52px}.chat-screen .chat-voice-orb{right:auto;bottom:-7px;width:74px;height:74px;min-height:74px}.chat-screen .chat-voice-orb canvas{width:74px;height:74px}}
 
+/* V1.6 Chat shell: viewport / native message scroller / two real composer columns. */
+.chat-screen #content{display:flex;min-height:0;padding-bottom:0}
+.chat-screen .chat-shell{position:relative;display:grid;grid-template-rows:minmax(0,1fr) auto;flex:1;min-height:0;width:100%}
+.chat-screen .chat{grid-row:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y}
+.chat-screen .chat-inner{min-height:100%;display:flex;flex-direction:column;gap:6px}
+.chat-screen .chat-inner::before{content:'';flex:1 0 0}
+.chat-screen .chat-composer{--chat-sphere-slot:90px;display:grid;grid-template-columns:minmax(0,1fr) var(--chat-sphere-slot);align-items:end;gap:0;grid-row:2;min-height:90px;margin:8px 0 max(8px,var(--app-safe-bottom,env(safe-area-inset-bottom))) 0;padding:0;border:0!important;border-radius:0;background:transparent;box-shadow:none;overflow:visible}
+.chat-screen .chat-composer:before{display:none}
+.chat-screen .chat-input-area{position:relative;align-self:end;min-width:0;min-height:52px;margin-bottom:8px;border:1px solid rgba(244,244,242,.22);border-right:0;border-radius:19px 0 0 19px;background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.018));box-shadow:inset 0 1px rgba(255,255,255,.045),0 14px 34px rgba(0,0,0,.3);backdrop-filter:blur(22px)}
+.chat-screen .chat-input-area textarea{display:block;width:100%;min-height:52px;max-height:122px;margin:0;padding:14px 16px 12px;border:0;border-radius:0;background:transparent;resize:none;overflow-y:auto;font:300 16px/1.25 var(--font-ui);outline:0}
+.chat-screen .chat-input-area .composer-status{position:absolute;z-index:1;left:16px;right:16px;top:8px;bottom:auto}
+.chat-screen .chat-input-area .composer-status:not([hidden])+textarea{padding-top:22px;padding-bottom:4px}
+.chat-screen .chat-sphere-slot{display:flex;align-items:flex-end;justify-content:flex-end;min-width:0;min-height:90px;overflow:visible}
+.chat-screen .chat-sphere-slot .chat-voice-orb{position:static;display:block;flex:0 0 90px;width:90px;height:90px;min-height:90px;margin:0 0 -8px;transform:none;filter:brightness(2.38) contrast(1.07) drop-shadow(0 0 16px rgba(255,255,255,.26));overflow:visible}
+.chat-screen .chat-sphere-slot .chat-voice-orb canvas{width:90px;height:90px}
+.chat-screen .chat-latest{right:12px;bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 108px)}
+@media(max-width:370px){.chat-screen .chat-composer{--chat-sphere-slot:78px;min-height:78px}.chat-screen .chat-sphere-slot{min-height:78px}.chat-screen .chat-sphere-slot .chat-voice-orb{flex-basis:78px;width:78px;height:78px;min-height:78px;margin-bottom:-7px}.chat-screen .chat-sphere-slot .chat-voice-orb canvas{width:78px;height:78px}}
+
 /* 5. Tasks and reminders */
 .task-list,.reminder-list,.recent-notes,.resource-list,.people-list{display:grid;gap:10px}
 .task-card{min-height:94px;margin:0;padding:12px 14px;display:flex;align-items:flex-start;gap:10px}
