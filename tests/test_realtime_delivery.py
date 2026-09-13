@@ -194,7 +194,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             bot.unregister_active_draft(42, 77)
 
-    async def test_telegram_draft_finishes_as_persistent_message(self):
+    async def test_experimental_telegram_draft_finishes_as_persistent_message(self):
         telegram = SimpleNamespace(send_message_draft=AsyncMock(return_value=True))
         context = SimpleNamespace(bot=telegram)
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=42))
@@ -205,10 +205,67 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         ])
         with patch.object(bot, "stream_agent_response", return_value=events), \
              patch.object(bot, "send_answer", new=AsyncMock()) as final_send:
-            completed = await bot.stream_answer_to_telegram(update, context, "тест")
+            completed = await bot.stream_answer_to_telegram_draft(update, context, "тест")
         self.assertTrue(completed)
         self.assertGreaterEqual(telegram.send_message_draft.await_count, 2)
         final_send.assert_awaited_once()
+
+    async def test_production_stream_sends_once_then_edits_same_message(self):
+        telegram = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+            edit_message_text=AsyncMock(return_value=True),
+            send_message_draft=AsyncMock(),
+        )
+        context = SimpleNamespace(bot=telegram)
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=42),
+            effective_message=SimpleNamespace(reply_voice=AsyncMock()),
+        )
+        events = iter([
+            {"type": "delta", "text": "При"},
+            {"type": "delta", "text": "вет"},
+            {"type": "done", "text": "Привет", "canonical_message_id": 9},
+        ])
+        with patch.object(bot, "stream_agent_response", return_value=events), \
+             patch.object(bot, "get_mode", return_value="text"):
+            completed = await bot.stream_answer_to_telegram(update, context, "тест")
+        self.assertTrue(completed)
+        telegram.send_message.assert_awaited_once()
+        telegram.send_message_draft.assert_not_awaited()
+        self.assertGreaterEqual(telegram.edit_message_text.await_count, 1)
+        self.assertEqual({call.kwargs["message_id"] for call in telegram.edit_message_text.await_args_list}, {77})
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["canonical_message_id"], 9)
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["telegram_message_id"], 77)
+
+    async def test_production_stream_never_exposes_reasoning(self):
+        telegram = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=88)),
+            edit_message_text=AsyncMock(return_value=True),
+            send_message_draft=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
+                                 effective_message=SimpleNamespace(reply_voice=AsyncMock()))
+        response = Mock(ok=True, status_code=200)
+        response.iter_lines.return_value = [
+            b'data: {"choices":[{"delta":{"reasoning":"private","content":"<thi"}}]}',
+            b'data: {"choices":[{"delta":{"content":"nk>internal</think>Visible"}}]}',
+            b'data: [DONE]',
+        ]
+        router = SimpleNamespace(resolve=lambda *_: {"primary": "test-model", "fallback": ""})
+        with patch.object(bot, "direct_live_request", return_value=None), \
+             patch.object(bot, "conversation_context", return_value=[]), \
+             patch.object(bot, "system_prompt", return_value="system"), \
+             patch.object(bot, "model_router", return_value=router), \
+             patch.object(bot, "runtime_config_values", return_value={"strong_model": "", "model_catalog": []}), \
+             patch.object(bot, "request_chat_stream", return_value=response), \
+             patch.object(bot, "record_usage"), patch.object(bot, "add_message", side_effect=[1, 2]), \
+             patch.object(bot, "get_mode", return_value="text"):
+            await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "AAA")
+        delivered = " ".join(call.kwargs["text"] for call in telegram.send_message.await_args_list)
+        delivered += " " + " ".join(call.kwargs["text"] for call in telegram.edit_message_text.await_args_list)
+        self.assertIn("Visible", delivered)
+        self.assertNotIn("internal", delivered)
+        self.assertNotIn("think", delivered.casefold())
 
     async def test_output_modes_keep_text_voice_and_combined_contracts(self):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())

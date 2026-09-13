@@ -24,9 +24,13 @@ class CanonicalConversationE2ETests(unittest.IsolatedAsyncioTestCase):
 
                 # Telegram streaming calls the same entry point and therefore
                 # must see the Mini App turn in its next context.
-                message = SimpleNamespace(reply_text=AsyncMock())
+                message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
                 update = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id), effective_message=message)
-                context = SimpleNamespace(bot=SimpleNamespace(send_message_draft=AsyncMock()))
+                context = SimpleNamespace(bot=SimpleNamespace(
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+                    edit_message_text=AsyncMock(return_value=True),
+                    send_message_draft=AsyncMock(),
+                ))
                 with patch.object(bot, "direct_live_request", return_value="Ответ из Telegram"):
                     self.assertTrue(await bot.stream_answer_to_telegram(update, context, "Сообщение из Telegram"))
 

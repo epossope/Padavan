@@ -34,6 +34,7 @@ import time
 import shutil
 import threading
 import unicodedata
+import uuid
 from urllib.parse import parse_qsl
 
 from datetime import datetime, timezone, timedelta
@@ -55,7 +56,7 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
@@ -146,9 +147,9 @@ MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-trans
 MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
 TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lower()
-TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
-TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
-TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
+TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+TELEGRAM_DRAFT_MIN_INTERVAL = max(0.3, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.4")))
+TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.5")))
 TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
 TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
 TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
@@ -186,6 +187,7 @@ ACTIVE_DRAFTS_LOCK = threading.RLock()
 ACTIVE_DRAFTS = {}
 ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
 ACTIVE_STREAM_RESPONSES = {}
+TELEGRAM_DELIVERY_CORRELATIONS = deque(maxlen=256)
 RUNTIME_METRICS = {}
 LATENCY_METRICS = (
     "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
@@ -1742,9 +1744,10 @@ def add_message(chat_id, role, content):
 
     with conn() as c:
 
-        c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
+        cursor = c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
 
-                  (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
+                           (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
+        return cursor.lastrowid
 
 
 def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_chars=5000):
@@ -3620,9 +3623,10 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         return
     live = direct_live_request(text)
     if live is not None:
-        add_message(chat_id, "user", text); add_message(chat_id, "assistant", live)
+        add_message(chat_id, "user", text)
+        canonical_message_id = add_message(chat_id, "assistant", live)
         yield {"type": "delta", "text": live}
-        yield {"type": "done", "text": live}
+        yield {"type": "done", "text": live, "canonical_message_id": canonical_message_id}
         return
     context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
@@ -3687,8 +3691,10 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         calls = message.get("tool_calls") or []
         if not calls:
             answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
-            add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
-            yield {"type": "done", "text": answer, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+            add_message(chat_id, "user", text)
+            canonical_message_id = add_message(chat_id, "assistant", answer)
+            yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+                   "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
         messages.append(message)
         for call in calls:
@@ -3710,8 +3716,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 yield {"type": "cancelled"}
                 return
     answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
-    add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
-    yield {"type": "done", "text": answer}
+    add_message(chat_id, "user", text)
+    canonical_message_id = add_message(chat_id, "assistant", answer)
+    yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id}
 
 
 def mint_mistral_realtime_session():
@@ -3786,7 +3793,7 @@ async def stopped_generation_handler(update, context):
         cancel_active_draft(chat_id, draft_id if isinstance(draft_id, int) else None)
 
 
-async def stream_answer_to_telegram(update, context, text):
+async def stream_answer_to_telegram_draft(update, context, text):
     """Stream one ephemeral draft, then persist exactly one formatted final answer."""
     chat_id = update.effective_chat.id
     draft_id, cancelled = _new_draft_id(), threading.Event()
@@ -3862,6 +3869,162 @@ async def stream_answer_to_telegram(update, context, text):
     finally:
         cancelled.set()
         unregister_active_draft(chat_id, draft_id)
+
+
+def _telegram_stream_text(chat_id, text):
+    """Render one safe, bounded Telegram bubble from canonical visible text."""
+    visible = sanitize_visible_content(text).strip()
+    if not visible:
+        return ""
+    chunks = TelegramRenderer.chunks(visible)
+    rendered = chunks[0]
+    if len(chunks) > 1:
+        rendered = TelegramRenderer.render(visible[:3600].rstrip() + "\n\n…")
+    available = max(0, reply_emoji_limit(len(visible)) - 1)
+    rendered, _ = animate_configured_emojis(rendered, available)
+    return reply_emoji_prefix(chat_id) + rendered
+
+
+async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="telegram_stream"):
+    """Edit a known message without ever creating a duplicate fallback reply."""
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        started = time.perf_counter()
+        try:
+            result = await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode=TelegramRenderer.parse_mode,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT, read_timeout=TELEGRAM_READ_TIMEOUT,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT, pool_timeout=TELEGRAM_POOL_TIMEOUT,
+            )
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt)
+            return result
+        except BadRequest as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="BadRequest")
+            message = str(error).casefold()
+            if "message is not modified" in message:
+                return True
+            # Deleted/invalid/inaccessible messages cannot be safely replaced:
+            # a second send could duplicate an edit that Telegram already applied.
+            LOGGER.warning("Telegram stream edit stopped chat_id=%s message_id=%s: %s",
+                           chat_id, message_id, error)
+            return None
+        except RetryAfter as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="RetryAfter")
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                return None
+            await asyncio.sleep(min(2.0, max(0.05, float(error.retry_after))))
+        except (TimedOut, NetworkError) as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error=type(error).__name__)
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                return None
+            await asyncio.sleep(0.15 * (2 ** attempt) + secrets.randbelow(80) / 1000)
+        except Forbidden:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="Forbidden")
+            return None
+    return None
+
+
+async def stream_answer_to_telegram(update, context, text):
+    """Deliver one request as one persistent Telegram message edited in place."""
+    chat_id = update.effective_chat.id
+    request_id, cancelled = uuid.uuid4().hex, threading.Event()
+    register_active_draft(chat_id, request_id, cancelled)
+    queue, loop = asyncio.Queue(), asyncio.get_running_loop()
+
+    def produce():
+        try:
+            for event in stream_agent_response(chat_id, text, cancelled):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
+    throttle = AdaptiveDraftThrottle(0.3, 0.5, TELEGRAM_DRAFT_MIN_CHARS)
+    accumulated, final = "", ""
+    canonical_message_id = None
+    telegram_message_id = None
+    sent = None
+    editing_available = True
+    mode = get_mode(chat_id)
+    effective_mode = "voice_and_text" if wants_voice(text) else ("text" if mode == "auto" else mode)
+    wants_text = effective_mode in {"text", "voice_and_text"}
+    wants_audio = effective_mode in {"voice", "voice_and_text"}
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            if isinstance(event, Exception):
+                raise event
+            kind = event.get("type")
+            if kind == "delta":
+                accumulated += event.get("text", "")
+                if not wants_text:
+                    continue
+                rendered = _telegram_stream_text(chat_id, accumulated)
+                if not rendered:
+                    continue
+                if sent is None:
+                    sent = await telegram_send_with_retry(
+                        context.bot, source="telegram_stream_initial", chat_id=chat_id,
+                        text=rendered, reply_markup=main_keyboard(),
+                        parse_mode=TelegramRenderer.parse_mode,
+                    )
+                    telegram_message_id = getattr(sent, "message_id", None)
+                    throttle.should_send(accumulated, force=True)
+                elif editing_available and throttle.should_send(accumulated):
+                    editing_available = bool(await telegram_edit_with_retry(
+                        context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                        text=rendered,
+                    ))
+            elif kind == "done":
+                final = event.get("text") or accumulated
+                canonical_message_id = event.get("canonical_message_id")
+            elif kind == "cancelled":
+                cancelled.set()
+
+        if cancelled.is_set():
+            return False
+        final = sanitize_visible_content(final or accumulated).strip()
+        if wants_text and final:
+            rendered = _telegram_stream_text(chat_id, final)
+            if sent is None:
+                sent = await telegram_send_with_retry(
+                    context.bot, source="telegram_stream_initial", chat_id=chat_id,
+                    text=rendered, reply_markup=main_keyboard(),
+                    parse_mode=TelegramRenderer.parse_mode,
+                )
+                telegram_message_id = getattr(sent, "message_id", None)
+            elif editing_available:
+                editing_available = bool(await telegram_edit_with_retry(
+                    context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                    text=rendered, source="telegram_stream_final",
+                ))
+        if wants_audio and final:
+            voice_path = await make_voice(final, chat_id=chat_id)
+            try:
+                with voice_path.open("rb") as voice_file:
+                    await update.effective_message.reply_voice(voice=voice_file)
+            finally:
+                voice_path.unlink(missing_ok=True)
+        TELEGRAM_DELIVERY_CORRELATIONS.append({
+            "request_id": request_id,
+            "canonical_message_id": canonical_message_id,
+            "telegram_message_id": telegram_message_id,
+        })
+        LOGGER.info("Telegram delivery request_id=%s canonical_message_id=%s telegram_message_id=%s",
+                    request_id, canonical_message_id, telegram_message_id)
+        return True
+    finally:
+        cancelled.set()
+        unregister_active_draft(chat_id, request_id)
 
 
 
@@ -6086,9 +6249,10 @@ async def text_handler(update,context):
 
 
 
-    if TELEGRAM_DRAFT_STREAMING_ENABLED and update.effective_chat.type == "private":
+    if update.effective_chat.type == "private":
         try:
-            completed = await stream_answer_to_telegram(update, context, t)
+            delivery = stream_answer_to_telegram_draft if TELEGRAM_DRAFT_STREAMING_ENABLED else stream_answer_to_telegram
+            completed = await delivery(update, context, t)
             if completed:
                 await drain_media_outbox(update, context)
         except Exception as e:
