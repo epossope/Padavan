@@ -80,8 +80,8 @@ def sanitize_visible_content(value: str) -> str:
 def sanitize_assistant_message(message: dict) -> dict:
     """Keep tool calls and final content, but discard provider-only reasoning."""
     clean = dict(message or {})
-    clean.pop("reasoning", None)
-    clean.pop("reasoning_details", None)
+    for field in ("reasoning", "reasoning_details", "analysis", "thinking"):
+        clean.pop(field, None)
     clean["content"] = sanitize_visible_content(clean.get("content") or "")
     return clean
 

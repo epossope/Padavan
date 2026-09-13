@@ -34,6 +34,7 @@ import time
 import shutil
 import threading
 import unicodedata
+import uuid
 from urllib.parse import parse_qsl
 
 from datetime import datetime, timezone, timedelta
@@ -55,7 +56,7 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, MessageEntity, ReplyKeyboardMarkup, Update, WebAppInfo
-from telegram.error import BadRequest, Forbidden, NetworkError, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
@@ -146,9 +147,9 @@ MISTRAL_REALTIME_MODEL = os.getenv("MISTRAL_REALTIME_MODEL", "voxtral-mini-trans
 MISTRAL_CLIENT_SESSIONS_URL = os.getenv("MISTRAL_CLIENT_SESSIONS_URL", "https://api.mistral.ai/v1/client/sessions").strip()
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
 TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lower()
-TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
-TELEGRAM_DRAFT_MIN_INTERVAL = max(0.8, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.8")))
-TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "1.2")))
+TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+TELEGRAM_DRAFT_MIN_INTERVAL = max(0.3, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.4")))
+TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.5")))
 TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
 TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
 TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
@@ -186,6 +187,7 @@ ACTIVE_DRAFTS_LOCK = threading.RLock()
 ACTIVE_DRAFTS = {}
 ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
 ACTIVE_STREAM_RESPONSES = {}
+TELEGRAM_DELIVERY_CORRELATIONS = deque(maxlen=256)
 RUNTIME_METRICS = {}
 LATENCY_METRICS = (
     "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
@@ -193,6 +195,8 @@ LATENCY_METRICS = (
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
     "llm_total_ms", "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
     "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+    "tts_enqueue_ms", "tts_synthesis_start_ms", "tts_synthesis_done_ms",
+    "tts_play_start_ms", "tts_play_end_ms", "tts_playback_gap_ms", "tts_total_ms",
     "speech_text_length_chars", "total_response_start_ms", "total_ms",
 )
 VOICE_ROBUSTNESS_METRICS = (
@@ -869,10 +873,13 @@ def set_app_setting(key, value, updated_by=None):
 
 RUNTIME_CONFIG_KEY = "admin_runtime_config_v1"
 RUNTIME_CONFIG_FIELDS = (
+    "global_model_mode", "global_force_model",
+    "global_vision_mode", "global_force_vision_model",
     "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
     "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
     "vision_model", "vision_fallback_models", "batch_stt_model",
-    "tts_provider", "tts_fallback_provider", "tts_voice", "default_voice_reply_mode",
+    "tts_provider", "tts_fallback_provider", "tts_voice",
+    "tts_default_speed", "tts_default_pitch", "tts_default_volume", "default_voice_reply_mode",
     "realtime_model", "model_catalog",
 )
 _MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,200}$")
@@ -883,9 +890,20 @@ def _env_is_set(*names):
     return any(bool((os.getenv(name) or "").strip()) for name in names)
 
 
+def _env_float(name, default, minimum, maximum):
+    try:
+        return min(maximum, max(minimum, float(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
 def _runtime_env_defaults():
     """Safe startup values and their provenance; no secrets are represented here."""
     return {
+        "global_model_mode": (os.getenv("GLOBAL_MODEL_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_MODEL_MODE") else "DEFAULT"),
+        "global_force_model": (os.getenv("GLOBAL_FORCE_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_MODEL") else "DEFAULT"),
+        "global_vision_mode": (os.getenv("GLOBAL_VISION_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_VISION_MODE") else "DEFAULT"),
+        "global_force_vision_model": (os.getenv("GLOBAL_FORCE_VISION_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_VISION_MODEL") else "DEFAULT"),
         "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL", "MODEL") else "DEFAULT"),
         "fast_model_providers": (list(FAST_MODEL_PROVIDERS), "ENV" if _env_is_set("FAST_MODEL_PROVIDERS") else "DEFAULT"),
         "fast_model_allow_provider_fallback": (FAST_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("FAST_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
@@ -898,6 +916,9 @@ def _runtime_env_defaults():
         "tts_provider": (TTS_PROVIDER, "ENV" if _env_is_set("TTS_PROVIDER") else "DEFAULT"),
         "tts_fallback_provider": (TTS_FALLBACK_PROVIDER, "ENV" if _env_is_set("TTS_FALLBACK_PROVIDER") else "DEFAULT"),
         "tts_voice": (VOICE, "ENV" if _env_is_set("EDGE_VOICE") else "DEFAULT"),
+        "tts_default_speed": (_env_float("TTS_DEFAULT_SPEED", 1.0, .8, 1.25), "ENV" if _env_is_set("TTS_DEFAULT_SPEED") else "DEFAULT"),
+        "tts_default_pitch": (_env_float("TTS_DEFAULT_PITCH", 1.0, .5, 1.5), "ENV" if _env_is_set("TTS_DEFAULT_PITCH") else "DEFAULT"),
+        "tts_default_volume": (_env_float("TTS_DEFAULT_VOLUME", 1.0, .2, 1.0), "ENV" if _env_is_set("TTS_DEFAULT_VOLUME") else "DEFAULT"),
         "default_voice_reply_mode": (DEFAULT_MODE, "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
         "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
         "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
@@ -945,6 +966,16 @@ def _normalise_runtime_config_value(field, value):
         if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
             raise ValueError("Invalid model or voice value")
         return clean
+    if field in {"global_force_model", "global_force_vision_model"}:
+        clean = str(value or "").strip()
+        if clean and not _MODEL_VALUE_RE.fullmatch(clean):
+            raise ValueError("Invalid forced model value")
+        return clean
+    if field in {"global_model_mode", "global_vision_mode"}:
+        clean = str(value or "").strip().lower()
+        if clean not in {"auto", "force"}:
+            raise ValueError("Invalid global model mode")
+        return clean
     if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models", "model_catalog"}:
         raw = value if isinstance(value, list) else str(value or "").split(",")
         clean = [str(item).strip() for item in raw if str(item).strip()]
@@ -964,6 +995,15 @@ def _normalise_runtime_config_value(field, value):
         if clean not in {"text", "voice", "voice_and_text", "auto"}:
             raise ValueError("Invalid voice reply mode")
         return clean
+    if field in {"tts_default_speed", "tts_default_pitch", "tts_default_volume"}:
+        try:
+            clean = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid TTS default")
+        minimum, maximum = ({"tts_default_speed": (.8, 1.25), "tts_default_pitch": (.5, 1.5), "tts_default_volume": (.2, 1.0)})[field]
+        if not minimum <= clean <= maximum:
+            raise ValueError("Invalid TTS default")
+        return round(clean, 2)
     if field in {"tts_provider", "tts_fallback_provider"}:
         clean = str(value or "").strip().lower()
         allowed = {"edge", "browser"} if field == "tts_provider" else {"edge", "browser", "none"}
@@ -1675,6 +1715,27 @@ def model_router():
     return ModelRouter(conn, config["fast_model"], [config["strong_model"]], config["vision_model"])
 
 
+def resolved_chat_models(chat_id):
+    """Resolve the effective chat route with a reversible global FORCE layer."""
+    config = runtime_config_values()
+    forced = str(config.get("global_force_model") or "").strip()
+    if config.get("global_model_mode") == "force" and forced:
+        return {"primary": forced, "fallback": "", "source": "ADMIN_FORCE", "forced": True}
+    selected = model_router().resolve(chat_id, "chat")
+    return {**selected, "source": "ROUTER", "forced": False}
+
+
+def chat_model_candidates(chat_id):
+    """Return the exact outbound model order; FORCE never leaks to another model."""
+    selected = resolved_chat_models(chat_id)
+    if selected["forced"]:
+        return [selected["primary"]]
+    config = runtime_config_values()
+    return list(dict.fromkeys(model for model in (
+        selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]
+    ) if model))
+
+
 def provider_preferences_for(model):
     """Keep the A/B-tested model/provider routes beside the normal router.
 
@@ -1742,9 +1803,10 @@ def add_message(chat_id, role, content):
 
     with conn() as c:
 
-        c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
+        cursor = c.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
 
-                  (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
+                           (chat_id,role,content,datetime.now(timezone.utc).isoformat()))
+        return cursor.lastrowid
 
 
 def conversation_context(chat_id, recent_limit=10, summary_after=18, summary_chars=5000):
@@ -2200,6 +2262,9 @@ def set_shared_vision_model(model):
 def vision_models_for(chat_id):
     """Resolve Vision independently from chat models and key ownership."""
     config = runtime_config_values()
+    forced = str(config.get("global_force_vision_model") or "").strip()
+    if config.get("global_vision_mode") == "force" and forced:
+        return [forced]
     if not has_personal_api_key(chat_id):
         primary = shared_vision_model()
         return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
@@ -2208,7 +2273,7 @@ def vision_models_for(chat_id):
 
 
 def effective_user_ai_config(chat_id):
-    """Explain the existing USER -> ADMIN -> ENV -> DEFAULT resolution safely."""
+    """Explain ADMIN_FORCE -> USER -> ADMIN -> ENV -> DEFAULT resolution."""
     snapshot = runtime_config_snapshot()
     fields = snapshot["fields"]
     try:
@@ -2232,10 +2297,16 @@ def effective_user_ai_config(chat_id):
     if not vision_is_user and effective_vision != vision_default["value"]:
         # Compatibility value written by the previous admin Vision screen.
         vision_source = "ADMIN"
+    global_model_mode = fields.get("global_model_mode", {"value": "auto"})["value"]
+    global_force_model = str(fields.get("global_force_model", {"value": ""})["value"] or "").strip()
+    model_forced = global_model_mode == "force" and bool(global_force_model)
+    global_vision_mode = fields.get("global_vision_mode", {"value": "auto"})["value"]
+    global_force_vision = str(fields.get("global_force_vision_model", {"value": ""})["value"] or "").strip()
+    vision_forced = global_vision_mode == "force" and bool(global_force_vision)
     return {
         "effective_model": {
-            "value": primary_override or fast["value"],
-            "source": "USER" if primary_override else fast["source"],
+            "value": global_force_model if model_forced else (primary_override or fast["value"]),
+            "source": "ADMIN_FORCE" if model_forced else ("USER" if primary_override else fast["source"]),
         },
         "effective_fallback": {
             "value": fallback_override or strong["value"],
@@ -2243,7 +2314,20 @@ def effective_user_ai_config(chat_id):
         },
         "fast_default": dict(fast),
         "strong_fallback": dict(strong),
-        "vision": {"value": effective_vision, "source": vision_source},
+        "vision": {"value": effective_vision, "source": "ADMIN_FORCE" if vision_forced else vision_source},
+        "global": {
+            "model_mode": "FORCE" if model_forced else "AUTO",
+            "model": global_force_model if model_forced else fast["value"],
+            "model_source": "ADMIN_FORCE" if model_forced else fast["source"],
+            "vision_mode": "FORCE" if vision_forced else "AUTO",
+            "vision": global_force_vision if vision_forced else vision_default["value"],
+            "vision_source": "ADMIN_FORCE" if vision_forced else vision_default["source"],
+        },
+        "personal": {
+            "model_override": primary_override,
+            "vision_override": vision_override,
+            "temporarily_overridden": model_forced and bool(primary_override),
+        },
         "tts": {
             "provider": fields["tts_provider"]["value"],
             "provider_source": fields["tts_provider"]["source"],
@@ -3620,16 +3704,15 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         return
     live = direct_live_request(text)
     if live is not None:
-        add_message(chat_id, "user", text); add_message(chat_id, "assistant", live)
+        add_message(chat_id, "user", text)
+        canonical_message_id = add_message(chat_id, "assistant", live)
         yield {"type": "delta", "text": live}
-        yield {"type": "done", "text": live}
+        yield {"type": "done", "text": live, "canonical_message_id": canonical_message_id}
         return
     context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
     tools = ToolPackResolver().resolve(TOOLS, text)
-    selected = model_router().resolve(chat_id, "chat")
-    config = runtime_config_values()
-    models = list(dict.fromkeys([selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]]))
+    models = chat_model_candidates(chat_id)
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes = []
     for round_index in range(5):
@@ -3687,8 +3770,10 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         calls = message.get("tool_calls") or []
         if not calls:
             answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
-            add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
-            yield {"type": "done", "text": answer, "elapsed_ms": round((time.perf_counter() - started) * 1000)}
+            add_message(chat_id, "user", text)
+            canonical_message_id = add_message(chat_id, "assistant", answer)
+            yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+                   "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
         messages.append(message)
         for call in calls:
@@ -3710,8 +3795,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 yield {"type": "cancelled"}
                 return
     answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
-    add_message(chat_id, "user", text); add_message(chat_id, "assistant", answer)
-    yield {"type": "done", "text": answer}
+    add_message(chat_id, "user", text)
+    canonical_message_id = add_message(chat_id, "assistant", answer)
+    yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id}
 
 
 def mint_mistral_realtime_session():
@@ -3786,7 +3872,7 @@ async def stopped_generation_handler(update, context):
         cancel_active_draft(chat_id, draft_id if isinstance(draft_id, int) else None)
 
 
-async def stream_answer_to_telegram(update, context, text):
+async def stream_answer_to_telegram_draft(update, context, text):
     """Stream one ephemeral draft, then persist exactly one formatted final answer."""
     chat_id = update.effective_chat.id
     draft_id, cancelled = _new_draft_id(), threading.Event()
@@ -3864,16 +3950,165 @@ async def stream_answer_to_telegram(update, context, text):
         unregister_active_draft(chat_id, draft_id)
 
 
+def _telegram_stream_text(chat_id, text):
+    """Render one safe, bounded Telegram bubble from canonical visible text."""
+    visible = sanitize_visible_content(text).strip()
+    if not visible:
+        return ""
+    chunks = TelegramRenderer.chunks(visible)
+    rendered = chunks[0]
+    if len(chunks) > 1:
+        rendered = TelegramRenderer.render(visible[:3600].rstrip() + "\n\n…")
+    available = max(0, reply_emoji_limit(len(visible)) - 1)
+    rendered, _ = animate_configured_emojis(rendered, available)
+    return reply_emoji_prefix(chat_id) + rendered
+
+
+async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="telegram_stream"):
+    """Edit a known message without ever creating a duplicate fallback reply."""
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        started = time.perf_counter()
+        try:
+            result = await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode=TelegramRenderer.parse_mode,
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT, read_timeout=TELEGRAM_READ_TIMEOUT,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT, pool_timeout=TELEGRAM_POOL_TIMEOUT,
+            )
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt)
+            return result
+        except BadRequest as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="BadRequest")
+            message = str(error).casefold()
+            if "message is not modified" in message:
+                return True
+            # Deleted/invalid/inaccessible messages cannot be safely replaced:
+            # a second send could duplicate an edit that Telegram already applied.
+            LOGGER.warning("Telegram stream edit stopped chat_id=%s message_id=%s: %s",
+                           chat_id, message_id, error)
+            return None
+        except RetryAfter as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="RetryAfter")
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                return None
+            await asyncio.sleep(min(2.0, max(0.05, float(error.retry_after))))
+        except (TimedOut, NetworkError) as error:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error=type(error).__name__)
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                return None
+            await asyncio.sleep(0.15 * (2 ** attempt) + secrets.randbelow(80) / 1000)
+        except Forbidden:
+            record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000,
+                                  source=source, attempt=attempt, error="Forbidden")
+            return None
+    return None
+
+
+async def stream_answer_to_telegram(update, context, text):
+    """Deliver one request as one persistent Telegram message edited in place."""
+    chat_id = update.effective_chat.id
+    request_id, cancelled = uuid.uuid4().hex, threading.Event()
+    register_active_draft(chat_id, request_id, cancelled)
+    queue, loop = asyncio.Queue(), asyncio.get_running_loop()
+
+    def produce():
+        try:
+            for event in stream_agent_response(chat_id, text, cancelled):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
+    throttle = AdaptiveDraftThrottle(0.3, 0.5, TELEGRAM_DRAFT_MIN_CHARS)
+    accumulated, final = "", ""
+    canonical_message_id = None
+    telegram_message_id = None
+    sent = None
+    editing_available = True
+    mode = get_mode(chat_id)
+    effective_mode = "voice_and_text" if wants_voice(text) else ("text" if mode == "auto" else mode)
+    wants_text = effective_mode in {"text", "voice_and_text"}
+    wants_audio = effective_mode in {"voice", "voice_and_text"}
+    try:
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            if isinstance(event, Exception):
+                raise event
+            kind = event.get("type")
+            if kind == "delta":
+                accumulated += event.get("text", "")
+                if not wants_text:
+                    continue
+                rendered = _telegram_stream_text(chat_id, accumulated)
+                if not rendered:
+                    continue
+                if sent is None:
+                    sent = await telegram_send_with_retry(
+                        context.bot, source="telegram_stream_initial", chat_id=chat_id,
+                        text=rendered, reply_markup=main_keyboard(),
+                        parse_mode=TelegramRenderer.parse_mode,
+                    )
+                    telegram_message_id = getattr(sent, "message_id", None)
+                    throttle.should_send(accumulated, force=True)
+                elif editing_available and throttle.should_send(accumulated):
+                    editing_available = bool(await telegram_edit_with_retry(
+                        context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                        text=rendered,
+                    ))
+            elif kind == "done":
+                final = event.get("text") or accumulated
+                canonical_message_id = event.get("canonical_message_id")
+            elif kind == "cancelled":
+                cancelled.set()
+
+        if cancelled.is_set():
+            return False
+        final = sanitize_visible_content(final or accumulated).strip()
+        if wants_text and final:
+            rendered = _telegram_stream_text(chat_id, final)
+            if sent is None:
+                sent = await telegram_send_with_retry(
+                    context.bot, source="telegram_stream_initial", chat_id=chat_id,
+                    text=rendered, reply_markup=main_keyboard(),
+                    parse_mode=TelegramRenderer.parse_mode,
+                )
+                telegram_message_id = getattr(sent, "message_id", None)
+            elif editing_available:
+                editing_available = bool(await telegram_edit_with_retry(
+                    context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                    text=rendered, source="telegram_stream_final",
+                ))
+        if wants_audio and final:
+            voice_path = await make_voice(final, chat_id=chat_id)
+            try:
+                with voice_path.open("rb") as voice_file:
+                    await update.effective_message.reply_voice(voice=voice_file)
+            finally:
+                voice_path.unlink(missing_ok=True)
+        TELEGRAM_DELIVERY_CORRELATIONS.append({
+            "request_id": request_id,
+            "canonical_message_id": canonical_message_id,
+            "telegram_message_id": telegram_message_id,
+        })
+        LOGGER.info("Telegram delivery request_id=%s canonical_message_id=%s telegram_message_id=%s",
+                    request_id, canonical_message_id, telegram_message_id)
+        return True
+    finally:
+        cancelled.set()
+        unregister_active_draft(chat_id, request_id)
+
+
 
 def call_or(chat_id, messages,tools=None,tool_choice="auto"):
-
-    selected=model_router().resolve(chat_id, "chat")
-    primary, fallback = selected["primary"], selected["fallback"]
-    # The admin/ENV strong model and catalogue are the live fallback chain.
-    config = runtime_config_values()
-    candidates = [fallback, config["strong_model"], *config["model_catalog"]]
-    models = [primary] + [m for m in candidates if m and m != primary and m not in [primary]]
-    models = list(dict.fromkeys(models))
+    models = chat_model_candidates(chat_id)
 
     last=None
 
@@ -4224,12 +4459,13 @@ def get_voice_preferences(chat_id):
     except (TypeError, ValueError):
         saved = {}
     voice = str(saved.get("voice") or runtime["tts_voice"])[:120]
+    defaults = {"speed": float(runtime["tts_default_speed"]), "pitch": float(runtime["tts_default_pitch"]), "volume": float(runtime["tts_default_volume"])}
     try:
-        speed = min(1.25, max(.8, float(saved.get("speed", 1.0))))
-        pitch = min(1.5, max(.5, float(saved.get("pitch", 1.0))))
-        volume = min(1.0, max(.2, float(saved.get("volume", 1.0))))
+        speed = min(1.25, max(.8, float(saved.get("speed", defaults["speed"]))))
+        pitch = min(1.5, max(.5, float(saved.get("pitch", defaults["pitch"]))))
+        volume = min(1.0, max(.2, float(saved.get("volume", defaults["volume"]))))
     except (TypeError, ValueError):
-        speed, pitch, volume = 1.0, 1.0, 1.0
+        speed, pitch, volume = defaults["speed"], defaults["pitch"], defaults["volume"]
     engine = str(runtime["tts_provider"] or "edge").lower()
     return {"voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
             "supports_pitch": engine in {"edge", "browser"}, "supports_volume": engine in {"edge", "browser"}}
@@ -4874,21 +5110,27 @@ async def callback(update,context):
     if q.data == "settings:model":
         current = effective_user_ai_config(q.message.chat_id)
         selected = current["effective_model"]
+        global_config = current["global"]
         lines = [
             "<b>🧠 Модель</b>",
-            f"Сейчас: <code>{html.escape(str(selected['value']))}</code>",
-            f"Источник: <b>{html.escape(str(selected['source']))}</b>",
+            f"🌐 Для всех: <b>{html.escape(global_config['model_mode'])}</b> · <code>{html.escape(str(global_config['model']))}</code>",
+            f"👤 Моя модель: <code>{html.escape(str(current['personal']['model_override'] or 'Авто'))}</code>",
+            f"Effective: <code>{html.escape(str(selected['value']))}</code> · <b>{html.escape(str(selected['source']))}</b>",
             "",
             f"FAST default: <code>{html.escape(str(current['fast_default']['value']))}</code>",
             f"STRONG fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
             "",
             "Выберите модель или вернитесь в автоматический router mode:",
         ]
-        buttons = [[InlineKeyboardButton(
+        models = available_models_for(q.message.chat_id)
+        buttons = [
+            [InlineKeyboardButton("🌐 Auto для всех", callback_data="model:global:auto")],
+            *[[InlineKeyboardButton(f"🌐 Force · {model}", callback_data=f"model:gforce:{model}")] for model in models],
+            [InlineKeyboardButton(
             ("●" if selected["source"] != "USER" else "○") + " Авто",
             callback_data="model:auto",
         )]]
-        for model in available_models_for(q.message.chat_id):
+        for model in models:
             mark = "●" if selected["source"] == "USER" and model == selected["value"] else "○"
             buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
         buttons += [
@@ -4898,6 +5140,24 @@ async def callback(update,context):
         ]
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
+
+    if q.data == "model:global:auto":
+        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "auto")
+        return await q.edit_message_text(
+            "🌐 Глобальная модель возвращена в AUTO. Персональные настройки снова активны.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
+        )
+
+    if q.data.startswith("model:gforce:"):
+        model = q.data.split(":", 2)[2]
+        if model not in available_models_for(q.message.chat_id):
+            return await q.edit_message_text("Модель недоступна.")
+        set_admin_runtime_config(q.message.chat_id, "global_force_model", model)
+        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "force")
+        return await q.edit_message_text(
+            f"🌐 FORCE включён: <code>{html.escape(model)}</code> для всех пользователей.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
+        )
 
     if q.data == "settings:vision":
         cid = q.message.chat_id
@@ -4912,7 +5172,9 @@ async def callback(update,context):
                 [InlineKeyboardButton("↺ Стандартная модель", callback_data="vision:personal:reset")],
             ]
             if cid in ADMIN_CHAT_IDS:
-                buttons.append([InlineKeyboardButton("⚙️ Общая Vision-модель", callback_data="vision:shared:add")])
+                buttons += [[InlineKeyboardButton("👁 Vision AUTO для всех", callback_data="vision:global:auto")],
+                            [InlineKeyboardButton("👁 Vision FORCE для всех", callback_data="vision:global:force")],
+                            [InlineKeyboardButton("⚙️ Общая Vision-модель", callback_data="vision:shared:add")]]
             buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
         else:
             text = ("<b>👁 Vision-модель</b>\n"
@@ -4920,10 +5182,26 @@ async def callback(update,context):
                     "Подключите личный ключ, чтобы выбрать свою модель и оплачивать распознавание отдельно.")
             buttons = []
             if cid in ADMIN_CHAT_IDS:
-                buttons.append([InlineKeyboardButton("⚙️ Изменить общую модель", callback_data="vision:shared:add")])
+                buttons += [[InlineKeyboardButton("👁 Vision AUTO для всех", callback_data="vision:global:auto")],
+                            [InlineKeyboardButton("👁 Vision FORCE для всех", callback_data="vision:global:force")],
+                            [InlineKeyboardButton("⚙️ Изменить общую модель", callback_data="vision:shared:add")]]
             buttons += [[InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
                         [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
         return await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    if q.data == "vision:global:auto":
+        set_admin_runtime_config(q.message.chat_id, "global_vision_mode", "auto")
+        return await q.edit_message_text(
+            "👁 Глобальная Vision-модель возвращена в AUTO.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]),
+        )
+
+    if q.data == "vision:global:force":
+        context.user_data["awaiting_vision_model"] = "global_force"
+        return await q.edit_message_text(
+            "Пришлите точный ID Vision-модели для FORCE-режима всех пользователей.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]),
+        )
 
     if q.data == "vision:personal:add":
         context.user_data["awaiting_vision_model"] = "personal"
@@ -5010,6 +5288,22 @@ async def callback(update,context):
     if q.data == "settings:back":
         await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard(q.message.chat_id))
         return
+
+    if q.data == "settings:voice":
+        text, markup = voice_settings_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    if q.data.startswith("voice:speed:"):
+        if q.data == "voice:speed:noop":
+            return
+        direction = q.data.rsplit(":", 1)[-1]
+        if direction not in {"down", "up"}:
+            return
+        prefs = get_voice_preferences(q.message.chat_id)
+        speed = min(1.25, max(.8, round(prefs["speed"] + (-.1 if direction == "down" else .1), 2)))
+        set_voice_preferences(q.message.chat_id, prefs["voice"], speed, prefs["pitch"], prefs["volume"])
+        text, markup = voice_settings_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
     if q.data in ("menu:mode", "settings:mode"):
         await q.edit_message_text("🔊 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
@@ -5492,14 +5786,16 @@ def settings_keyboard(chat_id=None):
     if chat_id in ADMIN_CHAT_IDS:
         rows = [
             [interface_inline_button("model", "🧠", "Модель", "settings:model"), interface_inline_button("vision", "👁", "Vision", "settings:vision")],
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
+            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
             [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("keys", "🔐", "Управление AI", "settings:keys")],
             [InlineKeyboardButton("✨ Эмодзи", callback_data="settings:emoji")],
             [interface_inline_button("status", "⚙️", "Статус", "settings:status"), interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
     else:
         rows = [
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
+            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
             [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("status", "⚙️", "Статус", "settings:status")],
             [interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
@@ -5702,8 +5998,26 @@ def mode_keyboard(chat_id):
     return live_markup(InlineKeyboardMarkup(rows))
 
 
+def voice_settings_page(chat_id):
+    prefs = get_voice_preferences(chat_id)
+    speed = float(prefs["speed"])
+    rows = [[
+        InlineKeyboardButton("−", callback_data="voice:speed:down" if speed > .8 else "voice:speed:noop"),
+        InlineKeyboardButton(f"{speed:.2f}×", callback_data="voice:speed:noop"),
+        InlineKeyboardButton("+", callback_data="voice:speed:up" if speed < 1.25 else "voice:speed:noop"),
+    ]]
+    if QUICK_ACTIONS_BASE_URL:
+        rows.append([InlineKeyboardButton("Открыть расширенные настройки", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
+    rows.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    text = ("<b>🎙 Голос</b>\n"
+            f"Голос: <code>{html.escape(str(prefs['voice']))}</code>\n"
+            f"Скорость: <b>{speed:.2f}×</b>\n\n"
+            "Тон и громкость доступны в Mini App.")
+    return text, live_markup(InlineKeyboardMarkup(rows))
+
+
 def status_text(chat_id):
-    selected = model_router().resolve(chat_id, "chat")
+    selected = resolved_chat_models(chat_id)
     key_source = "отдельный" if managed_api_key(chat_id) else ("личный" if api_key_status(chat_id) else "общий")
     return ("<b>Noema активна</b>\n"
             f"Model: <code>{html.escape(selected['primary'])}</code>\n"
@@ -5916,9 +6230,16 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text(
                 "Не похож на ID модели. Формат: &lt;провайдер&gt;/&lt;модель&gt;, например <code>google/gemini-2.5-flash</code>.",
                 parse_mode="HTML")
-        if vision_scope == "shared":
+        if vision_scope in {"shared", "global_force"}:
             if cid not in ADMIN_CHAT_IDS:
                 return await update.effective_message.reply_text("Нет доступа к общей Vision-модели.")
+        if vision_scope == "global_force":
+            set_admin_runtime_config(cid, "global_force_vision_model", model)
+            set_admin_runtime_config(cid, "global_vision_mode", "force")
+            return await update.effective_message.reply_text(
+                f"👁 Vision FORCE включён для всех: <code>{html.escape(model)}</code>.",
+                parse_mode="HTML", reply_markup=settings_keyboard(cid))
+        if vision_scope == "shared":
             set_shared_vision_model(model)
             return await update.effective_message.reply_text(
                 f"👁 Общая Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard(cid))
@@ -6086,9 +6407,10 @@ async def text_handler(update,context):
 
 
 
-    if TELEGRAM_DRAFT_STREAMING_ENABLED and update.effective_chat.type == "private":
+    if update.effective_chat.type == "private":
         try:
-            completed = await stream_answer_to_telegram(update, context, t)
+            delivery = stream_answer_to_telegram_draft if TELEGRAM_DRAFT_STREAMING_ENABLED else stream_answer_to_telegram
+            completed = await delivery(update, context, t)
             if completed:
                 await drain_media_outbox(update, context)
         except Exception as e:

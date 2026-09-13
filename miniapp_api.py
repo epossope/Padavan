@@ -24,6 +24,8 @@ def register_miniapp(app, core):
         "wake_ms", "stt_first_partial_ms", "stt_final_ms", "llm_ttft_ms",
         "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
         "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+        "tts_enqueue_ms", "tts_synthesis_start_ms", "tts_synthesis_done_ms",
+        "tts_play_start_ms", "tts_play_end_ms", "tts_playback_gap_ms", "tts_total_ms",
         "speech_text_length_chars", "total_response_start_ms", "total_ms",
     }
     client_voice_robustness_metrics = {
@@ -123,14 +125,22 @@ def register_miniapp(app, core):
         values = args.get("metrics")
         if not isinstance(values, dict) or len(values) > len(client_telemetry_metrics):
             raise ValueError("Некорректная телеметрия")
-        clean = {}
+        clean = []
         for name, value in values.items():
-            if name not in client_telemetry_metrics or isinstance(value, bool) or not isinstance(value, (int, float)):
+            if name not in client_telemetry_metrics:
                 raise ValueError("Некорректная телеметрия")
-            value = float(value)
-            if not 0 <= value <= 900000:
+            samples = value if isinstance(value, list) else [value]
+            if not samples or len(samples) > 80:
                 raise ValueError("Некорректная телеметрия")
-            clean[name] = value
+            for sample in samples:
+                if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+                    raise ValueError("Некорректная телеметрия")
+                sample = float(sample)
+                if not 0 <= sample <= 900000:
+                    raise ValueError("Некорректная телеметрия")
+                clean.append((name, sample))
+        if len(clean) > 400:
+            raise ValueError("Некорректная телеметрия")
         return clean
 
     async def register_signed_user(user):
@@ -200,7 +210,7 @@ def register_miniapp(app, core):
                 result = await asyncio.to_thread(state, cid, args)
             elif action == "telemetry_record":
                 # Store numeric timings only.  No user text, audio, identifiers or secrets enter telemetry.
-                for name, value in telemetry_values(args).items():
+                for name, value in telemetry_values(args):
                     core.record_runtime_metric(name, value)
                 result = {"enabled": bool(getattr(core, "TELEMETRY_ENABLED", False))}
             elif action in {"telemetry_export", "telemetry_reset"}:
