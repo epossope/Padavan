@@ -871,6 +871,8 @@ def set_app_setting(key, value, updated_by=None):
 
 RUNTIME_CONFIG_KEY = "admin_runtime_config_v1"
 RUNTIME_CONFIG_FIELDS = (
+    "global_model_mode", "global_force_model",
+    "global_vision_mode", "global_force_vision_model",
     "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
     "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
     "vision_model", "vision_fallback_models", "batch_stt_model",
@@ -888,6 +890,10 @@ def _env_is_set(*names):
 def _runtime_env_defaults():
     """Safe startup values and their provenance; no secrets are represented here."""
     return {
+        "global_model_mode": (os.getenv("GLOBAL_MODEL_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_MODEL_MODE") else "DEFAULT"),
+        "global_force_model": (os.getenv("GLOBAL_FORCE_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_MODEL") else "DEFAULT"),
+        "global_vision_mode": (os.getenv("GLOBAL_VISION_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_VISION_MODE") else "DEFAULT"),
+        "global_force_vision_model": (os.getenv("GLOBAL_FORCE_VISION_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_VISION_MODEL") else "DEFAULT"),
         "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL", "MODEL") else "DEFAULT"),
         "fast_model_providers": (list(FAST_MODEL_PROVIDERS), "ENV" if _env_is_set("FAST_MODEL_PROVIDERS") else "DEFAULT"),
         "fast_model_allow_provider_fallback": (FAST_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("FAST_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
@@ -946,6 +952,16 @@ def _normalise_runtime_config_value(field, value):
         clean = str(value or "").strip()
         if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
             raise ValueError("Invalid model or voice value")
+        return clean
+    if field in {"global_force_model", "global_force_vision_model"}:
+        clean = str(value or "").strip()
+        if clean and not _MODEL_VALUE_RE.fullmatch(clean):
+            raise ValueError("Invalid forced model value")
+        return clean
+    if field in {"global_model_mode", "global_vision_mode"}:
+        clean = str(value or "").strip().lower()
+        if clean not in {"auto", "force"}:
+            raise ValueError("Invalid global model mode")
         return clean
     if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models", "model_catalog"}:
         raw = value if isinstance(value, list) else str(value or "").split(",")
@@ -1677,6 +1693,27 @@ def model_router():
     return ModelRouter(conn, config["fast_model"], [config["strong_model"]], config["vision_model"])
 
 
+def resolved_chat_models(chat_id):
+    """Resolve the effective chat route with a reversible global FORCE layer."""
+    config = runtime_config_values()
+    forced = str(config.get("global_force_model") or "").strip()
+    if config.get("global_model_mode") == "force" and forced:
+        return {"primary": forced, "fallback": "", "source": "ADMIN_FORCE", "forced": True}
+    selected = model_router().resolve(chat_id, "chat")
+    return {**selected, "source": "ROUTER", "forced": False}
+
+
+def chat_model_candidates(chat_id):
+    """Return the exact outbound model order; FORCE never leaks to another model."""
+    selected = resolved_chat_models(chat_id)
+    if selected["forced"]:
+        return [selected["primary"]]
+    config = runtime_config_values()
+    return list(dict.fromkeys(model for model in (
+        selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]
+    ) if model))
+
+
 def provider_preferences_for(model):
     """Keep the A/B-tested model/provider routes beside the normal router.
 
@@ -2203,6 +2240,9 @@ def set_shared_vision_model(model):
 def vision_models_for(chat_id):
     """Resolve Vision independently from chat models and key ownership."""
     config = runtime_config_values()
+    forced = str(config.get("global_force_vision_model") or "").strip()
+    if config.get("global_vision_mode") == "force" and forced:
+        return [forced]
     if not has_personal_api_key(chat_id):
         primary = shared_vision_model()
         return [primary] + [m for m in config["vision_fallback_models"] if m != primary]
@@ -2211,7 +2251,7 @@ def vision_models_for(chat_id):
 
 
 def effective_user_ai_config(chat_id):
-    """Explain the existing USER -> ADMIN -> ENV -> DEFAULT resolution safely."""
+    """Explain ADMIN_FORCE -> USER -> ADMIN -> ENV -> DEFAULT resolution."""
     snapshot = runtime_config_snapshot()
     fields = snapshot["fields"]
     try:
@@ -2235,10 +2275,16 @@ def effective_user_ai_config(chat_id):
     if not vision_is_user and effective_vision != vision_default["value"]:
         # Compatibility value written by the previous admin Vision screen.
         vision_source = "ADMIN"
+    global_model_mode = fields.get("global_model_mode", {"value": "auto"})["value"]
+    global_force_model = str(fields.get("global_force_model", {"value": ""})["value"] or "").strip()
+    model_forced = global_model_mode == "force" and bool(global_force_model)
+    global_vision_mode = fields.get("global_vision_mode", {"value": "auto"})["value"]
+    global_force_vision = str(fields.get("global_force_vision_model", {"value": ""})["value"] or "").strip()
+    vision_forced = global_vision_mode == "force" and bool(global_force_vision)
     return {
         "effective_model": {
-            "value": primary_override or fast["value"],
-            "source": "USER" if primary_override else fast["source"],
+            "value": global_force_model if model_forced else (primary_override or fast["value"]),
+            "source": "ADMIN_FORCE" if model_forced else ("USER" if primary_override else fast["source"]),
         },
         "effective_fallback": {
             "value": fallback_override or strong["value"],
@@ -2246,7 +2292,20 @@ def effective_user_ai_config(chat_id):
         },
         "fast_default": dict(fast),
         "strong_fallback": dict(strong),
-        "vision": {"value": effective_vision, "source": vision_source},
+        "vision": {"value": effective_vision, "source": "ADMIN_FORCE" if vision_forced else vision_source},
+        "global": {
+            "model_mode": "FORCE" if model_forced else "AUTO",
+            "model": global_force_model if model_forced else fast["value"],
+            "model_source": "ADMIN_FORCE" if model_forced else fast["source"],
+            "vision_mode": "FORCE" if vision_forced else "AUTO",
+            "vision": global_force_vision if vision_forced else vision_default["value"],
+            "vision_source": "ADMIN_FORCE" if vision_forced else vision_default["source"],
+        },
+        "personal": {
+            "model_override": primary_override,
+            "vision_override": vision_override,
+            "temporarily_overridden": model_forced and bool(primary_override),
+        },
         "tts": {
             "provider": fields["tts_provider"]["value"],
             "provider_source": fields["tts_provider"]["source"],
@@ -3631,9 +3690,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
     tools = ToolPackResolver().resolve(TOOLS, text)
-    selected = model_router().resolve(chat_id, "chat")
-    config = runtime_config_values()
-    models = list(dict.fromkeys([selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]]))
+    models = chat_model_candidates(chat_id)
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes = []
     for round_index in range(5):
@@ -4029,14 +4086,7 @@ async def stream_answer_to_telegram(update, context, text):
 
 
 def call_or(chat_id, messages,tools=None,tool_choice="auto"):
-
-    selected=model_router().resolve(chat_id, "chat")
-    primary, fallback = selected["primary"], selected["fallback"]
-    # The admin/ENV strong model and catalogue are the live fallback chain.
-    config = runtime_config_values()
-    candidates = [fallback, config["strong_model"], *config["model_catalog"]]
-    models = [primary] + [m for m in candidates if m and m != primary and m not in [primary]]
-    models = list(dict.fromkeys(models))
+    models = chat_model_candidates(chat_id)
 
     last=None
 
@@ -5037,21 +5087,27 @@ async def callback(update,context):
     if q.data == "settings:model":
         current = effective_user_ai_config(q.message.chat_id)
         selected = current["effective_model"]
+        global_config = current["global"]
         lines = [
             "<b>🧠 Модель</b>",
-            f"Сейчас: <code>{html.escape(str(selected['value']))}</code>",
-            f"Источник: <b>{html.escape(str(selected['source']))}</b>",
+            f"🌐 Для всех: <b>{html.escape(global_config['model_mode'])}</b> · <code>{html.escape(str(global_config['model']))}</code>",
+            f"👤 Моя модель: <code>{html.escape(str(current['personal']['model_override'] or 'Авто'))}</code>",
+            f"Effective: <code>{html.escape(str(selected['value']))}</code> · <b>{html.escape(str(selected['source']))}</b>",
             "",
             f"FAST default: <code>{html.escape(str(current['fast_default']['value']))}</code>",
             f"STRONG fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
             "",
             "Выберите модель или вернитесь в автоматический router mode:",
         ]
-        buttons = [[InlineKeyboardButton(
+        models = available_models_for(q.message.chat_id)
+        buttons = [
+            [InlineKeyboardButton("🌐 Auto для всех", callback_data="model:global:auto")],
+            *[[InlineKeyboardButton(f"🌐 Force · {model}", callback_data=f"model:gforce:{model}")] for model in models],
+            [InlineKeyboardButton(
             ("●" if selected["source"] != "USER" else "○") + " Авто",
             callback_data="model:auto",
         )]]
-        for model in available_models_for(q.message.chat_id):
+        for model in models:
             mark = "●" if selected["source"] == "USER" and model == selected["value"] else "○"
             buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
         buttons += [
@@ -5061,6 +5117,24 @@ async def callback(update,context):
         ]
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
+
+    if q.data == "model:global:auto":
+        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "auto")
+        return await q.edit_message_text(
+            "🌐 Глобальная модель возвращена в AUTO. Персональные настройки снова активны.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
+        )
+
+    if q.data.startswith("model:gforce:"):
+        model = q.data.split(":", 2)[2]
+        if model not in available_models_for(q.message.chat_id):
+            return await q.edit_message_text("Модель недоступна.")
+        set_admin_runtime_config(q.message.chat_id, "global_force_model", model)
+        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "force")
+        return await q.edit_message_text(
+            f"🌐 FORCE включён: <code>{html.escape(model)}</code> для всех пользователей.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
+        )
 
     if q.data == "settings:vision":
         cid = q.message.chat_id
@@ -5075,7 +5149,9 @@ async def callback(update,context):
                 [InlineKeyboardButton("↺ Стандартная модель", callback_data="vision:personal:reset")],
             ]
             if cid in ADMIN_CHAT_IDS:
-                buttons.append([InlineKeyboardButton("⚙️ Общая Vision-модель", callback_data="vision:shared:add")])
+                buttons += [[InlineKeyboardButton("👁 Vision AUTO для всех", callback_data="vision:global:auto")],
+                            [InlineKeyboardButton("👁 Vision FORCE для всех", callback_data="vision:global:force")],
+                            [InlineKeyboardButton("⚙️ Общая Vision-модель", callback_data="vision:shared:add")]]
             buttons.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
         else:
             text = ("<b>👁 Vision-модель</b>\n"
@@ -5083,10 +5159,26 @@ async def callback(update,context):
                     "Подключите личный ключ, чтобы выбрать свою модель и оплачивать распознавание отдельно.")
             buttons = []
             if cid in ADMIN_CHAT_IDS:
-                buttons.append([InlineKeyboardButton("⚙️ Изменить общую модель", callback_data="vision:shared:add")])
+                buttons += [[InlineKeyboardButton("👁 Vision AUTO для всех", callback_data="vision:global:auto")],
+                            [InlineKeyboardButton("👁 Vision FORCE для всех", callback_data="vision:global:force")],
+                            [InlineKeyboardButton("⚙️ Изменить общую модель", callback_data="vision:shared:add")]]
             buttons += [[InlineKeyboardButton("🔐 API-ключи", callback_data="settings:keys")],
                         [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]
         return await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+    if q.data == "vision:global:auto":
+        set_admin_runtime_config(q.message.chat_id, "global_vision_mode", "auto")
+        return await q.edit_message_text(
+            "👁 Глобальная Vision-модель возвращена в AUTO.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]),
+        )
+
+    if q.data == "vision:global:force":
+        context.user_data["awaiting_vision_model"] = "global_force"
+        return await q.edit_message_text(
+            "Пришлите точный ID Vision-модели для FORCE-режима всех пользователей.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]),
+        )
 
     if q.data == "vision:personal:add":
         context.user_data["awaiting_vision_model"] = "personal"
@@ -5866,7 +5958,7 @@ def mode_keyboard(chat_id):
 
 
 def status_text(chat_id):
-    selected = model_router().resolve(chat_id, "chat")
+    selected = resolved_chat_models(chat_id)
     key_source = "отдельный" if managed_api_key(chat_id) else ("личный" if api_key_status(chat_id) else "общий")
     return ("<b>Noema активна</b>\n"
             f"Model: <code>{html.escape(selected['primary'])}</code>\n"
@@ -6079,9 +6171,16 @@ async def text_handler(update,context):
             return await update.effective_message.reply_text(
                 "Не похож на ID модели. Формат: &lt;провайдер&gt;/&lt;модель&gt;, например <code>google/gemini-2.5-flash</code>.",
                 parse_mode="HTML")
-        if vision_scope == "shared":
+        if vision_scope in {"shared", "global_force"}:
             if cid not in ADMIN_CHAT_IDS:
                 return await update.effective_message.reply_text("Нет доступа к общей Vision-модели.")
+        if vision_scope == "global_force":
+            set_admin_runtime_config(cid, "global_force_vision_model", model)
+            set_admin_runtime_config(cid, "global_vision_mode", "force")
+            return await update.effective_message.reply_text(
+                f"👁 Vision FORCE включён для всех: <code>{html.escape(model)}</code>.",
+                parse_mode="HTML", reply_markup=settings_keyboard(cid))
+        if vision_scope == "shared":
             set_shared_vision_model(model)
             return await update.effective_message.reply_text(
                 f"👁 Общая Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard(cid))

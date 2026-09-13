@@ -61,6 +61,92 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             bot._normalise_runtime_config_value("tts_provider", "unknown-provider")
         self.assertEqual(bot._normalise_runtime_config_value("model_catalog", "one/model, two/model"), ["one/model", "two/model"])
+        self.assertEqual(bot._normalise_runtime_config_value("global_model_mode", "FORCE"), "force")
+        self.assertEqual(bot._normalise_runtime_config_value("global_force_model", "vendor/model"), "vendor/model")
+
+    def test_global_force_routes_real_multiuser_outbound_requests_and_restores_overrides(self):
+        database = sqlite3.connect(":memory:", check_same_thread=False)
+        database.row_factory = sqlite3.Row
+        database.execute("CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '')")
+        database.executemany("INSERT INTO user_settings(chat_id,primary_model) VALUES(?,?)", [(101, "qwen/user-a"), (102, "deepseek/user-b")])
+        router = bot.ModelRouter(lambda: database, "router/fast", ["router/strong"], "vision/default")
+        config = {"global_model_mode": "auto", "global_force_model": "", "fast_model": "router/fast",
+                  "strong_model": "router/strong", "model_catalog": [], "global_vision_mode": "auto",
+                  "global_force_vision_model": "", "vision_fallback_models": []}
+        outbound = []
+
+        def response_for(_chat_id, model, _messages, _tools=None, _tool_choice="auto"):
+            outbound.append(model)
+            response = Mock(ok=True, status_code=200)
+            response.iter_lines.return_value = [b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}', b'data: [DONE]']
+            return response
+
+        common = [patch.object(bot, "runtime_config_values", side_effect=lambda: dict(config)),
+                  patch.object(bot, "model_router", return_value=router),
+                  patch.object(bot, "direct_live_request", return_value=None),
+                  patch.object(bot, "conversation_context", return_value=[]),
+                  patch.object(bot, "system_prompt", return_value="system"),
+                  patch.object(bot, "request_chat_stream", side_effect=response_for),
+                  patch.object(bot, "record_usage"), patch.object(bot, "add_message", side_effect=range(1, 100))]
+        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7]:
+            for user in (100, 101, 102):
+                list(bot.stream_agent_response(user, "test"))
+            self.assertEqual(outbound, ["router/fast", "qwen/user-a", "deepseek/user-b"])
+            outbound.clear();config["global_model_mode"] = "force";config["global_force_model"] = "global/model-x"
+            for user in (100, 101, 102):
+                list(bot.stream_agent_response(user, "test"))
+            self.assertEqual(outbound, ["global/model-x"] * 3)
+            outbound.clear();config["global_model_mode"] = "auto"
+            for user in (100, 101, 102):
+                list(bot.stream_agent_response(user, "test"))
+            self.assertEqual(outbound, ["router/fast", "qwen/user-a", "deepseek/user-b"])
+        database.close()
+
+    def test_global_vision_force_is_used_by_real_outbound_request_for_every_user(self):
+        config = {"global_vision_mode": "force", "global_force_vision_model": "vision/global-y",
+                  "vision_model": "vision/default", "vision_fallback_models": []}
+        outbound = []
+
+        def vision_response(chat_id, model, _messages):
+            outbound.append((chat_id, model))
+            response = Mock(ok=True, status_code=200)
+            response.json.return_value = {"choices": [{"message": {"content": "Описание"}}]}
+            return response
+
+        handle = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        handle.write(b"image");handle.close()
+        try:
+            with patch.object(bot, "runtime_config_values", side_effect=lambda: dict(config)), \
+                 patch.object(bot, "request_vision", side_effect=vision_response), \
+                 patch.object(bot, "api_key_for_chat", return_value=("key", "shared")), \
+                 patch.object(bot, "record_usage"):
+                for user in (100, 101, 102):
+                    self.assertEqual(bot.describe_image(user, handle.name), "Описание")
+            self.assertEqual(outbound, [(100, "vision/global-y"), (101, "vision/global-y"), (102, "vision/global-y")])
+        finally:
+            Path(handle.name).unlink(missing_ok=True)
+
+    def test_global_vision_force_is_used_by_real_request_then_auto_restores(self):
+        config = {"global_vision_mode": "force", "global_force_vision_model": "vision/global-y",
+                  "vision_fallback_models": [], "vision_model": "vision/default"}
+        outbound = []
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content": "Описание"}}], "usage": {}}
+        image = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        image.write(b"image");image.close()
+        try:
+            with patch.object(bot, "runtime_config_values", side_effect=lambda: dict(config)), \
+                 patch.object(bot, "request_vision", side_effect=lambda cid, model, messages: outbound.append(model) or response), \
+                 patch.object(bot, "record_usage"), patch.object(bot, "api_key_for_chat", return_value=("key", "shared")):
+                self.assertEqual(bot.describe_image(101, image.name), "Описание")
+                self.assertEqual(outbound, ["vision/global-y"])
+                outbound.clear();config["global_vision_mode"] = "auto"
+                with patch.object(bot, "has_personal_api_key", return_value=False), \
+                     patch.object(bot, "shared_vision_model", return_value="vision/default"):
+                    self.assertEqual(bot.describe_image(102, image.name), "Описание")
+                self.assertEqual(outbound, ["vision/default"])
+        finally:
+            Path(image.name).unlink(missing_ok=True)
 
     def test_batch_stt_env_prefers_canonical_name_then_one_release_alias(self):
         values = {"BATCH_STT_MODEL": "canonical-model", "STT_MODEL": "legacy-model"}

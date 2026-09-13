@@ -13,6 +13,7 @@ Amvera должна содержать только переменные из `U
 | `OPENROUTER_API_KEY` | Общий ключ LLM и batch STT | Required secret |
 | `QUICK_ACTIONS_BASE_URL` | Публичный HTTPS origin Mini App | Required, если Mini App включён |
 | `ADMIN_CHAT_IDS` | Доступ к admin telemetry и Realtime Beta | Optional |
+| `GLOBAL_MODEL_MODE`, `GLOBAL_FORCE_MODEL`, `GLOBAL_VISION_MODE`, `GLOBAL_FORCE_VISION_MODEL` | Bootstrap глобальных AUTO/FORCE режимов | Optional; editable live admin, defaults AUTO |
 | `FAST_MODEL`, `FAST_MODEL_PROVIDERS`, `FAST_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для fast router | Optional; editable live admin |
 | `STRONG_MODEL`, `STRONG_MODEL_PROVIDERS`, `STRONG_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для strong fallback | Optional; editable live admin |
 | `MODEL_CATALOG`, `CHAT_MAX_TOKENS` | Allowed model catalogue и лимит | Optional; catalogue editable live admin |
@@ -67,7 +68,7 @@ It uses the existing `app_settings` SQLite storage, stores only safe model and
 voice values plus `updated_at` / `updated_by`, and immediately affects new
 requests without a restart. It never reads, displays or copies secrets.
 
-Effective precedence is: user-specific model/reply preference → admin override
+Effective model precedence is: global `ADMIN_FORCE` → user-specific override → admin default
 → ENV bootstrap default → built-in default. `Reset to ENV` removes only the
 admin override for that field. The live-editable fields are FAST/STRONG model
 routes, Vision, batch STT model, TTS provider/fallback/voice, default voice
