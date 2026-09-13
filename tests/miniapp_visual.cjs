@@ -110,9 +110,9 @@ const visualFixture={
    if(width<=430&&route==='settings'&&(await page.locator('.settings-stack .setting').first().boundingBox()).height>46)errors.push(`Settings rows are visually oversized ${width}`);
    if(route==='chat'){
     const box=await page.locator('.composer').boundingBox(),inputArea=await page.locator('.chat-input-area').boundingBox();if(height-box.y-box.height>40)errors.push(`Composer not bottom anchored ${width}`);
-    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x<inputArea.x+inputArea.width-1||sphere.x+sphere.width>width+2||sphere.y+sphere.height<inputArea.y+inputArea.height+4||sphere.y+sphere.height>inputArea.y+inputArea.height+16)errors.push(`Chat sphere is not the separate bottom-aligned composer end ${width}`);
-    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>{const composer=el.closest('.chat-composer'),input=document.querySelector('.chat-input-area'),canvas=el.querySelector('canvas'),style=getComputedStyle(el),canvasStyle=getComputedStyle(canvas);return {width:style.width,hasCanvas:Boolean(canvas),isLast:el.closest('.chat-sphere-slot')===el.parentElement,borderRight:getComputedStyle(input).borderRightWidth,composerWidth:composer.getBoundingClientRect().width,contentWidth:document.querySelector('#content').getBoundingClientRect().width,inputWidth:input.getBoundingClientRect().width,slotWidth:el.closest('.chat-sphere-slot').getBoundingClientRect().width,grid:getComputedStyle(composer).gridTemplateColumns,orbBackground:style.backgroundImage,orbFilter:style.filter,canvasBackground:canvasStyle.backgroundImage,canvasFilter:canvasStyle.filter,wrap:getComputedStyle(document.querySelector('#chat-input')).overflowWrap}});
-    if(Number.parseFloat(sphereStyle.width)<76||Number.parseFloat(sphereStyle.width)>92||box.height<78||!sphereStyle.hasCanvas||!sphereStyle.isLast||sphereStyle.borderRight!=='0px'||Math.abs(sphereStyle.composerWidth-sphereStyle.contentWidth)>1||Math.abs(sphereStyle.inputWidth+sphereStyle.slotWidth-sphereStyle.composerWidth)>1||sphereStyle.orbBackground!=='none'||sphereStyle.orbFilter!=='none'||sphereStyle.canvasBackground!=='none'||sphereStyle.canvasFilter!=='none'||sphereStyle.wrap!=='anywhere')errors.push(`Chat voice sphere/grid composer contract failed ${width}: ${JSON.stringify(sphereStyle)}`);
+    const sphere=await page.locator('.composer .chat-voice-orb').boundingBox();if(sphere.x<box.x+box.width-sphere.width-11||sphere.x+sphere.width>box.x+box.width||sphere.y+sphere.height<box.y+box.height+4||sphere.y+sphere.height>box.y+box.height+10)errors.push(`Chat sphere is not integrated at the composer bottom ${width}`);
+    const sphereStyle=await page.locator('.composer .chat-voice-orb').evaluate(el=>{const composer=el.closest('.chat-composer'),input=document.querySelector('.chat-input-area'),textarea=document.querySelector('#chat-input'),canvas=el.querySelector('canvas'),style=getComputedStyle(el),canvasStyle=getComputedStyle(canvas),composerStyle=getComputedStyle(composer),textareaStyle=getComputedStyle(textarea);return {width:style.width,hasCanvas:Boolean(canvas),isDirect:el.parentElement===composer,composerWidth:composer.getBoundingClientRect().width,contentWidth:document.querySelector('#content').getBoundingClientRect().width,inputWidth:input.getBoundingClientRect().width,textareaWidth:textarea.getBoundingClientRect().width,paddingRight:textareaStyle.paddingRight,composerBackground:composerStyle.backgroundImage,composerBorder:composerStyle.borderTopWidth,composerRadius:composerStyle.borderRadius,orbBackground:style.backgroundImage,orbFilter:style.filter,canvasBackground:canvasStyle.backgroundImage,canvasFilter:canvasStyle.filter,wrap:textareaStyle.overflowWrap,scrollbar:textareaStyle.scrollbarWidth}});
+    if(Number.parseFloat(sphereStyle.width)<76||Number.parseFloat(sphereStyle.width)>92||box.height<56||!sphereStyle.hasCanvas||!sphereStyle.isDirect||Math.abs(sphereStyle.composerWidth-sphereStyle.contentWidth)>1||Math.abs(sphereStyle.inputWidth-sphereStyle.composerWidth)>3||Math.abs(sphereStyle.textareaWidth-sphereStyle.inputWidth)>1||Number.parseFloat(sphereStyle.paddingRight)<Number.parseFloat(sphereStyle.width)+14||sphereStyle.composerBackground==='none'||sphereStyle.composerBorder==='0px'||Number.parseFloat(sphereStyle.composerRadius)<20||sphereStyle.orbBackground!=='none'||sphereStyle.orbFilter!=='none'||sphereStyle.canvasBackground!=='none'||sphereStyle.canvasFilter!=='none'||sphereStyle.wrap!=='anywhere'||sphereStyle.scrollbar!=='none')errors.push(`Chat integrated composer contract failed ${width}: ${JSON.stringify(sphereStyle)}`);
     const stateGeometry=await page.evaluate(async()=>{const orb=document.querySelector('.chat-voice-orb'),states={};for(const state of ['idle','listening','thinking','responding']){window.NoemaMembrane?.setState(state);await new Promise(resolve=>requestAnimationFrame(resolve));const rect=orb.getBoundingClientRect();states[state]=[rect.x,rect.y,rect.width,rect.height]}return states});
     if(new Set(Object.values(stateGeometry).map(value=>value.join(','))).size!==1)errors.push(`Chat sphere state changed layout ${width}: ${JSON.stringify(stateGeometry)}`);
     if(await page.locator('#notice.visible').count())errors.push(`Chat uses a separate status strip ${width}`);
@@ -135,7 +135,7 @@ const visualFixture={
     const sendPinsBottom=await page.evaluate(()=>{const t=document.querySelector('.chat');t.scrollTop=0;t.dispatchEvent(new Event('scroll'));return new Promise(resolve=>requestAnimationFrame(()=>{window.NoemaChatScroll.addPendingUser('Моё новое сообщение');requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(t.scrollHeight-t.scrollTop-t.clientHeight<=2)))}));});
     if(!sendPinsBottom)errors.push(`Chat send did not restore bottom follow ${width}`);
     const composerCases=await page.evaluate(()=>{const input=document.querySelector('#chat-input'),measure=value=>{input.value=value;input.dispatchEvent(new Event('input',{bubbles:true}));return {height:input.getBoundingClientRect().height,clientHeight:input.clientHeight,scrollHeight:input.scrollHeight,scrollWidth:input.scrollWidth,clientWidth:input.clientWidth,composer:input.closest('.composer').getBoundingClientRect().height}};return {empty:measure(''),short:measure('Короткая фраза'),word:measure('оченьдлинноесловобезпробелов'.repeat(12)),two:measure('Первая строка\nВторая строка'),five:measure('1\n2\n3\n4\n5'),overflow:measure('1\n2\n3\n4\n5\n6\n7\n8')}});
-    if(composerCases.empty.height>54||composerCases.short.height>54||composerCases.word.scrollWidth>composerCases.word.clientWidth+1||composerCases.two.height<=composerCases.empty.height||composerCases.five.height>122||composerCases.overflow.height>122||composerCases.overflow.scrollHeight<=composerCases.overflow.clientHeight||composerCases.two.composer<=52)errors.push(`Chat textarea sizing regressed ${width}: ${JSON.stringify(composerCases)}`);
+    if(composerCases.empty.height>58||composerCases.short.height>58||composerCases.word.scrollWidth>composerCases.word.clientWidth+1||composerCases.two.height<=composerCases.empty.height||composerCases.five.height>122||composerCases.overflow.height>122||composerCases.overflow.scrollHeight<=composerCases.overflow.clientHeight||composerCases.two.composer<=58)errors.push(`Chat textarea sizing regressed ${width}: ${JSON.stringify(composerCases)}`);
    }
    if(route==='home'){
     if(await page.locator('#header .utilities button').count()!==1||await page.locator('#header [data-page="settings"]').count()!==1)errors.push(`Home header is not Noema plus Settings only ${width}`);
@@ -147,11 +147,11 @@ const visualFixture={
      const focusShape=await page.locator('#dock .focus-pill').evaluate(el=>({body:getComputedStyle(el).borderRadius,organic:getComputedStyle(el,'::before').backgroundImage}));
      await page.evaluate(()=>scrollTo(0,document.documentElement.scrollHeight));await page.waitForTimeout(50);
      const last=await page.locator('.home-grid>[data-widget]').last().boundingBox(),dock=await page.locator('#dock').boundingBox();
-     if(tile.height>145||boxes[1].width>120||last.y+last.height>dock.y+2||focusShape.body!=='0px'||focusShape.organic==='none')errors.push(`Home density, organic focus, or dock safe-zone regressed ${width}`);
+     if(tile.height<148||tile.height>156||boxes[1].width>120||last.y+last.height>dock.y+2||focusShape.body!=='0px'||focusShape.organic==='none')errors.push(`Home density, organic focus, or dock safe-zone regressed ${width}`);
      await page.evaluate(()=>scrollTo(0,0));
     }
    }
-   if(width===390){
+   if(width===390&&process.env.NOEMA_CAPTURE_PREVIEWS==='1'){
     await page.screenshot({path:path.resolve('miniapp',`preview-${route}.png`),fullPage:false});
     if(['chat','archive','budget','notes','people'].includes(route)){
      await page.screenshot({path:path.resolve('ui-proof','ui-polish-v1.2',`after-${route}.png`),fullPage:false});
@@ -196,7 +196,7 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:b.x+b.width/2,y:b.y+b.height/2}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.locator('.grid>[data-widget]').first().getAttribute('data-widget')!=='next_event')errors.push('Touch drag failed');
- for(const startX of [2,10,18]){
+ for(const startX of [10,30,50,80]){
   await touch.evaluate(()=>go('archive'));
   await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:startX,y:220}]});
   await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:startX+100,y:226}]});
@@ -206,11 +206,11 @@ const visualFixture={
   if(await touch.evaluate(()=>page)!=='home')errors.push(`Edge swipe from ${startX}px did not return to the preceding screen`);
  }
  await touch.evaluate(()=>go('archive'));
- await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
- await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:130,y:226}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:100,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:200,y:226}]});
  const outsideEdgeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(220);
- if(outsideEdgeOffset!=='none'||await touch.evaluate(()=>page)!=='archive')errors.push('Swipe beginning at 30px incorrectly acquired the back gesture');
+ if(outsideEdgeOffset!=='none'||await touch.evaluate(()=>page)!=='archive')errors.push('Swipe beginning at 100px incorrectly acquired the back gesture');
  await touch.evaluate(()=>go('archive'));
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:8,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:74,y:224}]});
@@ -222,6 +222,27 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:12,y:350}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
  if(await touch.evaluate(()=>page)!=='archive')errors.push('Vertical scroll was mistaken for an edge swipe');
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
+ for(const x of [46,64,88,126]){await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x,y:224}]});await touch.waitForTimeout(45)}
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+ if(await touch.evaluate(()=>page)!=='home')errors.push('Slow edge swipe did not commit');
+ await touch.evaluate(()=>go('archive'));
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:66,y:222}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+ if(await touch.evaluate(()=>page)!=='home')errors.push('Fast edge flick did not commit');
+ await touch.evaluate(()=>go('chat'));
+ const chatInputBox=await touch.locator('#chat-input').boundingBox(),inputStartX=Math.min(70,chatInputBox.x+8),inputY=chatInputBox.y+chatInputBox.height/2;
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:inputStartX,y:inputY}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:inputStartX+105,y:inputY+2}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(220);
+ if(await touch.evaluate(()=>page)!=='chat')errors.push('Edge swipe stole a textarea gesture');
+ await touch.evaluate(()=>go('archive'));
+ const archiveChip=await touch.locator('.chip-row,.toolbar').first().boundingBox(),chipStartX=Math.min(80,archiveChip.x+8),chipY=archiveChip.y+archiveChip.height/2;
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:chipStartX,y:chipY}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:chipStartX+105,y:chipY+2}]});
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(220);
+ if(await touch.evaluate(()=>page)!=='archive')errors.push('Edge swipe stole a horizontal filter gesture');
  const fullscreen=await browser.newPage({viewport:{width:390,height:844}});
  await fullscreen.route('https://telegram.org/**',route=>route.abort());
  await fullscreen.addInitScript(()=>{

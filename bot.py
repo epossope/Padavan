@@ -333,7 +333,9 @@ TOOLS = [
 
             "age":{"type":"integer"},"home_city":{"type":"string"},"current_location":{"type":"string"},
 
-            "projects":{"type":"string"},"notes":{"type":"string"}
+            "projects":{"type":"string"},"notes":{"type":"string"},
+            "groups":{"type":"array","items":{"type":"string"}},
+            "tags":{"type":"array","items":{"type":"string"}}
 
         },"required":["name"]}
 
@@ -682,6 +684,41 @@ def build_inquiry_input(result):
     if result.urls:
         body += "\nURL: " + ", ".join(result.urls[:3])
     return ("[Сохранено в память]\n" + body) if body else None
+
+
+def link_person_avatar_from_caption(chat_id, caption, ingestion_result):
+    """Link an ingested image only for an explicit, unambiguous person-photo phrase."""
+    text = str(caption or "").strip()
+    if not text or not ingestion_result or not ingestion_result.ok or not ingestion_result.item:
+        return {"matched": False}
+    image = next((f for f in _files_for_item(ingestion_result.item)
+                  if str(f.get("mime_type") or "").startswith("image/")), None)
+    if not image:
+        return {"matched": False}
+    create = re.search(r"(?iu)\bэто\s+мо(?:й|я)\s+(друг|подруга|коллега|мама|папа|брат|сестра)\s+([а-яё][а-яё-]{1,40})\b", text)
+    replace = re.search(r"(?iu)\b(?:поменяй|замени|обнови)\s+фото\s+([а-яё][а-яё-]{1,40})\b", text)
+    if not create and not replace:
+        if re.search(r"(?iu)\b(?:это|фото|аватар)\b.*\b(?:друг\w*|человек\w*|контакт\w*|его|её)\b", text):
+            return {"matched": True, "needs_clarification": True, "reply": "Уточни, пожалуйста, имя человека для этого фото."}
+        return {"matched": False}
+    if create:
+        relation, raw_name = create.groups()
+        name = raw_name[:1].upper() + raw_name[1:].lower()
+        group = {"друг": "Друзья", "подруга": "Друзья", "коллега": "Работа",
+                 "мама": "Семья", "папа": "Семья", "брат": "Семья", "сестра": "Семья"}[relation.lower()]
+        person = person_upsert(chat_id, name, relationship=relation.lower(), groups=[group])
+    else:
+        raw_name = replace.group(1)
+        needle = raw_name.lower()
+        with conn() as c:
+            rows = c.execute("SELECT id,name FROM people WHERE chat_id=? AND (lower(name)=? OR lower(name) LIKE ?)",
+                             (chat_id, needle, needle.rstrip("аяыи") + "%")).fetchall()
+        if len(rows) != 1:
+            return {"matched": True, "needs_clarification": True, "reply": "Уточни, пожалуйста, кому именно заменить фото."}
+        person = {"id": rows[0]["id"], "name": rows[0]["name"]}
+    linked = set_person_avatar(chat_id, person["id"], image["id"])
+    return {"matched": True, "linked": bool(linked.get("ok")), "person_id": person["id"],
+            "reply": f"Фото для {person['name']} обновлено." if linked.get("ok") else "Не удалось связать фото с профилем."}
 
 
 # ---------- AGENT RETRIEVAL TOOLS ----------
@@ -1614,7 +1651,9 @@ def init_db():
 
             ("people","age","INTEGER"),("people","home_city","TEXT"),("people","current_location","TEXT"),
 
-            ("people","projects","TEXT"),("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
+            ("people","projects","TEXT"),("people","avatar_file_id","INTEGER"),
+            ("people","groups_json","TEXT NOT NULL DEFAULT '[]'"),("people","tags_json","TEXT NOT NULL DEFAULT '[]'"),
+            ("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
             ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
@@ -2591,7 +2630,42 @@ def merge_text(old,new):
 
 
 
-def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes=""):
+PERSON_GROUPS = ("Семья", "Друзья", "Работа", "Учёба", "Проекты", "Хобби", "Путешествия / Спорт", "Другое")
+
+
+def _person_list(value):
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            value = decoded if isinstance(decoded, list) else [value]
+        except (TypeError, ValueError):
+            value = [part.strip() for part in value.split(",")]
+    return list(dict.fromkeys(str(item).strip()[:80] for item in (value or []) if str(item).strip()))
+
+
+def classify_person_groups(relationship="", projects="", notes="", groups=None):
+    """Map free-form facts to the small stable UI taxonomy; never promote whole phrases."""
+    explicit = [item for item in _person_list(groups) if item in PERSON_GROUPS]
+    text = " ".join((str(relationship or ""), str(projects or ""), str(notes or ""))).lower()
+    rules = (
+        ("Семья", ("мама", "папа", "мать", "отец", "брат", "сестр", "муж", "жен", "сын", "дочь", "семь")),
+        ("Друзья", ("друг", "подруг", "приятел")),
+        ("Работа", ("коллег", "работ", "началь", "клиент")),
+        ("Учёба", ("учил", "учёб", "учеб", "однокласс", "однокурс")),
+        ("Проекты", ("проект", "noema", "ноэма")),
+        ("Хобби", ("хобби", "играем", "rust", "музык", "театр")),
+        ("Путешествия / Спорт", ("спорт", "трен", "горы", "поход", "путеше", "бег")),
+    )
+    found = explicit + [group for group, words in rules if any(word in text for word in words)]
+    if str(projects or "").strip():
+        found.append("Проекты")
+    found = list(dict.fromkeys(found))
+    if len(found) > 1 and "Другое" in found:
+        found.remove("Другое")
+    return found or ["Другое"]
+
+
+def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes="",groups=None,tags=None,avatar_file_id=None):
 
     with conn() as c:
 
@@ -2599,6 +2673,8 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
 
         if old:
 
+            old_groups = _person_list(old["groups_json"] if "groups_json" in old.keys() else "[]")
+            old_tags = _person_list(old["tags_json"] if "tags_json" in old.keys() else "[]")
             vals = {
 
                 "relationship":relationship or old["relationship"] or "",
@@ -2614,26 +2690,32 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
                 "projects":merge_text(old["projects"],projects),
 
                 "notes":merge_text(old["notes"],notes),
+                "groups": classify_person_groups(relationship or old["relationship"], merge_text(old["projects"],projects), merge_text(old["notes"],notes), old_groups + _person_list(groups)),
+                "tags": list(dict.fromkeys(old_tags + _person_list(tags))),
+                "avatar_file_id": avatar_file_id if avatar_file_id is not None else old["avatar_file_id"],
 
             }
 
             c.execute("""UPDATE people SET relationship=?,birthday=?,age=?,home_city=?,current_location=?,
 
-            projects=?,notes=?,updated_at=? WHERE id=?""",
+            projects=?,notes=?,groups_json=?,tags_json=?,avatar_file_id=?,updated_at=? WHERE id=?""",
 
             (vals["relationship"],vals["birthday"],vals["age"],vals["home_city"],vals["current_location"],
 
-             vals["projects"],vals["notes"],datetime.now(timezone.utc).isoformat(),old["id"]))
+             vals["projects"],vals["notes"],json.dumps(vals["groups"],ensure_ascii=False),json.dumps(vals["tags"],ensure_ascii=False),
+             vals["avatar_file_id"],datetime.now(timezone.utc).isoformat(),old["id"]))
 
             pid=old["id"]
 
         else:
 
-            cur=c.execute("""INSERT INTO people(chat_id,name,relationship,birthday,age,home_city,current_location,projects,notes,updated_at)
+            inferred_groups = classify_person_groups(relationship, projects, notes, groups)
+            cur=c.execute("""INSERT INTO people(chat_id,name,relationship,birthday,age,home_city,current_location,projects,notes,avatar_file_id,groups_json,tags_json,updated_at)
 
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
 
-            (chat_id,name,relationship,birthday,age,home_city,current_location,projects,notes,datetime.now(timezone.utc).isoformat()))
+            (chat_id,name,relationship,birthday,age,home_city,current_location,projects,notes,avatar_file_id,
+             json.dumps(inferred_groups,ensure_ascii=False),json.dumps(_person_list(tags),ensure_ascii=False),datetime.now(timezone.utc).isoformat()))
 
             pid=cur.lastrowid
 
@@ -2825,6 +2907,8 @@ def get_people(chat_id,query=""):
         for r in rows:
 
             d=dict(r)
+            d["groups"] = classify_person_groups(d.get("relationship"), d.get("projects"), d.get("notes"), d.pop("groups_json", "[]"))
+            d["tags"] = _person_list(d.pop("tags_json", "[]"))
 
             ints=c.execute("""SELECT interaction,interaction_date,interaction_type FROM interactions
 
@@ -2874,7 +2958,7 @@ def update_expense(chat_id, expense_id, amount, description="", category="про
 
 
 def update_person(chat_id, person_id, name="", relationship="", birthday="", age=None,
-                  home_city=None, current_location=None, projects="", notes=""):
+                  home_city=None, current_location=None, projects="", notes="", groups=None, tags=None):
     name = str(name or "").strip()[:160]
     if not name:
         return {"ok": False, "tool": "update_person", "error": "empty_name"}
@@ -2884,16 +2968,19 @@ def update_person(chat_id, person_id, name="", relationship="", birthday="", age
     except (TypeError, ValueError):
         return {"ok": False, "tool": "update_person", "error": "invalid_age"}
     with conn() as c:
-        existing = c.execute("SELECT age,home_city,current_location FROM people WHERE id=? AND chat_id=?",
+        existing = c.execute("SELECT age,home_city,current_location,groups_json,tags_json FROM people WHERE id=? AND chat_id=?",
                              (int(person_id), chat_id)).fetchone()
         if not existing:
             return {"ok": False, "tool": "update_person", "error": "not_found"}
-        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,updated_at=? WHERE id=? AND chat_id=?",
+        normalized_groups = classify_person_groups(relationship, projects, notes, groups if groups is not None else existing["groups_json"])
+        normalized_tags = _person_list(tags if tags is not None else existing["tags_json"])
+        cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,groups_json=?,tags_json=?,updated_at=? WHERE id=? AND chat_id=?",
                         (name, str(relationship or "")[:160], str(birthday or "")[:32],
                          age if has_age else existing["age"],
                          str(existing["home_city"] if home_city is None else home_city or "")[:160],
                          str(existing["current_location"] if current_location is None else current_location or "")[:160],
-                         str(projects or "")[:1000], str(notes or "")[:3000],
+                         str(projects or "")[:1000], str(notes or "")[:3000], json.dumps(normalized_groups,ensure_ascii=False),
+                         json.dumps(normalized_tags,ensure_ascii=False),
                          datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
     return {"ok": bool(cur.rowcount), "tool": "update_person", "updated": cur.rowcount}
 
@@ -2924,6 +3011,20 @@ def delete_person(chat_id,person_id):
     with conn() as c:
         cur = c.execute("DELETE FROM people WHERE id=? AND chat_id=?", (person_id,chat_id))
     return {"ok":True,"tool":"delete_person","deleted":cur.rowcount}
+
+
+def set_person_avatar(chat_id, person_id, file_id=None):
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (int(person_id), chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "set_person_avatar", "error": "person_not_found"}
+        if file_id is not None:
+            image = c.execute("SELECT id,mime_type FROM files WHERE id=? AND chat_id=?", (int(file_id), chat_id)).fetchone()
+            if not image or not str(image["mime_type"] or "").startswith("image/"):
+                return {"ok": False, "tool": "set_person_avatar", "error": "image_not_found"}
+        c.execute("UPDATE people SET avatar_file_id=?,updated_at=? WHERE id=? AND chat_id=?",
+                  (int(file_id) if file_id is not None else None, datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
+    return {"ok": True, "tool": "set_person_avatar", "person_id": int(person_id), "file_id": int(file_id) if file_id is not None else None}
 
 
 def delete_interaction(chat_id,interaction_id):
@@ -4106,17 +4207,65 @@ def clean_tts(s):
 
     s=re.sub(r"(?m)^\s{0,3}#{1,6}\s*","",s); s=re.sub(r"(?m)^\s*>\s*","",s)
 
+    # Speech-only cleanup. The visible answer is deliberately untouched.
+    s=re.sub(r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\U00002600-\U000027BF]", " ", s)
+    s=s.replace("\ufe0e", "").replace("\ufe0f", "").replace("\u200d", "")
+
     s=re.sub(r"\s+"," ",s)
 
     return s.strip()
 
 
 
-async def make_voice(text):
+def get_voice_preferences(chat_id):
+    runtime = runtime_config_values()
+    try:
+        saved = json.loads(app_setting(f"voice_preferences:{int(chat_id)}", "{}"))
+    except (TypeError, ValueError):
+        saved = {}
+    voice = str(saved.get("voice") or runtime["tts_voice"])[:120]
+    try:
+        speed = min(1.25, max(.8, float(saved.get("speed", 1.0))))
+        pitch = min(1.5, max(.5, float(saved.get("pitch", 1.0))))
+        volume = min(1.0, max(.2, float(saved.get("volume", 1.0))))
+    except (TypeError, ValueError):
+        speed, pitch, volume = 1.0, 1.0, 1.0
+    engine = str(runtime["tts_provider"] or "edge").lower()
+    return {"voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
+            "supports_pitch": engine in {"edge", "browser"}, "supports_volume": engine in {"edge", "browser"}}
+
+
+def normalize_voice_preferences(voice, speed=1.0, pitch=1.0, volume=1.0):
+    runtime = runtime_config_values()
+    voice = str(voice or runtime["tts_voice"]).strip()[:120]
+    if not voice or not re.fullmatch(r"[A-Za-z0-9._-]{2,120}", voice):
+        return None
+    try:
+        speed, pitch, volume = float(speed), float(pitch), float(volume)
+    except (TypeError, ValueError):
+        return None
+    if not .8 <= speed <= 1.25 or not .5 <= pitch <= 1.5 or not .2 <= volume <= 1.0:
+        return None
+    return {"voice": voice, "speed": round(speed, 2), "pitch": round(pitch, 2), "volume": round(volume, 2)}
+
+
+def set_voice_preferences(chat_id, voice=None, speed=1.0, pitch=1.0, volume=1.0):
+    value = normalize_voice_preferences(voice, speed, pitch, volume)
+    if value is None:
+        return {"ok": False, "error": "invalid_voice_preferences"}
+    set_app_setting(f"voice_preferences:{int(chat_id)}", json.dumps(value, ensure_ascii=False), updated_by=chat_id)
+    return {"ok": True, **get_voice_preferences(chat_id)}
+
+
+async def make_voice(text, chat_id=None, preferences=None):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
 
-    await edge_tts.Communicate(clean_tts(text) or "Готово.", runtime_config_values()["tts_voice"]).save(str(p))
+    prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime_config_values()["tts_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
+    rate = f"{round((float(prefs['speed']) - 1) * 100):+d}%"
+    pitch = f"{round((float(prefs['pitch']) - 1) * 50):+d}Hz"
+    volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
+    await edge_tts.Communicate(clean_tts(text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
 
     return p
 
@@ -6052,7 +6201,8 @@ async def image_handler(update,context):
 
             return
 
-        pre=result.reply or "Готово."
+        avatar_link = link_person_avatar_from_caption(cid, caption, result)
+        pre = avatar_link.get("reply") if avatar_link.get("matched") else (result.reply or "Готово.")
 
         final_text=pre
 
@@ -6600,4 +6750,3 @@ def main():
 if __name__=="__main__":
 
     main()
-

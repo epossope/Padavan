@@ -29,6 +29,7 @@
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
  let edgeSwipe=null,edgeSwipeFinishing=false;
+ function edgeSwipeStartZone(){return Math.min(96,Math.max(44,innerWidth*.25))}
  function finishEdgeSwipe(commit){
   if(edgeSwipeFinishing)return;
   const shell=document.querySelector('#shell');if(!shell)return;
@@ -39,7 +40,7 @@
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false);edgeSwipe=null}
  document.addEventListener('pointerdown',e=>{
-  if(edgeSwipeFinishing||e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>20||e.target.closest('input,textarea,select,dialog,.chip-row,.segments,.bars,[contenteditable=true]'))return;
+  if(edgeSwipeFinishing||e.pointerType==='mouse'||!e.isPrimary||page==='home'||!navHistory.length||e.clientX>edgeSwipeStartZone()||e.target.closest('input,textarea,select,dialog,.chip-row,.segments,.bars,.trend,.distribution-body,[contenteditable=true]'))return;
   edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,captured:false,dx:0,dy:0,lastX:e.clientX,lastAt:performance.now(),velocity:0};
  },{passive:true,capture:true});
  document.addEventListener('pointermove',e=>{
