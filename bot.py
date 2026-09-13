@@ -195,6 +195,8 @@ LATENCY_METRICS = (
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
     "llm_total_ms", "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
     "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
+    "tts_enqueue_ms", "tts_synthesis_start_ms", "tts_synthesis_done_ms",
+    "tts_play_start_ms", "tts_play_end_ms", "tts_playback_gap_ms", "tts_total_ms",
     "speech_text_length_chars", "total_response_start_ms", "total_ms",
 )
 VOICE_ROBUSTNESS_METRICS = (

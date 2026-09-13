@@ -320,7 +320,8 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             "args": {"metrics": {
                 "tts_queue_wait_ms": 12, "tts_prepare_ms": 34,
                 "tts_first_chunk_ms": 56, "tts_voice_name": 101,
-                "tts_engine_name": 1, "speech_text_length_chars": 78,
+                "tts_engine_name": 1, "speech_text_length_chars": [78, 91],
+                "tts_synthesis_start_ms": [57, 61], "tts_play_end_ms": [90, 140],
             }},
         })
         self.assertEqual(response.status, 200)
@@ -328,6 +329,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core.record_runtime_metric.assert_any_call("tts_prepare_ms", 34.0)
         self.core.record_runtime_metric.assert_any_call("tts_voice_name", 101.0)
         self.core.record_runtime_metric.assert_any_call("speech_text_length_chars", 78.0)
+        self.core.record_runtime_metric.assert_any_call("speech_text_length_chars", 91.0)
+        self.core.record_runtime_metric.assert_any_call("tts_synthesis_start_ms", 61.0)
+        self.core.record_runtime_metric.assert_any_call("tts_play_end_ms", 140.0)
 
     def test_miniapp_and_telegram_share_the_canonical_streaming_pipeline(self):
         api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")
