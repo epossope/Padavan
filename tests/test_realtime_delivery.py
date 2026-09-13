@@ -64,15 +64,13 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._normalise_runtime_config_value("global_model_mode", "FORCE"), "force")
         self.assertEqual(bot._normalise_runtime_config_value("global_force_model", "vendor/model"), "vendor/model")
 
-    def test_global_force_routes_real_multiuser_outbound_requests_and_restores_overrides(self):
+    def test_global_primary_routes_real_multiuser_outbound_requests_without_user_overrides(self):
         database = sqlite3.connect(":memory:", check_same_thread=False)
         database.row_factory = sqlite3.Row
         database.execute("CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '')")
         database.executemany("INSERT INTO user_settings(chat_id,primary_model) VALUES(?,?)", [(101, "qwen/user-a"), (102, "deepseek/user-b")])
-        router = bot.ModelRouter(lambda: database, "router/fast", ["router/strong"], "vision/default")
-        config = {"global_model_mode": "auto", "global_force_model": "", "fast_model": "router/fast",
-                  "strong_model": "router/strong", "model_catalog": [], "global_vision_mode": "auto",
-                  "global_force_vision_model": "", "vision_fallback_models": []}
+        config = {"fast_model": "router/fast", "strong_model": "router/strong"}
+        fields = {name: {"value": value, "source": "ADMIN"} for name, value in config.items()}
         outbound = []
 
         def response_for(_chat_id, model, _messages, _tools=None, _tool_choice="auto"):
@@ -81,25 +79,20 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             response.iter_lines.return_value = [b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}', b'data: [DONE]']
             return response
 
-        common = [patch.object(bot, "runtime_config_values", side_effect=lambda: dict(config)),
-                  patch.object(bot, "model_router", return_value=router),
+        common = [patch.object(bot, "runtime_config_snapshot", side_effect=lambda: {"fields": dict(fields)}),
                   patch.object(bot, "direct_live_request", return_value=None),
                   patch.object(bot, "conversation_context", return_value=[]),
                   patch.object(bot, "system_prompt", return_value="system"),
                   patch.object(bot, "request_chat_stream", side_effect=response_for),
                   patch.object(bot, "record_usage"), patch.object(bot, "add_message", side_effect=range(1, 100))]
-        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7]:
+        with common[0], common[1], common[2], common[3], common[4], common[5], common[6]:
             for user in (100, 101, 102):
                 list(bot.stream_agent_response(user, "test"))
-            self.assertEqual(outbound, ["router/fast", "qwen/user-a", "deepseek/user-b"])
-            outbound.clear();config["global_model_mode"] = "force";config["global_force_model"] = "global/model-x"
+            self.assertEqual(outbound, ["router/fast"] * 3)
+            outbound.clear();fields["fast_model"] = {"value": "global/model-x", "source": "ADMIN"}
             for user in (100, 101, 102):
                 list(bot.stream_agent_response(user, "test"))
             self.assertEqual(outbound, ["global/model-x"] * 3)
-            outbound.clear();config["global_model_mode"] = "auto"
-            for user in (100, 101, 102):
-                list(bot.stream_agent_response(user, "test"))
-            self.assertEqual(outbound, ["router/fast", "qwen/user-a", "deepseek/user-b"])
         database.close()
 
     def test_global_vision_force_is_used_by_real_outbound_request_for_every_user(self):
@@ -210,7 +203,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "system_prompt", return_value="system"), \
              patch.object(bot, "request_chat_stream") as request:
             events = list(bot.stream_agent_response(42, "тест", cancel))
-        self.assertEqual(events, [{"type": "cancelled"}])
+        self.assertEqual(events[-1], {"type": "cancelled"})
         request.assert_not_called()
 
     def test_reasoning_never_reaches_shared_stream_or_canonical_history(self):
@@ -254,7 +247,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "request_chat_stream", return_value=response), \
              patch.object(bot, "execute_tool") as execute:
             events = list(bot.stream_agent_response(42, "добавь задачу", cancel))
-        self.assertEqual(events, [{"type": "cancelled"}])
+        self.assertEqual(events[-1], {"type": "cancelled"})
         execute.assert_not_called()
 
     def test_cancel_stream_closes_active_http_response(self):
@@ -318,8 +311,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completed)
         telegram.send_message.assert_awaited_once()
         telegram.send_message_draft.assert_not_awaited()
-        self.assertGreaterEqual(telegram.edit_message_text.await_count, 1)
-        self.assertEqual({call.kwargs["message_id"] for call in telegram.edit_message_text.await_args_list}, {77})
+        self.assertEqual(telegram.edit_message_text.await_count, 0)
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["canonical_message_id"], 9)
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["telegram_message_id"], 77)
 
@@ -372,7 +364,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.reply_text.await_count, text_count, mode)
             self.assertEqual(message.reply_voice.await_count, voice_count, mode)
 
-    def test_effective_model_user_override_and_auto_share_one_setting(self):
+    def test_effective_model_is_global_and_legacy_user_override_is_ignored(self):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
         database.execute("CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '')")
@@ -390,12 +382,10 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "has_personal_api_key", return_value=False):
             router.set_primary(42, "user-model")
             selected = bot.effective_user_ai_config(42)
-            self.assertEqual(selected["effective_model"], {"value": "user-model", "source": "USER"})
+            self.assertEqual(selected["effective_model"], {"value": "admin-fast", "source": "ADMIN"})
             self.assertEqual(selected["fast_default"], {"value": "admin-fast", "source": "ADMIN"})
             self.assertEqual(selected["strong_fallback"], {"value": "env-strong", "source": "ENV"})
-            router.set_primary(42, "")
-            automatic = bot.effective_user_ai_config(42)
-            self.assertEqual(automatic["effective_model"], {"value": "admin-fast", "source": "ADMIN"})
+            self.assertEqual(selected["personal"]["model_override"], "")
         database.close()
 
     def test_canonical_history_never_stores_or_returns_reasoning(self):

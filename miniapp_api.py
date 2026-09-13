@@ -292,7 +292,10 @@ def register_miniapp(app, core):
                 core.set_mode(cid, args["mode"])
                 result = {"ok": True}
             elif action == "voice_preferences":
-                result = await asyncio.to_thread(core.set_voice_preferences, cid, args.get("voice"), args.get("speed", 1), args.get("pitch", 1), args.get("volume", 1))
+                # ``gender`` is the only user-selectable voice identity.  It
+                # resolves to the current admin male/female slot at request
+                # time, so an admin voice change applies live to all users.
+                result = await asyncio.to_thread(core.set_voice_preferences, cid, args.get("gender", args.get("voice")), args.get("speed", 1), args.get("pitch", 1), args.get("volume", 1))
                 if not result.get("ok"):
                     raise ValueError("Некорректные настройки голоса")
             elif action == "person_avatar_remove":
@@ -391,7 +394,7 @@ def register_miniapp(app, core):
         voice_runtime = {}
         if callable(getattr(core, "runtime_config_values", None)):
             runtime = core.runtime_config_values()
-            voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice")}
+            voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice", "tts_male_voice", "tts_female_voice")}
         effective_ai = None
         if callable(getattr(core, "effective_user_ai_config", None)):
             effective_ai = core.effective_user_ai_config(cid)
@@ -485,7 +488,7 @@ def register_miniapp(app, core):
         preferences = core.get_voice_preferences(user["id"]) if callable(getattr(core, "get_voice_preferences", None)) else None
         requested_preferences = payload.get("preferences")
         if isinstance(requested_preferences, dict) and callable(getattr(core, "normalize_voice_preferences", None)):
-            locked = core.normalize_voice_preferences(requested_preferences.get("voice"), requested_preferences.get("speed", 1),
+            locked = core.normalize_voice_preferences(requested_preferences.get("gender", requested_preferences.get("voice")), requested_preferences.get("speed", 1),
                                                       requested_preferences.get("pitch", 1), requested_preferences.get("volume", 1))
             if locked is None:
                 raise web.HTTPBadRequest(text="Некорректные настройки голоса")
@@ -621,16 +624,18 @@ def register_miniapp(app, core):
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
                 except asyncio.TimeoutError:
-                    # This is intentionally generic: no unsupported claim about
-                    # a search or a tool is shown before the core emits one.
-                    await response.write(json.dumps({"type": "progress", "text": "Ответ ещё готовится…"}, ensure_ascii=False).encode("utf-8") + b"\n")
+                    # No unsupported claim about search/tool activity before
+                    # the core emits a corresponding truthful progress event.
+                    await response.write(json.dumps({"type": "progress", "text": "Думаю…"}, ensure_ascii=False).encode("utf-8") + b"\n")
                     next_watchdog_at = time.monotonic() + 8
                     continue
                 if event is None:
                     break
-                if event.get("type") == "tool":
-                    await response.write(json.dumps({"type": "progress", "text": "Действие выполнено, готовлю ответ…"}, ensure_ascii=False).encode("utf-8") + b"\n")
                 await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                if event.get("type") == "done":
+                    # Numeric aggregate only: the final text itself is never
+                    # retained by telemetry.
+                    core.record_runtime_metric("miniapp_visible_chars", len(str(event.get("text") or "")))
         except (ConnectionResetError, asyncio.CancelledError):
             # The worker deliberately keeps running: its final answer is added by
             # the canonical agent pipeline even if this screen has gone away.

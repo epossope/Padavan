@@ -1,4 +1,9 @@
-"""Per-chat model selection; values are resolved for every LLM request."""
+"""Runtime model helpers.
+
+Chat routing is global by design.  The legacy per-user primary/fallback
+columns remain readable only for an on-disk migration window; they are never
+consulted for a normal LLM request.
+"""
 from __future__ import annotations
 
 
@@ -18,14 +23,14 @@ class ModelRouter:
         row = dict(row) if row else {}
         if task_type == "vision":
             return row.get("vision_model") or self.vision_model
-        primary = row.get("primary_model") or self.default_model
-        fallback = row.get("fallback_model") or (self.fallback_models[0] if self.fallback_models else "")
-        return {"primary": primary, "fallback": fallback}
+        return {"primary": self.default_model,
+                "fallback": self.fallback_models[0] if self.fallback_models else ""}
 
     def set_primary(self, chat_id, model):
+        """Compatibility no-op: personal chat model selection was retired."""
         with self.connect() as c:
-            c.execute("INSERT INTO user_settings(chat_id, primary_model) VALUES(?, ?) "
-                      "ON CONFLICT(chat_id) DO UPDATE SET primary_model=excluded.primary_model", (chat_id, model))
+            c.execute("INSERT INTO user_settings(chat_id, primary_model, fallback_model) VALUES(?, '', '') "
+                      "ON CONFLICT(chat_id) DO UPDATE SET primary_model='', fallback_model=''", (chat_id,))
 
     def set_vision(self, chat_id, model):
         """Store a user's preferred Vision model.

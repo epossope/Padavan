@@ -25,25 +25,22 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BadRequest):
             await bot.safe_callback_answer(query)
 
-    async def test_telegram_auto_clears_the_user_model_override(self):
+    async def test_telegram_auto_reports_that_user_model_override_is_retired(self):
         query = SimpleNamespace(
             answer=AsyncMock(), data="model:auto", edit_message_text=AsyncMock(),
             message=SimpleNamespace(chat_id=42, message_id=7),
         )
         update = SimpleNamespace(callback_query=query, effective_user=None)
-        router = SimpleNamespace(set_primary=Mock())
         with patch.object(bot, "ADMIN_CHAT_IDS", {42}), \
              patch.object(bot, "adopt_active_ui", new=AsyncMock()), \
              patch.object(bot, "register_bot_user"), \
-             patch.object(bot, "model_router", return_value=router), \
              patch.object(bot, "effective_user_ai_config", return_value={"effective_model": {"value": "admin-fast", "source": "ADMIN"}}), \
              patch.object(bot, "live_ui_text", side_effect=lambda value: value), \
              patch.object(bot, "live_markup", side_effect=lambda value: value), \
              patch.object(bot, "set_active_ui_message_id"):
             await bot.callback(update, SimpleNamespace())
-        router.set_primary.assert_called_once_with(42, "")
         query.edit_message_text.assert_awaited_once()
-        self.assertIn("Автоматический режим", query.edit_message_text.await_args.args[0])
+        self.assertIn("Личный выбор модели отключён", query.edit_message_text.await_args.args[0])
 
     async def test_telegram_send_has_one_bounded_retry(self):
         telegram = SimpleNamespace(send_message=AsyncMock(side_effect=[TimedOut("slow"), SimpleNamespace(message_id=9)]))

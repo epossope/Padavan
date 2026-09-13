@@ -198,6 +198,9 @@ LATENCY_METRICS = (
     "tts_enqueue_ms", "tts_synthesis_start_ms", "tts_synthesis_done_ms",
     "tts_play_start_ms", "tts_play_end_ms", "tts_playback_gap_ms", "tts_total_ms",
     "speech_text_length_chars", "total_response_start_ms", "total_ms",
+    "selected_global_model", "reasoning_chunks_dropped", "visible_stream_chars",
+    "telegram_visible_chars", "miniapp_visible_chars", "stream_first_visible_ms",
+    "stream_complete_ms",
 )
 VOICE_ROBUSTNESS_METRICS = (
     "barge_in_reason_code", "barge_in_duration_ms", "barge_in_peak_rms",
@@ -878,7 +881,7 @@ RUNTIME_CONFIG_FIELDS = (
     "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
     "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
     "vision_model", "vision_fallback_models", "batch_stt_model",
-    "tts_provider", "tts_fallback_provider", "tts_voice",
+    "tts_provider", "tts_fallback_provider", "tts_voice", "tts_male_voice", "tts_female_voice",
     "tts_default_speed", "tts_default_pitch", "tts_default_volume", "default_voice_reply_mode",
     "realtime_model", "model_catalog",
 )
@@ -915,7 +918,13 @@ def _runtime_env_defaults():
         "batch_stt_model": (BATCH_STT_MODEL, "ENV" if _env_is_set("BATCH_STT_MODEL", "STT_MODEL") else "DEFAULT"),
         "tts_provider": (TTS_PROVIDER, "ENV" if _env_is_set("TTS_PROVIDER") else "DEFAULT"),
         "tts_fallback_provider": (TTS_FALLBACK_PROVIDER, "ENV" if _env_is_set("TTS_FALLBACK_PROVIDER") else "DEFAULT"),
+        # ``tts_voice`` remains a one-release compatibility alias for the
+        # configured male default.  New UI and request resolution use the
+        # semantic male/female slots below, so admin changes affect every
+        # user who selected that gender without rewriting user preferences.
         "tts_voice": (VOICE, "ENV" if _env_is_set("EDGE_VOICE") else "DEFAULT"),
+        "tts_male_voice": (os.getenv("TTS_MALE_VOICE", VOICE).strip(), "ENV" if _env_is_set("TTS_MALE_VOICE", "EDGE_VOICE") else "DEFAULT"),
+        "tts_female_voice": (os.getenv("TTS_FEMALE_VOICE", "ru-RU-SvetlanaNeural").strip(), "ENV" if _env_is_set("TTS_FEMALE_VOICE") else "DEFAULT"),
         "tts_default_speed": (_env_float("TTS_DEFAULT_SPEED", 1.0, .8, 1.25), "ENV" if _env_is_set("TTS_DEFAULT_SPEED") else "DEFAULT"),
         "tts_default_pitch": (_env_float("TTS_DEFAULT_PITCH", 1.0, .5, 1.5), "ENV" if _env_is_set("TTS_DEFAULT_PITCH") else "DEFAULT"),
         "tts_default_volume": (_env_float("TTS_DEFAULT_VOLUME", 1.0, .2, 1.0), "ENV" if _env_is_set("TTS_DEFAULT_VOLUME") else "DEFAULT"),
@@ -961,7 +970,7 @@ def runtime_config_values():
 def _normalise_runtime_config_value(field, value):
     if field not in RUNTIME_CONFIG_FIELDS:
         raise ValueError("Unknown runtime configuration field")
-    if field in {"fast_model", "strong_model", "vision_model", "batch_stt_model", "realtime_model", "tts_voice"}:
+    if field in {"fast_model", "strong_model", "vision_model", "batch_stt_model", "realtime_model", "tts_voice", "tts_male_voice", "tts_female_voice"}:
         clean = str(value or "").strip()
         if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
             raise ValueError("Invalid model or voice value")
@@ -1716,24 +1725,23 @@ def model_router():
 
 
 def resolved_chat_models(chat_id):
-    """Resolve the effective chat route with a reversible global FORCE layer."""
-    config = runtime_config_values()
-    forced = str(config.get("global_force_model") or "").strip()
-    if config.get("global_model_mode") == "force" and forced:
-        return {"primary": forced, "fallback": "", "source": "ADMIN_FORCE", "forced": True}
-    selected = model_router().resolve(chat_id, "chat")
-    return {**selected, "source": "ROUTER", "forced": False}
+    """One global LLM source: admin selected -> ENV -> built-in default.
+
+    The historical ``user_settings.primary_model`` and the old FORCE fields
+    are deliberately ignored.  ``strong_model`` remains an emergency runtime
+    fallback, not a user-selectable route.
+    """
+    fields = runtime_config_snapshot()["fields"]
+    primary, fallback = fields["fast_model"], fields["strong_model"]
+    return {"primary": primary["value"], "fallback": fallback["value"],
+            "source": primary["source"], "fallback_source": fallback["source"],
+            "forced": False}
 
 
 def chat_model_candidates(chat_id):
-    """Return the exact outbound model order; FORCE never leaks to another model."""
+    """Primary global model plus a single emergency technical fallback."""
     selected = resolved_chat_models(chat_id)
-    if selected["forced"]:
-        return [selected["primary"]]
-    config = runtime_config_values()
-    return list(dict.fromkeys(model for model in (
-        selected["primary"], selected["fallback"], config["strong_model"], *config["model_catalog"]
-    ) if model))
+    return list(dict.fromkeys(model for model in (selected["primary"], selected["fallback"]) if model))
 
 
 def provider_preferences_for(model):
@@ -2273,66 +2281,47 @@ def vision_models_for(chat_id):
 
 
 def effective_user_ai_config(chat_id):
-    """Explain ADMIN_FORCE -> USER -> ADMIN -> ENV -> DEFAULT resolution."""
+    """Safe UI snapshot for the global routing model.
+
+    Retaining this function avoids a parallel API shape during rollout, but
+    there is intentionally no personal LLM override in the returned data.
+    """
     snapshot = runtime_config_snapshot()
     fields = snapshot["fields"]
-    try:
-        with conn() as c:
-            row = c.execute(
-                "SELECT primary_model,fallback_model,vision_model FROM user_settings WHERE chat_id=?",
-                (chat_id,),
-            ).fetchone()
-    except sqlite3.OperationalError:
-        row = None
-    user = dict(row) if row else {}
-    primary_override = str(user.get("primary_model") or "").strip()
-    fallback_override = str(user.get("fallback_model") or "").strip()
-    vision_override = str(user.get("vision_model") or "").strip()
     fast = fields["fast_model"]
     strong = fields["strong_model"]
     vision_default = fields["vision_model"]
     effective_vision = vision_models_for(chat_id)[0]
-    vision_is_user = bool(vision_override and has_personal_api_key(chat_id))
-    vision_source = "USER" if vision_is_user else vision_default["source"]
-    if not vision_is_user and effective_vision != vision_default["value"]:
-        # Compatibility value written by the previous admin Vision screen.
-        vision_source = "ADMIN"
-    global_model_mode = fields.get("global_model_mode", {"value": "auto"})["value"]
-    global_force_model = str(fields.get("global_force_model", {"value": ""})["value"] or "").strip()
-    model_forced = global_model_mode == "force" and bool(global_force_model)
+    vision_source = vision_default["source"]
     global_vision_mode = fields.get("global_vision_mode", {"value": "auto"})["value"]
     global_force_vision = str(fields.get("global_force_vision_model", {"value": ""})["value"] or "").strip()
     vision_forced = global_vision_mode == "force" and bool(global_force_vision)
     return {
         "effective_model": {
-            "value": global_force_model if model_forced else (primary_override or fast["value"]),
-            "source": "ADMIN_FORCE" if model_forced else ("USER" if primary_override else fast["source"]),
+            "value": fast["value"], "source": fast["source"],
         },
         "effective_fallback": {
-            "value": fallback_override or strong["value"],
-            "source": "USER" if fallback_override else strong["source"],
+            "value": strong["value"], "source": strong["source"],
         },
         "fast_default": dict(fast),
         "strong_fallback": dict(strong),
         "vision": {"value": effective_vision, "source": "ADMIN_FORCE" if vision_forced else vision_source},
         "global": {
-            "model_mode": "FORCE" if model_forced else "AUTO",
-            "model": global_force_model if model_forced else fast["value"],
-            "model_source": "ADMIN_FORCE" if model_forced else fast["source"],
+            "model_mode": "GLOBAL",
+            "model": fast["value"], "model_source": fast["source"],
             "vision_mode": "FORCE" if vision_forced else "AUTO",
             "vision": global_force_vision if vision_forced else vision_default["value"],
             "vision_source": "ADMIN_FORCE" if vision_forced else vision_default["source"],
         },
         "personal": {
-            "model_override": primary_override,
-            "vision_override": vision_override,
-            "temporarily_overridden": model_forced and bool(primary_override),
+            "model_override": "", "vision_override": "", "temporarily_overridden": False,
         },
         "tts": {
             "provider": fields["tts_provider"]["value"],
             "provider_source": fields["tts_provider"]["source"],
-            "voice": fields["tts_voice"]["value"],
-            "voice_source": fields["tts_voice"]["source"],
+            "male_voice": fields.get("tts_male_voice", fields["tts_voice"])["value"],
+            "female_voice": fields.get("tts_female_voice", fields["tts_voice"])["value"],
+            "voice_source": fields.get("tts_male_voice", fields["tts_voice"])["source"],
         },
     }
 
@@ -2454,7 +2443,7 @@ def admin_usage_users():
                       (row["chat_id"], "", "", now, now))
         rows = c.execute("""
             SELECT u.user_number,u.chat_id,u.username,u.display_name,u.first_seen_at,u.last_seen_at,
-                   COALESCE(NULLIF(s.primary_model,''), ?) AS effective_model,
+                   ? AS effective_model,
                    CASE WHEN p.chat_id IS NULL THEN 0 ELSE 1 END AS has_personal_key,
                    CASE WHEN m.chat_id IS NULL THEN 0 ELSE 1 END AS has_managed_key,
                    COALESCE(m.limit_usd, 0) AS monthly_limit_usd,
@@ -2465,7 +2454,6 @@ def admin_usage_users():
                    (SELECT MAX(last_event.created_at) FROM usage_events last_event
                     WHERE last_event.chat_id=u.chat_id) AS last_llm_activity
             FROM bot_users u
-            LEFT JOIN user_settings s ON s.chat_id=u.chat_id
             LEFT JOIN user_api_keys p ON p.chat_id=u.chat_id AND p.active=1
             LEFT JOIN managed_api_keys m ON m.chat_id=u.chat_id AND m.active=1
             LEFT JOIN usage_events e ON e.chat_id=u.chat_id AND substr(e.created_at,1,10)>=?
@@ -3695,6 +3683,22 @@ def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"
                          json=payload, timeout=(20, 180), stream=True)
 
 
+def _safe_model_metric_code(model):
+    """Stable numeric telemetry representation; model name is not user data."""
+    return int.from_bytes(hashlib.blake2s(str(model).encode("utf-8"), digest_size=4).digest(), "big")
+
+
+def stream_progress_for_tool(name):
+    """Only report an action after its corresponding tool was actually run."""
+    if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
+        return "Вспоминаю…"
+    if name in {"get_weather", "internet_search"}:
+        return "Проверяю информацию…"
+    if name in WRITE_TOOLS:
+        return "Сохраняю изменения…"
+    return "Выполняю действие…"
+
+
 def stream_agent_response(chat_id, text, cancel_event=None):
     """One streaming core for text and voice; yields display-safe runtime events."""
     started = time.perf_counter()
@@ -3702,6 +3706,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     if cancel_event.is_set():
         yield {"type": "cancelled"}
         return
+    # A truthful pre-stream state: no claim about a search or tool is made.
+    yield {"type": "progress", "text": "Думаю…"}
     live = direct_live_request(text)
     if live is not None:
         add_message(chat_id, "user", text)
@@ -3713,8 +3719,13 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
     tools = ToolPackResolver().resolve(TOOLS, text)
     models = chat_model_candidates(chat_id)
+    if models:
+        record_runtime_metric("selected_global_model", _safe_model_metric_code(models[0]), model=models[0])
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes = []
+    total_visible_chars = 0
+    total_reasoning_dropped = 0
+    first_visible_marked = False
     for round_index in range(5):
         message = None
         last_error = None
@@ -3743,14 +3754,22 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         if not first_delta:
                             first_delta = True
                             record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
+                        if not first_visible_marked:
+                            first_visible_marked = True
+                            record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
                         yield {"type": "delta", "text": delta}
                 tail = accumulator.finish()
                 if tail:
                     if not first_delta:
                         first_delta = True
                         record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
+                    if not first_visible_marked:
+                        first_visible_marked = True
+                        record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
                     yield {"type": "delta", "text": tail}
                 message = accumulator.message()
+                total_visible_chars += accumulator.visible_chars
+                total_reasoning_dropped += accumulator.reasoning_chunks_dropped
                 if accumulator.usage:
                     record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
                 break
@@ -3772,6 +3791,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
             add_message(chat_id, "user", text)
             canonical_message_id = add_message(chat_id, "assistant", answer)
+            record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
+            record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
+            record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
             yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
                    "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
@@ -3791,12 +3813,16 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 writes.append(result)
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
+            yield {"type": "progress", "text": stream_progress_for_tool(name)}
             if cancel_event.is_set():
                 yield {"type": "cancelled"}
                 return
     answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
     add_message(chat_id, "user", text)
     canonical_message_id = add_message(chat_id, "assistant", answer)
+    record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
+    record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
+    record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
     yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id}
 
 
@@ -4050,7 +4076,10 @@ async def stream_answer_to_telegram(update, context, text):
                 rendered = _telegram_stream_text(chat_id, accumulated)
                 if not rendered:
                     continue
-                if sent is None:
+                # Do not create a one-character Telegram bubble.  The same
+                # visible accumulator will still be sent immediately at final
+                # for short answers.
+                if sent is None and len(accumulated.strip()) >= TELEGRAM_DRAFT_MIN_CHARS:
                     sent = await telegram_send_with_retry(
                         context.bot, source="telegram_stream_initial", chat_id=chat_id,
                         text=rendered, reply_markup=main_keyboard(),
@@ -4058,7 +4087,7 @@ async def stream_answer_to_telegram(update, context, text):
                     )
                     telegram_message_id = getattr(sent, "message_id", None)
                     throttle.should_send(accumulated, force=True)
-                elif editing_available and throttle.should_send(accumulated):
+                elif sent is not None and editing_available and throttle.should_send(accumulated):
                     editing_available = bool(await telegram_edit_with_retry(
                         context.bot, chat_id=chat_id, message_id=telegram_message_id,
                         text=rendered,
@@ -4072,6 +4101,7 @@ async def stream_answer_to_telegram(update, context, text):
         if cancelled.is_set():
             return False
         final = sanitize_visible_content(final or accumulated).strip()
+        record_runtime_metric("telegram_visible_chars", len(final))
         if wants_text and final:
             rendered = _telegram_stream_text(chat_id, final)
             if sent is None:
@@ -4452,13 +4482,31 @@ def clean_tts(s):
 
 
 
+def _voice_gender(value, runtime):
+    """Resolve a safe semantic user preference, never a hard-coded voice id."""
+    candidate = str(value or "").strip().lower()
+    if not candidate:
+        return "male"
+    if candidate in {"male", "female"}:
+        return candidate
+    female = str(runtime.get("tts_female_voice") or "").lower()
+    male = str(runtime.get("tts_male_voice") or runtime.get("tts_voice") or "").lower()
+    # Compatibility for a one-release migration from stored Edge voice ids.
+    if candidate == female or candidate == "ru-ru-svetlananeural":
+        return "female"
+    if candidate == male or candidate == "ru-ru-dmitryneural":
+        return "male"
+    return None
+
+
 def get_voice_preferences(chat_id):
     runtime = runtime_config_values()
     try:
         saved = json.loads(app_setting(f"voice_preferences:{int(chat_id)}", "{}"))
     except (TypeError, ValueError):
         saved = {}
-    voice = str(saved.get("voice") or runtime["tts_voice"])[:120]
+    gender = _voice_gender(saved.get("gender") or saved.get("voice"), runtime) or "male"
+    voice = runtime["tts_female_voice"] if gender == "female" else runtime["tts_male_voice"]
     defaults = {"speed": float(runtime["tts_default_speed"]), "pitch": float(runtime["tts_default_pitch"]), "volume": float(runtime["tts_default_volume"])}
     try:
         speed = min(1.25, max(.8, float(saved.get("speed", defaults["speed"]))))
@@ -4467,14 +4515,14 @@ def get_voice_preferences(chat_id):
     except (TypeError, ValueError):
         speed, pitch, volume = defaults["speed"], defaults["pitch"], defaults["volume"]
     engine = str(runtime["tts_provider"] or "edge").lower()
-    return {"voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
+    return {"gender": gender, "voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
             "supports_pitch": engine in {"edge", "browser"}, "supports_volume": engine in {"edge", "browser"}}
 
 
 def normalize_voice_preferences(voice, speed=1.0, pitch=1.0, volume=1.0):
     runtime = runtime_config_values()
-    voice = str(voice or runtime["tts_voice"]).strip()[:120]
-    if not voice or not re.fullmatch(r"[A-Za-z0-9._-]{2,120}", voice):
+    gender = _voice_gender(voice, runtime)
+    if gender is None:
         return None
     try:
         speed, pitch, volume = float(speed), float(pitch), float(volume)
@@ -4482,13 +4530,15 @@ def normalize_voice_preferences(voice, speed=1.0, pitch=1.0, volume=1.0):
         return None
     if not .8 <= speed <= 1.25 or not .5 <= pitch <= 1.5 or not .2 <= volume <= 1.0:
         return None
-    return {"voice": voice, "speed": round(speed, 2), "pitch": round(pitch, 2), "volume": round(volume, 2)}
+    return {"gender": gender, "speed": round(speed, 2), "pitch": round(pitch, 2), "volume": round(volume, 2)}
 
 
 def set_voice_preferences(chat_id, voice=None, speed=1.0, pitch=1.0, volume=1.0):
     value = normalize_voice_preferences(voice, speed, pitch, volume)
     if value is None:
         return {"ok": False, "error": "invalid_voice_preferences"}
+    # Persist only semantic gender and supported user controls.  The concrete
+    # id is selected live from the admin's male/female configuration.
     set_app_setting(f"voice_preferences:{int(chat_id)}", json.dumps(value, ensure_ascii=False), updated_by=chat_id)
     return {"ok": True, **get_voice_preferences(chat_id)}
 
@@ -4497,7 +4547,8 @@ async def make_voice(text, chat_id=None, preferences=None):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
 
-    prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime_config_values()["tts_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
+    runtime = runtime_config_values()
+    prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime["tts_male_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
     rate = f"{round((float(prefs['speed']) - 1) * 100):+d}%"
     pitch = f"{round((float(prefs['pitch']) - 1) * 50):+d}Hz"
     volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
@@ -5110,52 +5161,33 @@ async def callback(update,context):
     if q.data == "settings:model":
         current = effective_user_ai_config(q.message.chat_id)
         selected = current["effective_model"]
-        global_config = current["global"]
         lines = [
-            "<b>🧠 Модель</b>",
-            f"🌐 Для всех: <b>{html.escape(global_config['model_mode'])}</b> · <code>{html.escape(str(global_config['model']))}</code>",
-            f"👤 Моя модель: <code>{html.escape(str(current['personal']['model_override'] or 'Авто'))}</code>",
-            f"Effective: <code>{html.escape(str(selected['value']))}</code> · <b>{html.escape(str(selected['source']))}</b>",
+            "<b>🧠 Глобальная модель Noema</b>",
+            f"Сейчас для всех: <code>{html.escape(str(selected['value']))}</code>",
+            f"Источник: <b>{html.escape(str(selected['source']))}</b>",
             "",
-            f"FAST default: <code>{html.escape(str(current['fast_default']['value']))}</code>",
-            f"STRONG fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
+            f"Аварийный fallback: <code>{html.escape(str(current['strong_fallback']['value']))}</code>",
             "",
-            "Выберите модель или вернитесь в автоматический router mode:",
+            "Выберите основную модель. Изменение применяется к новым запросам сразу.",
         ]
-        models = available_models_for(q.message.chat_id)
-        buttons = [
-            [InlineKeyboardButton("🌐 Auto для всех", callback_data="model:global:auto")],
-            *[[InlineKeyboardButton(f"🌐 Force · {model}", callback_data=f"model:gforce:{model}")] for model in models],
-            [InlineKeyboardButton(
-            ("●" if selected["source"] != "USER" else "○") + " Авто",
-            callback_data="model:auto",
-        )]]
+        models = runtime_config_values()["model_catalog"]
+        buttons = []
         for model in models:
-            mark = "●" if selected["source"] == "USER" and model == selected["value"] else "○"
-            buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:set:{model}")])
+            mark = "●" if model == selected["value"] else "○"
+            buttons.append([InlineKeyboardButton(f"{mark} {model}", callback_data=f"model:global:set:{model}")])
         buttons += [
-            [InlineKeyboardButton("➕ Добавить модель", callback_data="model:add")],
-            [InlineKeyboardButton("🗑 Удалить модель", callback_data="model:delete_menu")],
             [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")],
         ]
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
-    if q.data == "model:global:auto":
-        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "auto")
-        return await q.edit_message_text(
-            "🌐 Глобальная модель возвращена в AUTO. Персональные настройки снова активны.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
-        )
-
-    if q.data.startswith("model:gforce:"):
+    if q.data.startswith("model:global:set:"):
         model = q.data.split(":", 2)[2]
-        if model not in available_models_for(q.message.chat_id):
+        if model not in runtime_config_values()["model_catalog"]:
             return await q.edit_message_text("Модель недоступна.")
-        set_admin_runtime_config(q.message.chat_id, "global_force_model", model)
-        set_admin_runtime_config(q.message.chat_id, "global_model_mode", "force")
+        set_admin_runtime_config(q.message.chat_id, "fast_model", model)
         return await q.edit_message_text(
-            f"🌐 FORCE включён: <code>{html.escape(model)}</code> для всех пользователей.",
+            f"🌐 Основная модель: <code>{html.escape(model)}</code> для всех пользователей.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Модель", callback_data="settings:model")]]),
         )
 
@@ -5224,65 +5256,15 @@ async def callback(update,context):
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Vision", callback_data="settings:vision")]]))
 
     if q.data == "model:auto":
-        model_router().set_primary(q.message.chat_id, "")
-        current = effective_user_ai_config(q.message.chat_id)["effective_model"]
         await q.edit_message_text(
-            f"<b>🧠 Автоматический режим</b>\n"
-            f"Сейчас: <code>{html.escape(str(current['value']))}</code>\n"
-            f"Источник: <b>{html.escape(str(current['source']))}</b>",
+            "<b>🧠 Личный выбор модели отключён.</b>\n"
+            "Noema использует единую глобальную модель, заданную администратором.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Изменить", callback_data="settings:model")],
                 [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
             ]),
         )
-        return
-
-    if q.data.startswith("model:set:"):
-        model = q.data.split(":", 2)[2]
-        if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель недоступна.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
-            ]))
-        model_router().set_primary(q.message.chat_id, model)
-        await q.edit_message_text(
-            f"<b>🧠 Модель выбрана</b>\n{html.escape(model)}\n"
-            f"Источник: <b>USER</b>\n\nСледующее сообщение сразу будет обработано этой моделью.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Изменить", callback_data="settings:model")],
-                [InlineKeyboardButton("‹ Назад", callback_data="settings:back")],
-            ]),
-        )
-        return
-
-    if q.data == "model:add":
-        context.user_data["awaiting_model"] = True
-        await q.edit_message_text(
-            "Пришлите точный ID модели OpenRouter, например:\n<code>deepseek/deepseek-v4-flash-0731</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="settings:model")]]),
-        )
-        return
-
-    if q.data == "model:delete_menu":
-        models = available_models_for(q.message.chat_id)
-        buttons = [[InlineKeyboardButton(f"🗑 {model}", callback_data=f"model:delete:{model}")] for model in models]
-        buttons.append([InlineKeyboardButton("‹ К моделям", callback_data="settings:model")])
-        await q.edit_message_text("Выберите модель для удаления из этого чата:", reply_markup=InlineKeyboardMarkup(buttons))
-        return
-
-    if q.data.startswith("model:delete:"):
-        model = q.data.split(":", 2)[2]
-        if model not in available_models_for(q.message.chat_id):
-            return await q.edit_message_text("Модель уже удалена.", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("‹ Назад", callback_data="settings:model")]
-            ]))
-        set_chat_model(q.message.chat_id, model, enabled=False)
-        if model_router().resolve(q.message.chat_id, "chat")["primary"] == model:
-            model_router().set_primary(q.message.chat_id, "")
-        await q.edit_message_text(f"Модель удалена из списка этого чата:\n{html.escape(model)}",
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К моделям", callback_data="settings:model")]]))
         return
 
     if q.data == "settings:back":
@@ -5301,7 +5283,16 @@ async def callback(update,context):
             return
         prefs = get_voice_preferences(q.message.chat_id)
         speed = min(1.25, max(.8, round(prefs["speed"] + (-.1 if direction == "down" else .1), 2)))
-        set_voice_preferences(q.message.chat_id, prefs["voice"], speed, prefs["pitch"], prefs["volume"])
+        set_voice_preferences(q.message.chat_id, prefs["gender"], speed, prefs["pitch"], prefs["volume"])
+        text, markup = voice_settings_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    if q.data.startswith("voice:gender:"):
+        gender = q.data.rsplit(":", 1)[-1]
+        if gender not in {"male", "female"}:
+            return
+        prefs = get_voice_preferences(q.message.chat_id)
+        set_voice_preferences(q.message.chat_id, gender, prefs["speed"], prefs["pitch"], prefs["volume"])
         text, markup = voice_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -6002,6 +5993,9 @@ def voice_settings_page(chat_id):
     prefs = get_voice_preferences(chat_id)
     speed = float(prefs["speed"])
     rows = [[
+        InlineKeyboardButton(("● " if prefs["gender"] == "male" else "○ ") + "Мужской", callback_data="voice:gender:male"),
+        InlineKeyboardButton(("● " if prefs["gender"] == "female" else "○ ") + "Женский", callback_data="voice:gender:female"),
+    ], [
         InlineKeyboardButton("−", callback_data="voice:speed:down" if speed > .8 else "voice:speed:noop"),
         InlineKeyboardButton(f"{speed:.2f}×", callback_data="voice:speed:noop"),
         InlineKeyboardButton("+", callback_data="voice:speed:up" if speed < 1.25 else "voice:speed:noop"),
@@ -6010,9 +6004,9 @@ def voice_settings_page(chat_id):
         rows.append([InlineKeyboardButton("Открыть расширенные настройки", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
     rows.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
     text = ("<b>🎙 Голос</b>\n"
-            f"Голос: <code>{html.escape(str(prefs['voice']))}</code>\n"
+            f"Выбор: <b>{'Мужской' if prefs['gender'] == 'male' else 'Женский'}</b> · <code>{html.escape(str(prefs['voice']))}</code>\n"
             f"Скорость: <b>{speed:.2f}×</b>\n\n"
-            "Тон и громкость доступны в Mini App.")
+            "Идентификатор голоса задаёт администратор; тон и громкость доступны в Mini App.")
     return text, live_markup(InlineKeyboardMarkup(rows))
 
 
@@ -6277,16 +6271,6 @@ async def text_handler(update,context):
             await update.effective_message.delete()
         text, markup = plan_page(cid, parsed.isoformat())
         return await refresh_active_ui(update, context, text, markup)
-
-    if context.user_data.pop("awaiting_model", False):
-        model = t.strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.:-]+", model):
-            return await update.effective_message.reply_text(
-                "Не похож на ID модели. Формат: <провайдер>/<модель>, например deepseek/deepseek-v4-flash-0731.")
-        set_chat_model(cid, model, enabled=True)
-        return await update.effective_message.reply_text(
-            f"Добавила модель: {model}\nОткройте «⚙️ Настройки → 🧠 Модель» и выберите её.",
-            reply_markup=settings_keyboard(cid))
 
     if t in ("⚙️ Настройки", "Настройки"):
         await consume_menu_tap()

@@ -16,7 +16,7 @@ class DeployFeaturesTest(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertTrue(all(len(x) < 3900 for x in chunks))
 
-    def test_model_router_reads_current_database_value(self):
+    def test_model_router_deactivates_legacy_chat_primary_value(self):
         db = Path(tempfile.mkdtemp()) / "settings.sqlite3"
         def connect():
             c = sqlite3.connect(db); c.row_factory = sqlite3.Row
@@ -25,7 +25,7 @@ class DeployFeaturesTest(unittest.TestCase):
         router = ModelRouter(connect, "model-a", ["model-f"], "vision-a")
         self.assertEqual(router.resolve(1)["primary"], "model-a")
         router.set_primary(1, "model-b")
-        self.assertEqual(router.resolve(1)["primary"], "model-b")
+        self.assertEqual(router.resolve(1)["primary"], "model-a")
 
     def test_generic_relation_has_one_source_item(self):
         db = Path(tempfile.mkdtemp()) / "memory.sqlite3"

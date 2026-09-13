@@ -118,6 +118,8 @@ class StreamAccumulator:
     finish_reason: str | None = None
     usage: dict = field(default_factory=dict)
     visible_filter: VisibleContentFilter = field(default_factory=VisibleContentFilter, repr=False)
+    reasoning_chunks_dropped: int = 0
+    visible_chars: int = 0
 
     def add(self, payload: dict) -> list[str]:
         if payload.get("usage"):
@@ -126,12 +128,19 @@ class StreamAccumulator:
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
         delta = choice.get("delta") or {}
         emitted = []
+        # OpenRouter-compatible providers can put chain-of-thought in these
+        # fields.  They are intentionally never normalised into content.
+        if any(delta.get(name) for name in ("reasoning", "reasoning_details", "analysis", "thinking")):
+            self.reasoning_chunks_dropped += 1
         content = delta.get("content")
         if isinstance(content, str) and content:
             visible = self.visible_filter.feed(content)
             if visible:
                 self.content.append(visible)
                 emitted.append(visible)
+                self.visible_chars += len(visible)
+            elif self.visible_filter.hidden_depth or self.visible_filter.tag_buffer:
+                self.reasoning_chunks_dropped += 1
         for part in delta.get("tool_calls") or []:
             index = int(part.get("index", 0))
             call = self.calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
@@ -148,6 +157,7 @@ class StreamAccumulator:
         tail = self.visible_filter.finish()
         if tail:
             self.content.append(tail)
+            self.visible_chars += len(tail)
         return tail
 
     def message(self) -> dict:

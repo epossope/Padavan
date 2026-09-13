@@ -13,14 +13,14 @@ Amvera должна содержать только переменные из `U
 | `OPENROUTER_API_KEY` | Общий ключ LLM и batch STT | Required secret |
 | `QUICK_ACTIONS_BASE_URL` | Публичный HTTPS origin Mini App | Required, если Mini App включён |
 | `ADMIN_CHAT_IDS` | Доступ к admin telemetry и Realtime Beta | Optional |
-| `GLOBAL_MODEL_MODE`, `GLOBAL_FORCE_MODEL`, `GLOBAL_VISION_MODE`, `GLOBAL_FORCE_VISION_MODEL` | Bootstrap глобальных AUTO/FORCE режимов | Optional; editable live admin, defaults AUTO |
-| `FAST_MODEL`, `FAST_MODEL_PROVIDERS`, `FAST_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для fast router | Optional; editable live admin |
+| `GLOBAL_VISION_MODE`, `GLOBAL_FORCE_VISION_MODEL` | Bootstrap глобального Vision AUTO/FORCE | Optional; editable live admin, defaults AUTO |
+| `FAST_MODEL`, `FAST_MODEL_PROVIDERS`, `FAST_MODEL_ALLOW_PROVIDER_FALLBACK` | Единственная primary LLM Noema: ADMIN → ENV → default | Optional; editable live admin |
 | `STRONG_MODEL`, `STRONG_MODEL_PROVIDERS`, `STRONG_MODEL_ALLOW_PROVIDER_FALLBACK` | Bootstrap defaults для strong fallback | Optional; editable live admin |
 | `MODEL_CATALOG`, `CHAT_MAX_TOKENS` | Allowed model catalogue и лимит | Optional; catalogue editable live admin |
 | `VISION_MODEL`, `VISION_FALLBACK_MODELS` | Bootstrap defaults Vision | Optional; editable live admin |
 | `BATCH_STT_MODEL`, `BATCH_STT_TIMEOUT_SEC` | Canonical production batch STT | Optional; defaults `mistralai/voxtral-mini-transcribe`, `180` |
 | `MISTRAL_API_KEY`, `MISTRAL_REALTIME_MODEL`, `MISTRAL_CLIENT_SESSIONS_URL` | Только admin-only Experimental Realtime Beta | Key is secret; model editable live admin |
-| `TTS_PROVIDER`, `TTS_FALLBACK_PROVIDER`, `EDGE_VOICE`, `TTS_DEFAULT_SPEED`, `TTS_DEFAULT_PITCH`, `TTS_DEFAULT_VOLUME`, `VOICE_REPLY_MODE` | Bootstrap TTS, voice prosody and default reply mode | Optional; editable live admin |
+| `TTS_PROVIDER`, `TTS_FALLBACK_PROVIDER`, `TTS_MALE_VOICE`, `TTS_FEMALE_VOICE`, `EDGE_VOICE`, `TTS_DEFAULT_SPEED`, `TTS_DEFAULT_PITCH`, `TTS_DEFAULT_VOLUME`, `VOICE_REPLY_MODE` | Bootstrap TTS, semantic male/female slots, prosody and default reply mode | Optional; editable live admin |
 | `TELEGRAM_DRAFT_STREAMING_ENABLED`, `TELEGRAM_DRAFT_MIN_INTERVAL`, `TELEGRAM_DRAFT_MAX_INTERVAL`, `TELEGRAM_DRAFT_MIN_CHARS` | Experimental Telegram draft mode; production uses one persistent edited message | Optional; draft mode defaults to `false` |
 | `TELEGRAM_SEND_RETRIES`, `TELEGRAM_CONNECT_TIMEOUT`, `TELEGRAM_READ_TIMEOUT`, `TELEGRAM_WRITE_TIMEOUT`, `TELEGRAM_POOL_TIMEOUT`, `TELEGRAM_CONNECTION_POOL_SIZE` | Telegram HTTP reliability | Optional; defaults есть |
 | `REMINDER_TICK_SECONDS` | Reminder scheduler | Optional; clamped 15–30 sec |
@@ -34,6 +34,7 @@ Amvera должна содержать только переменные из `U
 |---|---|---|---|
 | `STT_MODEL` | `BATCH_STT_MODEL` | Used only when `BATCH_STT_MODEL` is absent | Move its value to `BATCH_STT_MODEL`; remove legacy key after the next release |
 | `MODEL` | `FAST_MODEL` | Used only when `FAST_MODEL` is absent | Move its value to `FAST_MODEL`; remove after the next release |
+| `GLOBAL_MODEL_MODE`, `GLOBAL_FORCE_MODEL` | — | Ignored after model consolidation | Delete from Amvera; use `FAST_MODEL` or the live admin setting |
 | `FALLBACK_MODELS` | `STRONG_MODEL` | First value used only when `STRONG_MODEL` is absent | Move first value to `STRONG_MODEL`; remove after the next release |
 | `AVAILABLE_MODELS` | `MODEL_CATALOG` | Used only when `MODEL_CATALOG` is absent | Move its value to `MODEL_CATALOG`; remove after the next release |
 | `BOT_TOKEN` | `TELEGRAM_BOT_TOKEN` | Historical fallback is still read | Prefer canonical name; do not add it to new deployments |

@@ -299,7 +299,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (root / "app.js").read_text(encoding="utf-8")
         screen_source = (root / "screens.js").read_text(encoding="utf-8")
         mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
-        self.assertEqual(index.count("?v=ui-1.6.0"), 11)
+        self.assertEqual(index.count("?v=ui-1.7.0"), 11)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", app_source)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", screen_source)
         self.assertNotIn("if(homeEditing", mobile_source)
@@ -309,9 +309,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")
         self.assertIn("effective_user_ai_config(cid)", api_source)
         self.assertIn('"effective_ai": effective_ai', api_source)
-        self.assertIn("Сейчас для меня", app_source)
+        self.assertIn("ТЕКУЩАЯ ГЛОБАЛЬНАЯ МОДЕЛЬ", app_source)
         self.assertIn("effective.effective_model", app_source)
-        self.assertIn("FAST default и STRONG fallback", app_source)
+        self.assertIn("Аварийная модель", app_source)
         self.assertEqual(app_source.count("runtimeSection('"), 6)
 
     async def test_production_tts_metrics_are_numeric_allowlisted(self):
