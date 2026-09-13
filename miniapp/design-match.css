@@ -198,63 +198,12 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
   animation:bubble-in 180ms ease-out both;
 }
 .chat-screen .bubble.user{max-width:80%;padding:9px 12px;background:rgba(255,255,255,.075)}
-.chat-screen .composer{
-  position:relative;bottom:auto;min-height:64px;flex:0 0 auto;margin:8px 0 max(10px,var(--app-safe-bottom,env(safe-area-inset-bottom)));
-  padding:5px 6px 5px 15px;gap:8px;border:0;border-radius:23px;background:transparent;box-shadow:none;isolation:isolate;
-}
-.chat-screen .composer:before{content:'';position:absolute;z-index:-1;inset:0 48px 0 0;border:1px solid rgba(244,244,242,.22);border-right:0;border-radius:23px 0 0 23px;background:linear-gradient(135deg,rgba(255,255,255,.075),rgba(255,255,255,.018));box-shadow:inset 0 1px rgba(255,255,255,.045),0 14px 34px rgba(0,0,0,.3);backdrop-filter:blur(22px)}
-.chat-screen .composer input{min-height:52px;padding:8px 0;border:0;background:none;font-size:16px;line-height:1.2;outline:0}
-.chat-screen .composer-status{
-  position:absolute;z-index:2;left:15px;right:69px;top:9px;color:rgba(226,226,223,.66);
-  font-size:10px;line-height:1.1;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.chat-screen .composer-status:not([hidden])+input{padding-top:19px;padding-bottom:2px}
-.chat-voice-orb{
-  order:2;flex:0 0 56px;width:56px;height:56px;min-height:56px;padding:0;border:0!important;border-radius:50%!important;
-  background:radial-gradient(circle at 36% 30%,rgba(255,255,255,.13),rgba(255,255,255,.015) 64%,transparent 66%)!important;
-  transform:translateY(5px);filter:brightness(1.75) contrast(1.07) drop-shadow(0 0 10px rgba(255,255,255,.17));overflow:visible;
-}
-.chat-voice-orb canvas{display:block;width:100%;height:100%}
 .chat-screen .chat-latest{position:absolute;z-index:4;right:12px;bottom:82px;width:34px;height:34px;min-height:34px;padding:0;border:1px solid rgba(244,244,242,.24);border-radius:50%;background:rgba(20,20,20,.88);box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:20px;line-height:1;color:var(--ink)}
 .chat-screen .chat-latest[hidden]{display:none}
 #shell.edge-swipe-active,#shell.edge-swipe-settling{will-change:transform;transform:translate3d(var(--edge-swipe-x,0),0,0)}
 #shell.edge-swipe-active{transition:none!important}
 #shell.edge-swipe-settling{transition:transform 180ms cubic-bezier(.2,.8,.2,1)}
 @keyframes bubble-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-
-/* Telegram-like chat mechanics: native list scrolling, anchored only by ChatScrollController. */
-.chat-screen #content{position:relative;min-height:0}
-.chat-screen .chat{display:flex;flex-direction:column;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;touch-action:pan-y;overscroll-behavior:contain;scroll-behavior:auto}
-.chat-screen .chat::before{content:'';flex:0 0 auto;margin-top:auto}
-.chat-screen .chat>.empty{margin:auto 0 0}
-.chat-screen .bubble{width:fit-content;max-width:82%;flex:0 0 auto}
-.chat-screen .bubble.user{max-width:78%}
-.chat-screen .bubble.thinking{min-width:30px;color:var(--muted)}
-.chat-screen .composer{position:relative;flex:0 0 auto;min-height:52px;margin:8px 80px max(8px,var(--app-safe-bottom,env(safe-area-inset-bottom))) 0;padding:3px 8px 3px 13px;overflow:visible;border:0!important;border-radius:19px 0 0 19px;background:transparent;box-shadow:none}
-.chat-screen .composer:before{inset:0 34px 0 0;border-right:0;border-radius:19px 0 0 19px}
-.chat-screen .composer textarea{display:block;flex:1;align-self:flex-end;min-width:0;min-height:46px;max-height:132px;margin:0;padding:12px 0 10px;border:0;border-radius:0;background:transparent;resize:none;overflow-y:auto;font:300 16px/1.25 var(--font-ui);outline:0}
-.chat-screen .composer-status{right:22px;top:8px}
-.chat-screen .composer-status:not([hidden])+textarea{padding-top:20px;padding-bottom:2px}
-.chat-screen .chat-voice-orb{position:absolute;right:-80px;bottom:0;z-index:2;flex:0 0 80px;width:80px;height:80px;min-height:80px;margin:0;transform:none;filter:brightness(2.35) contrast(1.07) drop-shadow(0 0 15px rgba(255,255,255,.24));overflow:visible}
-.chat-screen .chat-voice-orb canvas{width:80px;height:80px}
-.chat-screen .chat-latest{right:10px;bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 66px)}
-@media(max-width:370px){.chat-screen .composer{margin-right:74px}.chat-screen .chat-voice-orb{right:-74px;width:74px;height:74px;min-height:74px}.chat-screen .chat-voice-orb canvas{width:74px;height:74px}}
-
-/* V1.5: the chat input and sphere are adjacent grid cells, never overlapping layers. */
-.chat-screen .chat{display:block;min-height:0;padding:2px 0 12px}
-.chat-screen .chat::before{display:none}
-.chat-screen .chat-inner{display:flex;flex-direction:column;justify-content:flex-start;gap:6px;min-height:100%}
-.chat-screen .chat-inner::before{content:'';flex:1 0 0}
-.chat-screen .chat-inner>[data-chat-bottom-sentinel]{flex:0 0 1px;width:100%}
-.chat-screen .composer{--chat-sphere-slot:84px;display:grid;grid-template-columns:minmax(0,1fr) var(--chat-sphere-slot);grid-template-rows:auto;align-items:end;column-gap:0;min-height:80px;margin:8px 0 max(8px,var(--app-safe-bottom,env(safe-area-inset-bottom))) 0;padding:0;overflow:visible;background:transparent}
-.chat-screen .composer:before{z-index:0;inset:auto var(--chat-sphere-slot) 8px 0;height:52px;border:1px solid rgba(244,244,242,.22);border-right:0;border-radius:19px 0 0 19px}
-.chat-screen .composer textarea{grid-column:1;grid-row:1;z-index:1;align-self:end;min-height:52px;max-height:122px;margin:8px 0;padding:14px 16px 12px;border:0;background:transparent}
-.chat-screen .composer-status{z-index:2;left:16px;right:calc(var(--chat-sphere-slot) + 15px);top:auto;bottom:40px}
-.chat-screen .composer-status:not([hidden])+textarea{padding-top:22px;padding-bottom:4px}
-.chat-screen .chat-voice-orb{position:relative;right:auto;bottom:-8px;grid-column:2;grid-row:1;align-self:end;justify-self:end;z-index:2;width:84px;height:84px;min-height:84px}
-.chat-screen .chat-voice-orb canvas{width:84px;height:84px}
-.chat-screen .chat-latest{bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 96px)}
-@media(max-width:370px){.chat-screen .composer{--chat-sphere-slot:74px;min-height:74px;margin-right:0}.chat-screen .composer:before{inset:auto var(--chat-sphere-slot) 8px 0;height:52px}.chat-screen .chat-voice-orb{right:auto;bottom:-7px;width:74px;height:74px;min-height:74px}.chat-screen .chat-voice-orb canvas{width:74px;height:74px}}
 
 /* 5. Tasks and reminders */
 .task-list,.reminder-list,.recent-notes,.resource-list,.people-list{display:grid;gap:10px}
@@ -905,25 +854,11 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 }
 .focus-pill>*{position:relative;z-index:1}
 
-/* Chat uses the same quiet glass language; the voice sphere overhangs a small composer. */
+/* Chat keeps the same compact bubble language; its composer is defined once below. */
 .chat-screen header{margin-bottom:5px}
 .chat-screen .chat{gap:6px;padding:2px 0 14px}
 .chat-screen .bubble{max-width:84%;padding:8px 10px;border-radius:15px;font-size:13px;line-height:1.4}
 .chat-screen .bubble.user{max-width:78%;padding:7px 9px}
-.chat-screen .composer{
-  min-height:52px;margin:20px 0 max(22px,var(--app-safe-bottom,env(safe-area-inset-bottom)));
-  padding:3px 2px 3px 12px;gap:5px;border-radius:18px;border-color:rgba(244,244,242,.15);
-  background:linear-gradient(135deg,rgba(255,255,255,.052),rgba(255,255,255,.012));
-  box-shadow:inset 0 1px rgba(255,255,255,.035),0 9px 26px rgba(0,0,0,.26);
-}
-.chat-screen .composer input{min-height:44px;height:44px;padding:5px 0;font-size:16px}
-.chat-screen .composer-status{left:12px;right:94px;top:7px;font-size:9px}
-.chat-screen .composer-status:not([hidden])+input{padding-top:16px}
-.chat-voice-orb{
-  z-index:2;flex:0 0 88px;width:88px;height:88px;min-height:88px;margin:-18px -2px -18px 0;
-  filter:brightness(2.3) contrast(1.06) drop-shadow(0 0 13px rgba(255,255,255,.22));
-}
-.chat-voice-orb canvas{width:88px;height:88px}
 
 @media(max-width:430px){
   .search-field input{font-size:16px}
@@ -941,8 +876,6 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
   .budget-controls{grid-template-columns:minmax(0,1fr) 108px;gap:4px}
   .budget-controls .segments button{padding-left:2px;padding-right:2px;font-size:8.5px}
   .period-picker{font-size:8px;padding-left:5px;padding-right:5px}
-  .chat-voice-orb{flex-basis:82px;width:82px;height:82px;min-height:82px}
-  .chat-voice-orb canvas{width:82px;height:82px}
 }
 
 /* V1.2 shared finish — one visual grammar across every internal workspace. */
@@ -1024,23 +957,6 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 .period-balance{text-align:right;white-space:nowrap}
 .period-balance h3{margin-bottom:5px}
 .finance-strip .period-balance .amount{font-size:20px}
-.chat-screen .composer{
-  position:sticky;overflow:visible;margin-right:102px;padding-right:8px;
-  border-right:0;border-radius:18px 0 0 18px;
-}
-.chat-screen .composer input{padding-right:0}
-.chat-screen .composer-status{right:8px}
-.chat-screen .chat-voice-orb{
-  position:absolute;right:-103px;bottom:-2px;width:104px;height:104px;min-height:104px;margin:0;
-  filter:brightness(2.45) contrast(1.07) drop-shadow(0 0 15px rgba(255,255,255,.25));
-}
-.chat-screen .chat-voice-orb canvas{width:104px;height:104px}
-@media(max-width:370px){
-  .chat-screen .composer{margin-right:94px}
-  .chat-screen .chat-voice-orb{right:-95px;width:96px;height:96px;min-height:96px}
-  .chat-screen .chat-voice-orb canvas{width:96px;height:96px}
-}
-
 /* V1.3 Home edit mode stays inside the grid and keeps the permanent dock untouched. */
 .home-edit-head{
   display:flex;align-items:center;justify-content:space-between;min-height:28px;margin:-1px 0 6px;
@@ -1066,20 +982,133 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 .home-hidden .chip{min-height:24px;padding:3px 8px;font-size:9px}
 .home-hidden .chip-row>span{font-size:9px;color:var(--muted)}
 
-/* V1.4 Telegram-like chat: native viewport, stable bottom anchoring, one composer control. */
-.chat-screen #content{position:relative;min-height:0}
-.chat-screen .chat{display:flex;flex-direction:column;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;touch-action:pan-y;overscroll-behavior:contain;scroll-behavior:auto}
-.chat-screen .chat::before{content:'';flex:0 0 auto;margin-top:auto}
+/* Canonical chat layout: one viewport scroller and one integrated composer pill. */
+.chat-screen #content{display:flex;position:relative;min-height:0;padding-bottom:0}
+.chat-screen .chat-shell{
+  position:relative;display:grid;grid-template-rows:minmax(0,1fr) auto;
+  flex:1;min-width:0;min-height:0;width:100%;
+}
+.chat-screen .chat{
+  grid-row:1;display:block;min-width:0;min-height:0;padding:2px 0 12px;
+  overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+  touch-action:pan-y;scroll-behavior:auto;scrollbar-width:none;
+}
+.chat-screen .chat::-webkit-scrollbar{display:none}
+.chat-screen .chat::before{display:none}
+.chat-screen .chat-inner{display:flex;flex-direction:column;gap:6px;min-height:100%;min-width:0}
+.chat-screen .chat-inner::before{content:'';flex:1 0 0}
+.chat-screen .chat-inner>[data-chat-bottom-sentinel]{flex:0 0 1px;width:100%}
 .chat-screen .chat>.empty{margin:auto 0 0}
 .chat-screen .bubble{width:fit-content;max-width:82%;flex:0 0 auto}
 .chat-screen .bubble.user{max-width:78%}
 .chat-screen .bubble.thinking{min-width:30px;color:var(--muted)}
-.chat-screen .composer{position:relative;flex:0 0 auto;min-height:52px;margin:8px 80px max(8px,var(--app-safe-bottom,env(safe-area-inset-bottom))) 0;padding:3px 8px 3px 13px;overflow:visible;border:0!important;border-radius:19px 0 0 19px;background:transparent;box-shadow:none}
-.chat-screen .composer:before{inset:0 34px 0 0;border-right:0;border-radius:19px 0 0 19px}
-.chat-screen .composer textarea{display:block;flex:1;align-self:flex-end;min-width:0;min-height:46px;max-height:132px;margin:0;padding:12px 0 10px;border:0;border-radius:0;background:transparent;resize:none;overflow-y:auto;font:300 16px/1.25 var(--font-ui);outline:0}
-.chat-screen .composer-status{right:22px;top:8px}
-.chat-screen .composer-status:not([hidden])+textarea{padding-top:20px;padding-bottom:2px}
-.chat-screen .chat-voice-orb{position:absolute;right:-80px;bottom:0;z-index:2;flex:0 0 80px;width:80px;height:80px;min-height:80px;margin:0;transform:none;filter:brightness(2.35) contrast(1.07) drop-shadow(0 0 15px rgba(255,255,255,.24));overflow:visible}
-.chat-screen .chat-voice-orb canvas{width:80px;height:80px}
-.chat-screen .chat-latest{right:10px;bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 66px)}
-@media(max-width:370px){.chat-screen .composer{margin-right:74px}.chat-screen .chat-voice-orb{right:-74px;width:74px;height:74px;min-height:74px}.chat-screen .chat-voice-orb canvas{width:74px;height:74px}}
+.chat-screen .chat-composer{
+  --chat-sphere-size:88px;
+  grid-row:2;display:block;position:relative;bottom:auto;isolation:isolate;
+  width:100%;min-width:0;min-height:58px;
+  margin:16px 0 max(12px,var(--app-safe-bottom,env(safe-area-inset-bottom)));padding:0;
+  overflow:visible;border:1px solid rgba(244,244,242,.2)!important;border-radius:22px;
+  background:linear-gradient(135deg,rgba(255,255,255,.07),rgba(255,255,255,.015));
+  box-shadow:inset 0 1px rgba(255,255,255,.045),0 14px 34px rgba(0,0,0,.3);
+  backdrop-filter:blur(22px);
+}
+.chat-screen .chat-composer::before{display:none}
+.chat-screen .chat-input-area{
+  position:relative;width:100%;min-width:0;min-height:56px;margin:0;
+  border:0;border-radius:inherit;background:transparent;box-shadow:none;backdrop-filter:none;
+}
+.chat-screen .chat-input-area textarea{
+  display:block;width:100%;min-width:0;max-width:none;min-height:56px;max-height:122px;
+  margin:0;padding:16px calc(var(--chat-sphere-size) + 18px) 14px 16px;border:0;border-radius:inherit;background:transparent;
+  resize:none;overflow-x:hidden;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+  color:var(--ink);font:300 16px/1.25 var(--font-ui);outline:0;scrollbar-width:none;
+}
+.chat-screen .chat-input-area textarea::-webkit-scrollbar{display:none}
+.chat-screen .chat-input-area .composer-status{
+  position:absolute;z-index:2;left:16px;right:calc(var(--chat-sphere-size) + 18px);top:8px;color:rgba(226,226,223,.66);
+  font-size:10px;line-height:1.1;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.chat-screen .chat-input-area .composer-status:not([hidden])+textarea{padding-top:22px;padding-bottom:4px}
+.chat-screen .chat-composer>.chat-voice-orb{
+  position:absolute;z-index:2;right:4px;bottom:-8px;display:block;
+  width:var(--chat-sphere-size);height:var(--chat-sphere-size);min-height:var(--chat-sphere-size);
+  margin:0;padding:0;overflow:visible;isolation:isolate;
+  border:0!important;border-radius:0!important;background:transparent!important;box-shadow:none!important;filter:none!important;
+  transform:none;
+}
+.chat-screen .chat-composer>.chat-voice-orb::before{
+  content:'';position:absolute;z-index:-1;inset:13%;pointer-events:none;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,.18) 0,rgba(255,255,255,.075) 34%,rgba(255,255,255,.018) 58%,transparent 72%);
+  box-shadow:0 0 18px rgba(255,255,255,.13),0 0 30px rgba(255,255,255,.055);
+}
+.chat-screen .chat-composer>.chat-voice-orb::after{
+  content:'';position:absolute;z-index:0;inset:25%;pointer-events:none;
+  border:1px solid rgba(245,245,243,.42);border-radius:48% 52% 46% 54%/54% 45% 55% 46%;
+  box-shadow:0 0 8px rgba(255,255,255,.24),inset 0 0 7px rgba(255,255,255,.12);
+  transform:rotate(-8deg);
+}
+.chat-screen .chat-composer>.chat-voice-orb canvas{
+  position:relative;z-index:1;display:block;width:100%;height:100%;
+  border:0;background:transparent!important;box-shadow:none;filter:none!important;
+}
+.chat-screen .chat-latest{right:12px;bottom:calc(var(--app-safe-bottom,env(safe-area-inset-bottom)) + 92px)}
+@media(max-width:370px){
+  .chat-screen .chat-composer{--chat-sphere-size:78px;min-height:56px}
+  .chat-screen .chat-composer>.chat-voice-orb{right:3px;bottom:-7px}
+}
+
+/* Product polish V1.4: People media, archive sheet and compact voice controls. */
+.person-profile>summary>.avatar{overflow:hidden;position:relative;background:radial-gradient(circle at 34% 28%,rgba(255,255,255,.16),rgba(255,255,255,.035) 56%,transparent 72%)}
+.person-profile .avatar img{display:block;width:100%;height:100%;object-fit:cover;filter:grayscale(1) contrast(1.06)}
+.person-profile .avatar-loading{position:absolute;inset:28%;border:1px solid rgba(255,255,255,.38);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite}
+.person-groups,.project-chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.person-groups span,.project-chips span{border:1px solid rgba(244,244,242,.13);border-radius:999px;padding:4px 8px;color:var(--muted);font-size:10px}
+.person-groups .tag{border-style:dashed}
+.avatar-action{position:relative;display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+.avatar-action input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.people-overflow{min-height:30px;max-width:78px;padding:0 20px 0 9px;border-radius:999px;font-size:10px}
+.resource-card[role=button]{cursor:pointer;touch-action:pan-y}
+.resource-card[role=button]:active{transform:scale(.995);border-color:rgba(244,244,242,.3)}
+.preview-sheet{width:min(92vw,520px);max-height:min(78dvh,720px);margin:auto auto 0;border-radius:24px 24px 0 0;padding:18px;background:rgba(12,13,15,.96);border:1px solid rgba(244,244,242,.16);color:var(--text);box-shadow:0 -18px 60px rgba(0,0,0,.5)}
+.preview-sheet::backdrop{background:rgba(0,0,0,.64);backdrop-filter:blur(5px)}
+.preview-sheet[open]{animation:sheet-in .22s ease-out}
+.preview-sheet #preview-body{overflow:auto;max-height:calc(78dvh - 72px);padding-bottom:max(12px,var(--app-safe-bottom))}
+.preview-media{display:grid;place-items:center;min-height:148px;margin:4px 0 14px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,.035);border:1px solid rgba(244,244,242,.09)}
+.preview-media>svg{width:44px;height:44px;color:var(--muted)}
+.preview-media img{display:block;width:100%;max-height:50dvh;object-fit:contain;background:#000}
+.preview-meta{display:grid;gap:0;margin:14px 0}
+.preview-meta div{display:grid;grid-template-columns:80px 1fr;gap:10px;padding:8px 0;border-top:1px solid rgba(244,244,242,.08)}
+.preview-meta dt{color:var(--muted);font-size:11px}.preview-meta dd{margin:0;font-size:12px;overflow-wrap:anywhere}
+.preview-open{display:inline-flex;text-decoration:none;align-items:center;justify-content:center}
+.voice-slider{display:grid;grid-template-columns:1fr auto;gap:5px 10px;padding:10px 0;border-top:1px solid rgba(244,244,242,.08)}
+.voice-slider span,.voice-slider output{font-size:12px}.voice-slider output{color:var(--muted)}
+.voice-slider input{grid-column:1/-1;width:100%;accent-color:#e8e8e6}
+@keyframes sheet-in{from{transform:translateY(30px);opacity:.4}to{transform:none;opacity:1}}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Product polish V1.4: denser Home viewport with slightly stronger widgets. */
+#shell[data-page="home"]{padding-top:calc(10px + var(--app-safe-top,env(safe-area-inset-top)))}
+#shell[data-page="home"] header{height:44px;min-height:44px;margin-bottom:10px}
+#shell[data-page="home"] .home-grid>[data-widget]{height:152px;min-height:152px}
+#shell[data-page="home"] .home-grid .card-head h3{font-size:10px}
+#shell[data-page="home"] .home-grid .card-head svg{width:19px;height:19px}
+#shell[data-page="home"] .home-grid .widget-content{max-height:104px;gap:6px}
+#shell[data-page="home"] .home-grid .widget-line svg{width:12.5px;height:16px}
+#shell[data-page="home"] .home-grid .widget-line>span{font-size:11.5px;line-height:1.3}
+#shell[data-page="home"] .home-grid .widget-line small{font-size:8.5px}
+#shell[data-page="home"] .home-grid .amount{font-size:24px}
+#shell[data-page="home"] .widget-time{font-size:24px!important}
+#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 116px minmax(0,.8fr)}
+#shell[data-page="home"] .focus-pill{width:100%;max-width:142px;min-height:62px;padding:9px 11px}
+#shell[data-page="home"] .focus-pill small{font-size:8.5px}
+#shell[data-page="home"] .focus-pill span{font-size:11px;line-height:1.3}
+@media(max-width:430px){
+  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 112px minmax(0,.8fr)}
+  #shell[data-page="home"] .focus-pill{max-width:132px;min-height:60px}
+}
+@media(max-width:370px){
+  #shell[data-page="home"] .home-grid>[data-widget]{height:148px;min-height:148px}
+  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 106px minmax(0,.8fr)}
+  #shell[data-page="home"] .focus-pill{max-width:118px;min-height:58px;padding:8px 9px}
+  #shell[data-page="home"] .focus-pill span{font-size:10.5px}
+}

@@ -281,6 +281,14 @@ def register_miniapp(app, core):
                     raise ValueError("Неизвестный режим")
                 core.set_mode(cid, args["mode"])
                 result = {"ok": True}
+            elif action == "voice_preferences":
+                result = await asyncio.to_thread(core.set_voice_preferences, cid, args.get("voice"), args.get("speed", 1), args.get("pitch", 1), args.get("volume", 1))
+                if not result.get("ok"):
+                    raise ValueError("Некорректные настройки голоса")
+            elif action == "person_avatar_remove":
+                result = await asyncio.to_thread(core.set_person_avatar, cid, int(args["person_id"]), None)
+                if not result.get("ok"):
+                    raise ValueError("Человек не найден")
             elif action in {"set_experimental_realtime", "set_experimental_wake"}:
                 if cid not in getattr(core, "ADMIN_CHAT_IDS", set()):
                     raise web.HTTPForbidden(text="Недостаточно прав")
@@ -347,8 +355,21 @@ def register_miniapp(app, core):
             reminders = [dict(r) for r in c.execute("SELECT id,text,remind_at_utc,acknowledged FROM reminders WHERE chat_id=? ORDER BY remind_at_utc DESC LIMIT 200", (cid,))]
             cfg = c.execute("SELECT enabled,time,city,topics FROM briefings WHERE chat_id=?", (cid,)).fetchone()
         files = core.get_files(cid, limit=100)["files"]
+        with core.conn() as c:
+            relations = {row["file_id"]: dict(row) for row in c.execute(
+                "SELECT kf.file_id,ki.project_id,ki.tags_json,ki.entities_json,ki.urls_json,ki.source_message_id "
+                "FROM knowledge_files kf JOIN knowledge_items ki ON ki.id=kf.knowledge_id WHERE ki.chat_id=? ORDER BY ki.id DESC", (cid,))}
         for item in files:
             item.pop("local_path", None)
+            relation = relations.get(item["id"], {})
+            item["project"] = relation.get("project_id") or ""
+            for source, target in (("tags_json", "tags"), ("entities_json", "people"), ("urls_json", "urls")):
+                try:
+                    value = json.loads(relation.get(source) or "[]")
+                except (TypeError, ValueError):
+                    value = []
+                item[target] = value if isinstance(value, list) else []
+            item["source"] = "Telegram" if relation.get("source_message_id") else "Mini App"
         beta_available = cid in getattr(core, "ADMIN_CHAT_IDS", set())
         realtime_beta = wake_enabled = False
         if beta_available and callable(getattr(core, "app_setting", None)):
@@ -364,6 +385,10 @@ def register_miniapp(app, core):
         effective_ai = None
         if callable(getattr(core, "effective_user_ai_config", None)):
             effective_ai = core.effective_user_ai_config(cid)
+        voice_preferences = core.get_voice_preferences(cid) if callable(getattr(core, "get_voice_preferences", None)) else {
+            "voice": voice_runtime.get("tts_voice", "edge"), "speed": 1.0, "pitch": 1.0, "volume": 1.0,
+            "engine": voice_runtime.get("tts_provider", "edge"), "supports_pitch": True, "supports_volume": True,
+        }
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
                 "expenses": core.get_expenses(cid)["items"], "files": files,
@@ -376,6 +401,7 @@ def register_miniapp(app, core):
                              "admin_runtime_config": admin_runtime_config,
                              "effective_ai": effective_ai,
                              "voice_runtime": voice_runtime,
+                             "voice_preferences": voice_preferences,
                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
 
@@ -446,14 +472,22 @@ def register_miniapp(app, core):
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 2000:
             raise web.HTTPBadRequest(text="Некорректный текст")
-        path = await core.make_voice(text)
+        preferences = core.get_voice_preferences(user["id"]) if callable(getattr(core, "get_voice_preferences", None)) else None
+        requested_preferences = payload.get("preferences")
+        if isinstance(requested_preferences, dict) and callable(getattr(core, "normalize_voice_preferences", None)):
+            locked = core.normalize_voice_preferences(requested_preferences.get("voice"), requested_preferences.get("speed", 1),
+                                                      requested_preferences.get("pitch", 1), requested_preferences.get("volume", 1))
+            if locked is None:
+                raise web.HTTPBadRequest(text="Некорректные настройки голоса")
+            preferences = {**(preferences or {}), **locked}
+        path = await core.make_voice(text, user["id"], preferences) if preferences is not None else await core.make_voice(text)
         try:
             body = await asyncio.to_thread(path.read_bytes)
             # These are server-configured route labels, never user data or secrets.
             # They let one client response lock one stable voice without exposing
             # the underlying provider configuration.
             runtime = core.runtime_config_values() if callable(getattr(core, "runtime_config_values", None)) else {}
-            voice_name = "".join(char for char in str(runtime.get("tts_voice") or getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
+            voice_name = "".join(char for char in str((preferences or {}).get("voice") or runtime.get("tts_voice") or getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
             engine = str(runtime.get("tts_provider") or "edge").lower()
             return web.Response(body=body, content_type="audio/mpeg", headers={
                 "Cache-Control": "no-store",
@@ -462,6 +496,58 @@ def register_miniapp(app, core):
             })
         finally:
             Path(path).unlink(missing_ok=True)
+
+    async def person_avatar(request):
+        reader = await request.multipart()
+        init_data = ""
+        person_id = None
+        upload = None
+        filename = "avatar.jpg"
+        mime_type = ""
+        async for part in reader:
+            if part.name == "init_data":
+                init_data = await part.text()
+            elif part.name == "person_id":
+                person_id = int(await part.text())
+            elif part.name == "avatar":
+                filename = Path(part.filename or filename).name[:180]
+                mime_type = str(part.headers.get("Content-Type") or "").lower()
+                if not mime_type.startswith("image/"):
+                    raise web.HTTPBadRequest(text="Нужен файл изображения")
+                suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}.get(mime_type)
+                if not suffix:
+                    raise web.HTTPBadRequest(text="Формат изображения не поддерживается")
+                folder = Path(core.STORAGE_ROOT) / "people"
+                await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+                upload = folder / f"{uuid.uuid4().hex}{suffix}"
+                size = 0
+                with upload.open("wb") as target:
+                    while True:
+                        chunk = await part.read_chunk(size=256 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > 8 * 1024 * 1024:
+                            target.close()
+                            upload.unlink(missing_ok=True)
+                            raise web.HTTPRequestEntityTooLarge(max_size=8 * 1024 * 1024, actual_size=size)
+                        await asyncio.to_thread(target.write, chunk)
+        user = core.valid_webapp_user(init_data)
+        if not user or not isinstance(user.get("id"), int):
+            if upload:
+                upload.unlink(missing_ok=True)
+            raise web.HTTPUnauthorized()
+        await register_signed_user(user)
+        if person_id is None or upload is None:
+            if upload:
+                upload.unlink(missing_ok=True)
+            raise web.HTTPBadRequest(text="Не выбран человек или файл")
+        saved = await asyncio.to_thread(core.save_image_to_db, user["id"], filename, mime_type, str(upload), "person_avatar", "Фото профиля")
+        linked = await asyncio.to_thread(core.set_person_avatar, user["id"], person_id, saved["id"])
+        if not linked.get("ok"):
+            upload.unlink(missing_ok=True)
+            raise web.HTTPNotFound(text="Человек не найден")
+        return web.json_response({"ok": True, "data": linked}, headers={"Cache-Control": "no-store"})
 
     async def chat_stream(request):
         payload = await request.json()
@@ -569,6 +655,7 @@ def register_miniapp(app, core):
     app.router.add_post("/api/v1/miniapp/voice", voice)
     app.router.add_post("/api/v1/miniapp/voice/transcribe", voice_transcribe)
     app.router.add_post("/api/v1/miniapp/speech", speech)
+    app.router.add_post("/api/v1/miniapp/person-avatar", person_avatar)
     app.router.add_post("/api/v1/miniapp/chat-stream", chat_stream)
     app.router.add_post("/api/v1/miniapp/voice/realtime-token", realtime_token)
     app.router.add_get("/app", index)
