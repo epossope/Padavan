@@ -200,8 +200,9 @@ const visualFixture={
   await touch.evaluate(()=>go('archive'));
   await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:startX,y:220}]});
   await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:startX+100,y:226}]});
+  await touch.waitForTimeout(20);
   const swipeOffset=await touch.locator('#shell').evaluate(el=>getComputedStyle(el).transform);
-  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
   if(swipeOffset==='none')errors.push(`Edge swipe from ${startX}px did not follow the finger`);
   if(await touch.evaluate(()=>page)!=='home')errors.push(`Edge swipe from ${startX}px did not return to the preceding screen`);
  }
@@ -223,13 +224,15 @@ const visualFixture={
  await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(100);
  if(await touch.evaluate(()=>page)!=='archive')errors.push('Vertical scroll was mistaken for an edge swipe');
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
- for(const x of [46,64,88,126]){await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x,y:224}]});await touch.waitForTimeout(45)}
- await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+ const swipeSamples=[];
+ for(const x of [46,64,88,126]){await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x,y:224}]});await touch.waitForTimeout(45);swipeSamples.push(await touch.locator('#shell').evaluate(el=>new DOMMatrix(getComputedStyle(el).transform).m41))}
+ if(swipeSamples.some((value,index)=>index&&value<swipeSamples[index-1]))errors.push(`Edge swipe motion jerked backwards: ${swipeSamples.join(',')}`);
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(380);
  if(await touch.evaluate(()=>page)!=='home')errors.push('Slow edge swipe did not commit');
  await touch.evaluate(()=>go('archive'));
  await cdp.send('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[{x:30,y:220}]});
  await cdp.send('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{x:66,y:222}]});
- await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(250);
+ await cdp.send('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});await touch.waitForTimeout(400);
  if(await touch.evaluate(()=>page)!=='home')errors.push('Fast edge flick did not commit');
  await touch.evaluate(()=>go('chat'));
  const chatInputBox=await touch.locator('#chat-input').boundingBox(),inputStartX=Math.min(70,chatInputBox.x+8),inputY=chatInputBox.y+chatInputBox.height/2;
