@@ -20,7 +20,7 @@ Amvera должна содержать только переменные из `U
 | `VISION_MODEL`, `VISION_FALLBACK_MODELS` | Bootstrap defaults Vision | Optional; editable live admin |
 | `BATCH_STT_MODEL`, `BATCH_STT_TIMEOUT_SEC` | Canonical production batch STT | Optional; defaults `mistralai/voxtral-mini-transcribe`, `180` |
 | `MISTRAL_API_KEY`, `MISTRAL_REALTIME_MODEL`, `MISTRAL_CLIENT_SESSIONS_URL` | Только admin-only Experimental Realtime Beta | Key is secret; model editable live admin |
-| `TTS_PROVIDER`, `TTS_FALLBACK_PROVIDER`, `EDGE_VOICE`, `VOICE_REPLY_MODE` | Bootstrap TTS and default reply mode | Optional; editable live admin |
+| `TTS_PROVIDER`, `TTS_FALLBACK_PROVIDER`, `EDGE_VOICE`, `TTS_DEFAULT_SPEED`, `TTS_DEFAULT_PITCH`, `TTS_DEFAULT_VOLUME`, `VOICE_REPLY_MODE` | Bootstrap TTS, voice prosody and default reply mode | Optional; editable live admin |
 | `TELEGRAM_DRAFT_STREAMING_ENABLED`, `TELEGRAM_DRAFT_MIN_INTERVAL`, `TELEGRAM_DRAFT_MAX_INTERVAL`, `TELEGRAM_DRAFT_MIN_CHARS` | Experimental Telegram draft mode; production uses one persistent edited message | Optional; draft mode defaults to `false` |
 | `TELEGRAM_SEND_RETRIES`, `TELEGRAM_CONNECT_TIMEOUT`, `TELEGRAM_READ_TIMEOUT`, `TELEGRAM_WRITE_TIMEOUT`, `TELEGRAM_POOL_TIMEOUT`, `TELEGRAM_CONNECTION_POOL_SIZE` | Telegram HTTP reliability | Optional; defaults есть |
 | `REMINDER_TICK_SECONDS` | Reminder scheduler | Optional; clamped 15–30 sec |

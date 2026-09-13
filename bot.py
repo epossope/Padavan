@@ -878,7 +878,8 @@ RUNTIME_CONFIG_FIELDS = (
     "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
     "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
     "vision_model", "vision_fallback_models", "batch_stt_model",
-    "tts_provider", "tts_fallback_provider", "tts_voice", "default_voice_reply_mode",
+    "tts_provider", "tts_fallback_provider", "tts_voice",
+    "tts_default_speed", "tts_default_pitch", "tts_default_volume", "default_voice_reply_mode",
     "realtime_model", "model_catalog",
 )
 _MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,200}$")
@@ -887,6 +888,13 @@ _PROVIDER_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,120}$")
 
 def _env_is_set(*names):
     return any(bool((os.getenv(name) or "").strip()) for name in names)
+
+
+def _env_float(name, default, minimum, maximum):
+    try:
+        return min(maximum, max(minimum, float(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
 
 
 def _runtime_env_defaults():
@@ -908,6 +916,9 @@ def _runtime_env_defaults():
         "tts_provider": (TTS_PROVIDER, "ENV" if _env_is_set("TTS_PROVIDER") else "DEFAULT"),
         "tts_fallback_provider": (TTS_FALLBACK_PROVIDER, "ENV" if _env_is_set("TTS_FALLBACK_PROVIDER") else "DEFAULT"),
         "tts_voice": (VOICE, "ENV" if _env_is_set("EDGE_VOICE") else "DEFAULT"),
+        "tts_default_speed": (_env_float("TTS_DEFAULT_SPEED", 1.0, .8, 1.25), "ENV" if _env_is_set("TTS_DEFAULT_SPEED") else "DEFAULT"),
+        "tts_default_pitch": (_env_float("TTS_DEFAULT_PITCH", 1.0, .5, 1.5), "ENV" if _env_is_set("TTS_DEFAULT_PITCH") else "DEFAULT"),
+        "tts_default_volume": (_env_float("TTS_DEFAULT_VOLUME", 1.0, .2, 1.0), "ENV" if _env_is_set("TTS_DEFAULT_VOLUME") else "DEFAULT"),
         "default_voice_reply_mode": (DEFAULT_MODE, "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
         "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
         "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
@@ -984,6 +995,15 @@ def _normalise_runtime_config_value(field, value):
         if clean not in {"text", "voice", "voice_and_text", "auto"}:
             raise ValueError("Invalid voice reply mode")
         return clean
+    if field in {"tts_default_speed", "tts_default_pitch", "tts_default_volume"}:
+        try:
+            clean = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid TTS default")
+        minimum, maximum = ({"tts_default_speed": (.8, 1.25), "tts_default_pitch": (.5, 1.5), "tts_default_volume": (.2, 1.0)})[field]
+        if not minimum <= clean <= maximum:
+            raise ValueError("Invalid TTS default")
+        return round(clean, 2)
     if field in {"tts_provider", "tts_fallback_provider"}:
         clean = str(value or "").strip().lower()
         allowed = {"edge", "browser"} if field == "tts_provider" else {"edge", "browser", "none"}
@@ -4439,12 +4459,13 @@ def get_voice_preferences(chat_id):
     except (TypeError, ValueError):
         saved = {}
     voice = str(saved.get("voice") or runtime["tts_voice"])[:120]
+    defaults = {"speed": float(runtime["tts_default_speed"]), "pitch": float(runtime["tts_default_pitch"]), "volume": float(runtime["tts_default_volume"])}
     try:
-        speed = min(1.25, max(.8, float(saved.get("speed", 1.0))))
-        pitch = min(1.5, max(.5, float(saved.get("pitch", 1.0))))
-        volume = min(1.0, max(.2, float(saved.get("volume", 1.0))))
+        speed = min(1.25, max(.8, float(saved.get("speed", defaults["speed"]))))
+        pitch = min(1.5, max(.5, float(saved.get("pitch", defaults["pitch"]))))
+        volume = min(1.0, max(.2, float(saved.get("volume", defaults["volume"]))))
     except (TypeError, ValueError):
-        speed, pitch, volume = 1.0, 1.0, 1.0
+        speed, pitch, volume = defaults["speed"], defaults["pitch"], defaults["volume"]
     engine = str(runtime["tts_provider"] or "edge").lower()
     return {"voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
             "supports_pitch": engine in {"edge", "browser"}, "supports_volume": engine in {"edge", "browser"}}
@@ -5268,6 +5289,22 @@ async def callback(update,context):
         await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard(q.message.chat_id))
         return
 
+    if q.data == "settings:voice":
+        text, markup = voice_settings_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    if q.data.startswith("voice:speed:"):
+        if q.data == "voice:speed:noop":
+            return
+        direction = q.data.rsplit(":", 1)[-1]
+        if direction not in {"down", "up"}:
+            return
+        prefs = get_voice_preferences(q.message.chat_id)
+        speed = min(1.25, max(.8, round(prefs["speed"] + (-.1 if direction == "down" else .1), 2)))
+        set_voice_preferences(q.message.chat_id, prefs["voice"], speed, prefs["pitch"], prefs["volume"])
+        text, markup = voice_settings_page(q.message.chat_id)
+        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
     if q.data in ("menu:mode", "settings:mode"):
         await q.edit_message_text("🔊 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
         return
@@ -5749,14 +5786,16 @@ def settings_keyboard(chat_id=None):
     if chat_id in ADMIN_CHAT_IDS:
         rows = [
             [interface_inline_button("model", "🧠", "Модель", "settings:model"), interface_inline_button("vision", "👁", "Vision", "settings:vision")],
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
+            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
             [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("keys", "🔐", "Управление AI", "settings:keys")],
             [InlineKeyboardButton("✨ Эмодзи", callback_data="settings:emoji")],
             [interface_inline_button("status", "⚙️", "Статус", "settings:status"), interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
     else:
         rows = [
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("rules", "📜", "Правила", "settings:rules")],
+            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
+            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
             [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("status", "⚙️", "Статус", "settings:status")],
             [interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
         ]
@@ -5957,6 +5996,24 @@ def mode_keyboard(chat_id):
     ]
     rows.append([InlineKeyboardButton("‹ Назад", callback_data="settings:back")])
     return live_markup(InlineKeyboardMarkup(rows))
+
+
+def voice_settings_page(chat_id):
+    prefs = get_voice_preferences(chat_id)
+    speed = float(prefs["speed"])
+    rows = [[
+        InlineKeyboardButton("−", callback_data="voice:speed:down" if speed > .8 else "voice:speed:noop"),
+        InlineKeyboardButton(f"{speed:.2f}×", callback_data="voice:speed:noop"),
+        InlineKeyboardButton("+", callback_data="voice:speed:up" if speed < 1.25 else "voice:speed:noop"),
+    ]]
+    if QUICK_ACTIONS_BASE_URL:
+        rows.append([InlineKeyboardButton("Открыть расширенные настройки", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
+    rows.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    text = ("<b>🎙 Голос</b>\n"
+            f"Голос: <code>{html.escape(str(prefs['voice']))}</code>\n"
+            f"Скорость: <b>{speed:.2f}×</b>\n\n"
+            "Тон и громкость доступны в Mini App.")
+    return text, live_markup(InlineKeyboardMarkup(rows))
 
 
 def status_text(chat_id):

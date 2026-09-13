@@ -67,6 +67,25 @@ class ProductPolishV14Tests(unittest.TestCase):
         self.assertFalse(bot.set_voice_preferences(74, "bad voice <x>", 1, 1, 1)["ok"])
         self.assertEqual(1.0, bot.get_voice_preferences(75)["speed"])
 
+    def test_admin_voice_defaults_apply_live_until_user_overrides_them(self):
+        bot.set_admin_runtime_config(1, "tts_default_speed", .8)
+        bot.set_admin_runtime_config(1, "tts_default_pitch", .75)
+        bot.set_admin_runtime_config(1, "tts_default_volume", .65)
+        self.assertEqual((.8, .75, .65), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
+        bot.set_voice_preferences(76, "ru-RU-DmitryNeural", 1.2, 1.1, .9)
+        self.assertEqual((1.2, 1.1, .9), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
+
+    def test_telegram_voice_settings_are_compact_and_open_miniapp(self):
+        with patch.object(bot, "QUICK_ACTIONS_BASE_URL", "https://noema.example"):
+            text, markup = bot.voice_settings_page(77)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row if button.callback_data]
+        webapps = [button.web_app.url for row in markup.inline_keyboard for button in row if button.web_app]
+        self.assertIn("Скорость", text)
+        self.assertIn("voice:speed:up", callbacks)
+        self.assertEqual(["https://noema.example/app?screen=settings"], webapps)
+        settings_callbacks = [button.callback_data for row in bot.settings_keyboard(77).inline_keyboard for button in row if button.callback_data]
+        self.assertIn("settings:voice", settings_callbacks)
+
     def test_edge_voice_adapter_receives_locked_rate_pitch_and_volume(self):
         communicator = SimpleNamespace(save=AsyncMock())
         with patch.object(bot.edge_tts, "Communicate", return_value=communicator) as factory:
