@@ -115,7 +115,7 @@ render=function(){
   content.querySelector('.subtle')?.remove();
  }
  for(const name of ['hero','voice-area','chat-voice-orb']){const canvas=content.querySelector(`.${name} canvas.membrane`),saved=persistentMembranes.get(name);if(canvas&&saved)canvas.replaceWith(saved)}
- renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat')window.NoemaChatScroll?.bind?.();else window.NoemaChatScroll?.detach?.();tg?.BackButton.hide()
+ renderDock();window.NoemaVoiceController?.sync?.();if(page==='chat'){const restore=window.NoemaChatScrollRestore||null;window.NoemaChatScrollRestore=null;window.NoemaChatScroll?.bind?.(restore)}else window.NoemaChatScroll?.detach?.();tg?.BackButton.hide()
 };
 go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')window.homeEditing=false;page=next;search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';archiveResults=null;say('');render();window.scrollTo({top:0});if(next==='budget')loadBudget()};
 function back(){if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();return}page=navHistory.pop()||'home';search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';render()}
@@ -144,7 +144,7 @@ document.addEventListener('click',async e=>{
  if(b.dataset.addWidget){layoutDraft.push(b.dataset.addWidget);drawLayout()}
  if(b.dataset.homeHide){await saveHomeWidgets((data.settings.home_widgets||defaultWidgets).filter(type=>type!==b.dataset.homeHide))}
  if(b.dataset.homeShow){await saveHomeWidgets([...(data.settings.home_widgets||defaultWidgets),b.dataset.homeShow])}
- if(b.hasAttribute('data-home-done')){window.homeEditing=false;render()}
+ if(b.hasAttribute('data-home-done'))window.NoemaHomeEdit?.exit?.()
  if(b.dataset.taskTab){taskTab=b.dataset.taskTab;taskFilter='all';render()}
  if(b.dataset.taskFilter){taskFilter=b.dataset.taskFilter;render()}
  if(b.dataset.noteFilter){noteFilter=b.dataset.noteFilter;render()}
@@ -180,6 +180,7 @@ function prepareTelegramViewport(){
  applyTelegramSafeArea();
  tg.onEvent?.('safeAreaChanged',applyTelegramSafeArea);
  tg.onEvent?.('contentSafeAreaChanged',applyTelegramSafeArea);
+ tg.onEvent?.('viewportChanged',()=>window.NoemaChatScroll?.handleViewportResize?.());
  try{
   if(typeof tg.requestFullscreen==='function'&&(!tg.isVersionAtLeast||tg.isVersionAtLeast('8.0')))tg.requestFullscreen()
  }catch{}
