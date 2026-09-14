@@ -87,6 +87,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         current = await self.client.get(f'/app/assets/app.js?v={APP_BUILD_ID}')
         self.assertEqual(current.status, 200)
         self.assertEqual(current.headers.get('Cache-Control'), 'public, max-age=31536000, immutable')
+        self.assertEqual(current.headers.get('X-Content-Type-Options'), 'nosniff')
         self.assertIn(APP_BUILD_ID, await current.text())
 
         stale = await self.client.get('/app/assets/app.js?v=ui-legacy')
@@ -97,6 +98,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
             'stage': 'bootstrap_failed', 'app_version': APP_BUILD_ID,
             'platform': 'ios', 'telegram_version': '8.0', 'code': 'API_TIMEOUT',
+            'boot_id': 'boot-compat-1',
         })
         self.assertEqual(response.status, 200)
         self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
@@ -346,13 +348,20 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (root / "app.js").read_text(encoding="utf-8")
         screen_source = (root / "screens.js").read_text(encoding="utf-8")
         mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
-        self.assertEqual(index.count("?v=__NOEMA_APP_BUILD_ID__"), 11)
-        self.assertIn("const APP_BUILD_ID='__NOEMA_APP_BUILD_ID__'", index)
+        # JavaScript is intentionally loaded by the pre-boot controller so an
+        # HTTP/MIME/parse failure cannot strand a static script tag forever.
+        self.assertIn("var APP_BUILD_ID='__NOEMA_APP_BUILD_ID__'", index)
+        self.assertIn("var ASSETS=['tokens.js','ui.js','orb.js','app.js','screens.js','mobile.js','voice-conversation.js']", index)
+        self.assertIn("script.onerror=function(){recovery('ASSET_LOAD_FAILED')}", index)
+        self.assertIn("script.src='/app/assets/'+name+'?v='+encodeURIComponent(APP_BUILD_ID)", index)
+        self.assertEqual(index.count("?v=__NOEMA_APP_BUILD_ID__"), 4)
         self.assertIn("BOOT_TIMEOUT_MS=10000", index)
         self.assertIn("controlledReload", index)
         self.assertIn("boot-recovery", index)
         self.assertIn("window.addEventListener('unhandledrejection'", index)
         self.assertIn("window.addEventListener('error'", index)
+        self.assertIn("sdk_load_failed", index)
+        self.assertIn("boot_id", index)
         self.assertIn("AbortController", app_source)
         self.assertIn("SESSION_EXPIRED", app_source)
         self.assertIn("waitForTelegram", screen_source)

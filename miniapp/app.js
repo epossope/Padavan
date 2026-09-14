@@ -72,14 +72,15 @@ function bootError(code){const error=new Error(code);error.code=code;return erro
 async function api(action,args={},options={}){
   if(preview)throw Error('Для сохранения открой Noema через Telegram. Здесь доступен только просмотр оформления.');
   const started=performance.now();
-  const controller=new AbortController(),timeoutMs=Number(options.timeoutMs)||0;
-  const abort=()=>controller.abort();
+  const nativeAbort=typeof AbortController==='function',controller=nativeAbort?new AbortController():null,timeoutMs=Number(options.timeoutMs)||0;
+  let timedOut=false;
+  const abort=()=>{timedOut=true;controller?.abort?.()};
   options.signal?.addEventListener?.('abort',abort,{once:true});
   const timeout=timeoutMs?setTimeout(abort,timeoutMs):0;
-  try{const initData=tg?.initData;if(!initData)throw bootError('INITDATA_MISSING');const response=await fetch('/api/v1/miniapp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:initData,action,args}),signal:controller.signal});
+  try{const initData=tg?.initData;if(!initData)throw bootError('INITDATA_MISSING');const request={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:initData,action,args})};if(controller)request.signal=controller.signal;const pending=fetch('/api/v1/miniapp',request);const response=controller?await pending:await(timeoutMs?Promise.race([pending,new Promise((_,reject)=>setTimeout(()=>reject(bootError('API_TIMEOUT')),timeoutMs))]):pending);
    if(response.status===401||response.status===403)throw bootError('SESSION_EXPIRED');
    const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Нет соединения с Noema.');return result.data}
-  catch(error){if(controller.signal.aborted)throw bootError(timeoutMs?'API_TIMEOUT':'REQUEST_ABORTED');throw error}
+  catch(error){if(timedOut||controller?.signal?.aborted)throw bootError(timeoutMs?'API_TIMEOUT':'REQUEST_ABORTED');throw error}
   finally{if(timeout)clearTimeout(timeout);options.signal?.removeEventListener?.('abort',abort);telemetry.record('ui_action_ms',performance.now()-started,{action})}
 }
 async function load(options={}){const chatSnapshot=page==='chat'?window.NoemaChatScroll?.snapshot?.():null;data=await api('state',{},options);if(options.signal?.aborted)throw bootError('BOOT_TIMEOUT');stateLoadedAt=Date.now();window.NoemaTelemetryEnabled=Boolean(data.settings?.telemetry_enabled);window.NoemaRealtimeBeta?.setEnabled(Boolean(data.settings?.experimental_realtime),{wakeEnabled:Boolean(data.settings?.experimental_wake_enabled)}).catch(()=>{});window.NoemaChatScrollRestore=chatSnapshot;render();if(page==='chat')await window.NoemaChatScroll?.whenSettled?.()}

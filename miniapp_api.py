@@ -14,12 +14,12 @@ from urllib.parse import quote
 from aiohttp import web
 
 
-APP_BUILD_ID = "ui-1.11.0"
+APP_BUILD_ID = "ui-1.12.0"
 BOOT_TELEMETRY_STAGES = {
     "boot_started", "js_ready", "telegram_ready", "initdata_present",
     "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
     "bootstrap_ok", "bootstrap_failed", "render_ready", "boot_timeout",
-    "window_error", "unhandledrejection",
+    "window_error", "unhandledrejection", "sdk_load_failed", "sdk_loaded",
 }
 
 
@@ -202,7 +202,12 @@ def register_miniapp(app, core):
         if root.resolve() not in requested.parents or not requested.is_file():
             raise web.HTTPNotFound()
         current_build = request.query.get("v") == APP_BUILD_ID
-        headers = {"Cache-Control": "public, max-age=31536000, immutable" if current_build else "no-cache"}
+        # `nosniff` turns an HTML error page or an incorrect MIME response into
+        # a script load error, which the independent pre-boot controller owns.
+        headers = {
+            "Cache-Control": "public, max-age=31536000, immutable" if current_build else "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        }
         if requested.suffix == ".js":
             source = requested.read_text(encoding="utf-8").replace("__NOEMA_APP_BUILD_ID__", APP_BUILD_ID)
             return web.Response(text=source, content_type="application/javascript", headers=headers)
@@ -216,14 +221,15 @@ def register_miniapp(app, core):
         stage = str(payload.get("stage") or "") if isinstance(payload, dict) else ""
         if stage not in BOOT_TELEMETRY_STAGES:
             raise web.HTTPBadRequest(text="Некорректная telemetry")
-        safe = {key: str(payload.get(key) or "")[:80] for key in ("app_version", "platform", "telegram_version", "code")}
+        safe = {key: str(payload.get(key) or "")[:80] for key in
+                ("app_version", "platform", "telegram_version", "code", "boot_id")}
         if any(any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for char in value)
                for value in safe.values()):
             raise web.HTTPBadRequest(text="Некорректная telemetry")
         logger = getattr(core, "LOGGER", None)
         if logger:
-            logger.info("miniapp_boot stage=%s app_version=%s platform=%s telegram_version=%s code=%s",
-                        stage, safe["app_version"], safe["platform"], safe["telegram_version"], safe["code"])
+            logger.info("miniapp_boot stage=%s app_version=%s platform=%s telegram_version=%s code=%s boot_id=%s",
+                        stage, safe["app_version"], safe["platform"], safe["telegram_version"], safe["code"], safe["boot_id"])
         return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def api(request):
