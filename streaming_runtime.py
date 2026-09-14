@@ -9,11 +9,12 @@ from dataclasses import dataclass, field
 
 TOOL_PACKS = {
     "core_memory": {"knowledge_search", "knowledge_get"},
-    "planning": {"add_task", "get_today_plan", "reminder_list", "delete_task", "set_reminder", "delete_reminder"},
+    "planning": {"add_task", "get_today_plan", "task_list", "reminder_list", "delete_task", "set_reminder", "delete_reminder"},
     "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "finance_summary", "finance_list_transactions", "delete_expense"},
     "people": {"person_upsert", "person_interaction", "get_people", "delete_person", "delete_interaction"},
     "web": {"internet_search", "get_weather"},
     "files": {"knowledge_files", "send_stored_image", "get_files", "artifact_create"},
+    "notes": {"get_notes", "note_list", "save_note", "update_note", "delete_note"},
     "preferences": {"set_timezone", "set_briefing_preferences", "save_behavior_rule", "update_behavior_rule", "delete_behavior_rule"},
 }
 
@@ -105,6 +106,7 @@ class ToolPackResolver:
         "planning": ("задач", "напом", "план", "встреч", "календар"),
         "finance": ("руб", "расход", "трат", "доход", "бюджет", "купил", "потрат", "баланс", "бензин", "операци"),
         "people": ("контакт", "человек", "день рождения", "познаком", "созвон"),
+        "notes": ("заметк", "записывал", "записала", "записано"),
         "web": ("интернет", "найди", "проверь", "погода", "новост", "сайт"),
         "files": ("файл", "фото", "скрин", "документ", "отправ", "таблиц", "html", "json",
                   "скрипт", "docx", "pdf", "сайт", "архив", "zip", "csv", "xml", "лендинг",
@@ -134,9 +136,18 @@ class ToolPackResolver:
         its structured result before composing the response.
         """
         lowered = str(text or "").lower()
+        task_words = ("какие у меня задачи", "что нужно сделать сегодня", "что просрочено", "покажи завершённые", "есть задача")
+        if any(word in lowered for word in task_words):
+            return {"type": "function", "function": {"name": "task_list"}}
         reminder_words = ("какие у меня напоминания", "какие напоминания", "что мне нужно сегодня", "напоминание завтра", "напоминания завтра", "есть ли напоминание", "покажи напомин")
         if any(word in lowered for word in reminder_words):
             return {"type": "function", "function": {"name": "reminder_list"}}
+        note_words = ("покажи мои заметки", "найди заметку", "что я записывал", "что я записывала")
+        if any(word in lowered for word in note_words):
+            return {"type": "function", "function": {"name": "note_list"}}
+        people_words = ("кого я знаю", "найди саш", "какие контакты", "кто работает со мной")
+        if any(word in lowered for word in people_words):
+            return {"type": "function", "function": {"name": "get_people"}}
         artifact_words = ("дай файлом", "сделай файл", "сделай документ", "сделай word", "сделай таблиц", "сделай excel", "сделай html", "сделай json", "создай скрипт", "собери сайт")
         asks_finance = any(word in lowered for word in ("трат", "расход", "доход", "баланс", "бюджет", "операци"))
         if asks_finance and any(word in lowered for word in artifact_words):

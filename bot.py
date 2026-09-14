@@ -451,6 +451,12 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"task_list",
+        "description":"Получить точные задачи текущего пользователя из базы: открытые, завершённые, просроченные, сегодня или поиск по тексту. Не используй историю как источник существования задачи.",
+        "parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["open","done","overdue","today","all"]},"query":{"type":"string"},"limit":{"type":"integer"}}}
+    }},
+
+    {"type":"function","function":{
         "name":"reminder_list",
         "description":"Получить точные напоминания текущего пользователя из базы. Используй для вопросов о существующих напоминаниях, сегодня, завтра, просроченных, будущих или поиске по тексту; не используй память как источник истины.",
         "parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["today","tomorrow","overdue","upcoming","all","custom"]},"date_from":{"type":"string"},"date_to":{"type":"string"},"query":{"type":"string"},"include_acknowledged":{"type":"boolean"},"limit":{"type":"integer"}}}
@@ -490,6 +496,12 @@ TOOLS = [
 
         "parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}
 
+    }},
+
+    {"type":"function","function":{
+        "name":"note_list",
+        "description":"Получить точные заметки текущего пользователя из базы с поиском по заголовку/тексту и датой. Не подтверждай заметку только по памяти.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"},"date":{"type":"string"},"limit":{"type":"integer"}}}
     }},
 
     {"type":"function","function":{
@@ -3110,6 +3122,28 @@ def reminder_list(chat_id, scope="upcoming", date_from="", date_to="", query="",
             "count": len(selected), "items": selected[:limit]}
 
 
+def task_list(chat_id, scope="open", query="", limit=100):
+    """Canonical owner-scoped task read model."""
+    scope = str(scope or "open").lower()
+    if scope not in {"open", "done", "overdue", "today", "all"}:
+        raise ValueError("invalid_task_scope")
+    limit = max(1, min(int(limit or 100), 200))
+    today = datetime.now(timezone_for(chat_id)).date().isoformat()
+    clauses, args = ["chat_id=?"], [chat_id]
+    if scope == "open": clauses.append("status='open'")
+    elif scope == "done": clauses.append("status='done'")
+    elif scope == "overdue": clauses.extend(["status='open'", "due_date<>''", "substr(due_date,1,10)<?"]); args.append(today)
+    elif scope == "today": clauses.extend(["status='open'", "(due_date='' OR substr(due_date,1,10)<=?)"]); args.append(today)
+    query = str(query or "").strip()
+    if query:
+        clauses.append("lower(text) LIKE ?"); args.append("%" + query.casefold().replace("%", "\\%").replace("_", "\\_") + "%")
+    where = " AND ".join(clauses)
+    with conn() as c:
+        count = c.execute("SELECT count(*) FROM tasks WHERE " + where, args).fetchone()[0]
+        rows = [dict(row) for row in c.execute("SELECT id,text,due_date,priority,status,created_at FROM tasks WHERE " + where + " ORDER BY due_date,id LIMIT ?", args + [limit]).fetchall()]
+    return {"ok": True, "tool": "task_list", "scope": scope, "date": today, "count": count, "items": rows}
+
+
 def get_plan_for_date(chat_id, day):
     """Return a calendar day without silently completing anything overdue."""
     selected = datetime.fromisoformat(day).date()
@@ -3154,6 +3188,24 @@ def toggle_task_status(chat_id, task_id):
         return {"ok": False, "error": "not_found"}
     return set_task_status(chat_id, task_id, "open" if row["status"] == "done" else "done")
 
+
+
+def note_list(chat_id, query="", date="", limit=50):
+    """Canonical owner-scoped exact note reader."""
+    limit = max(1, min(int(limit or 50), 200))
+    clauses, args = ["chat_id=?"], [chat_id]
+    query = str(query or "").strip()
+    if query:
+        clauses.append("(lower(title) LIKE ? OR lower(text) LIKE ?)")
+        needle = "%" + query.casefold().replace("%", "\\%").replace("_", "\\_") + "%"; args.extend([needle, needle])
+    if date:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)): raise ValueError("invalid_note_date")
+        clauses.append("substr(created_at,1,10)=?"); args.append(str(date))
+    where = " AND ".join(clauses)
+    with conn() as c:
+        count = c.execute("SELECT count(*) FROM notes WHERE " + where, args).fetchone()[0]
+        rows = [dict(row) for row in c.execute("SELECT id,title,text,created_at FROM notes WHERE " + where + " ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()]
+    return {"ok": True, "tool": "note_list", "count": count, "items": rows}
 
 
 def get_notes(chat_id,limit=20):
@@ -3388,11 +3440,15 @@ def execute_tool(chat_id,name,args):
 
         "get_today_plan":get_today_plan,
 
+        "task_list":task_list,
+
         "reminder_list":reminder_list,
 
         "set_briefing_preferences":set_briefing_preferences,
 
         "get_notes":get_notes,
+
+        "note_list":note_list,
 
         "get_people":get_people,
 
@@ -3842,7 +3898,7 @@ def system_prompt(chat_id):
 
         "Если в одном сообщении человек + созвон/задача/напоминание — вызови несколько tools. "
 
-        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, reminder_list для существующих напоминаний, get_today_plan для задач на сегодня, get_people для людей, get_notes для заметок и get_files для файлов. Если exact tool вернул 0 строк, не выдумывай запись из памяти или истории. "
+        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, reminder_list для существующих напоминаний, task_list для задач, get_people для контактов, note_list для заметок и get_files для сохранённых файлов. Если exact tool вернул 0 строк, не выдумывай запись из памяти или истории. Calendar integration отсутствует: не притворяйся, что существуют точные calendar events. "
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
@@ -3933,7 +3989,7 @@ def stream_progress_for_tool(name):
     """Only report an action after its corresponding tool was actually run."""
     if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
         return "Вспоминаю…"
-    if name in {"get_today_plan", "reminder_list", "add_task", "update_task", "delete_task", "set_reminder", "update_reminder", "delete_reminder"}:
+    if name in {"get_today_plan", "task_list", "reminder_list", "add_task", "update_task", "delete_task", "set_reminder", "update_reminder", "delete_reminder"}:
         return "Проверяю задачи…"
     if name in {"get_expenses", "add_expense", "add_income", "update_expense", "delete_expense", "update_last_expense"}:
         return "Смотрю бюджет…"
