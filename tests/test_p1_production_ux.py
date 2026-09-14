@@ -177,6 +177,19 @@ class P1ProductionUxTests(unittest.IsolatedAsyncioTestCase):
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
         self.assertIn("voice:admin:edit:tts_default_speed", callbacks)
 
+    def test_admin_voice_tuning_uses_range_sliders_and_user_screen_has_no_technical_controls(self):
+        source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("data-runtime-range", source)
+        self.assertIn('type="range"', source)
+        self.assertIn('tts_default_speed:[.8,1.25]', source)
+        self.assertIn('tts_default_pitch:[.5,1.5]', source)
+        self.assertIn('tts_default_volume:[.2,1]', source)
+        voice_settings = source[source.index("function voiceSettings"):source.index("function settings")]
+        self.assertIn("voice-choice", voice_settings)
+        self.assertNotIn("tts_default_speed", voice_settings)
+        self.assertNotIn("tts_default_pitch", voice_settings)
+        self.assertNotIn("tts_default_volume", voice_settings)
+
     async def test_three_voice_modes_have_same_channel_semantics(self):
         app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")
         self.assertIn("speak=mode==='voice'||mode==='voice_and_text'", app_source)

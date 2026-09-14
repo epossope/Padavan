@@ -354,10 +354,12 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             {"type": "done", "text": final, "canonical_message_id": 9},
         ])
         throttle = Mock(); throttle.should_send.return_value = True
+        trace_events = []
         with patch.object(bot, "stream_agent_response", return_value=events), \
              patch.object(bot, "get_mode", return_value="text"), \
              patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
-             patch.object(bot, "reply_emoji_prefix", return_value=""):
+             patch.object(bot, "reply_emoji_prefix", return_value=""), \
+             patch.object(bot, "_telegram_live_stream_trace", side_effect=lambda *_args, **_kwargs: trace_events.append(_args[2])):
             completed = await bot.stream_answer_to_telegram(update, context, "тест")
         self.assertTrue(completed)
         telegram.send_message.assert_awaited_once()
@@ -370,6 +372,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["canonical_message_id"], 9)
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["telegram_message_id"], 77)
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [77])
+        self.assertTrue({"working_message_created", "first_visible_edit", "progress_edit", "stream_edit_count", "final_promoted"}.issubset(trace_events))
 
     async def test_3000_char_preview_is_promoted_to_the_same_message(self):
         final = "B" * 3000
@@ -521,8 +524,8 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"],
                                  list(range(201 + offset * 20, 201 + offset * 20 + len(expected))))
 
-    async def test_progress_status_is_removed_when_first_stream_bubble_appears(self):
-        ids = iter((50, 51))
+    async def test_working_status_is_replaced_by_first_visible_delta_in_same_message(self):
+        ids = iter((50,))
         telegram = SimpleNamespace(
             send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
             edit_message_text=AsyncMock(return_value=True), delete_message=AsyncMock(return_value=True),
@@ -545,11 +548,12 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.stream_answer_to_telegram(
                 update, SimpleNamespace(bot=telegram), "test"
             ))
-        self.assertEqual(telegram.send_message.await_count, 2)
-        telegram.delete_message.assert_awaited_once_with(chat_id=42, message_id=50)
-        self.assertTrue(all(call.kwargs["message_id"] == 51
+        self.assertEqual(telegram.send_message.await_count, 1)
+        telegram.delete_message.assert_not_awaited()
+        self.assertTrue(all(call.kwargs["message_id"] == 50
                             for call in telegram.edit_message_text.await_args_list))
-        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [51])
+        self.assertEqual(telegram.edit_message_text.await_args_list[1].kwargs["text"], final[:12])
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [50])
 
     async def test_live_production_sequence_promotes_preview_without_second_final(self):
         """Regression: a real progress + fast deltas path never reaches send_answer."""
@@ -591,16 +595,16 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 update, SimpleNamespace(bot=telegram), "ordinary request"
             ))
 
-        self.assertEqual(telegram.send_message.await_count, 2)  # status + preview only
-        self.assertEqual(operations[0], ("send", "✍️ Готовлю ответ…"))
-        self.assertEqual(operations[1], ("send", first + second))
-        self.assertEqual(operations[2], ("delete", 50))
+        self.assertEqual(telegram.send_message.await_count, 1)
+        self.assertEqual(operations[0], ("send", "🧠 Думаю…"))
         self.assertGreaterEqual(telegram.edit_message_text.await_count, 2)
-        self.assertEqual(telegram.edit_message_text.await_args_list[0].kwargs["message_id"], 51)
-        self.assertEqual(telegram.edit_message_text.await_args_list[0].kwargs["text"], first + second + third)
-        self.assertEqual(telegram.edit_message_text.await_args.kwargs["message_id"], 51)
+        self.assertTrue(all(call.kwargs["message_id"] == 50
+                            for call in telegram.edit_message_text.await_args_list))
+        self.assertEqual(telegram.edit_message_text.await_args_list[1].kwargs["text"], first)
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["message_id"], 50)
         self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"], final)
-        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [51])
+        self.assertFalse(any(operation[0] == "delete" for operation in operations))
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [50])
 
     async def test_private_text_handler_ignores_legacy_draft_transport(self):
         update = SimpleNamespace(
@@ -618,8 +622,8 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         persistent.assert_awaited_once_with(update, context, "ordinary request")
         legacy_draft.assert_not_awaited()
 
-    async def test_short_final_removes_status_before_immutable_send(self):
-        operations, ids = [], iter((60, 61))
+    async def test_short_final_promotes_the_initial_working_message(self):
+        operations, ids = [], iter((60,))
 
         def sent(**kwargs):
             operations.append(("send", kwargs["text"]))
@@ -646,10 +650,12 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.stream_answer_to_telegram(
                 update, SimpleNamespace(bot=telegram), "ordinary request"
             ))
-        self.assertEqual(operations, [
-            ("send", "🧠 Думаю…"), ("delete", 60), ("send", "коротко"),
-        ])
-        telegram.edit_message_text.assert_not_awaited()
+        self.assertEqual(operations, [("send", "🧠 Думаю…")])
+        telegram.delete_message.assert_not_awaited()
+        self.assertTrue(all(call.kwargs["message_id"] == 60
+                            for call in telegram.edit_message_text.await_args_list))
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"], "коротко")
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [60])
 
     async def test_output_modes_keep_text_voice_and_combined_contracts(self):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
@@ -671,36 +677,53 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.reply_text.await_count, text_count, mode)
             self.assertEqual(message.reply_voice.await_count, voice_count, mode)
 
-    async def test_telegram_speech_prefetch_delivers_before_stream_completion_and_in_order(self):
+    async def test_telegram_final_tts_delivers_one_voice_payload(self):
         played = []
-        first_played = asyncio.Event()
 
         async def synthesize(text, *, chat_id=None, preferences=None):
-            if text == "first":
-                await asyncio.sleep(.01)
             handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             handle.write(text.encode()); handle.close()
             return Path(handle.name)
 
         async def deliver(*, voice):
             played.append(voice.read().decode())
-            first_played.set()
 
         telegram = SimpleNamespace(send_chat_action=AsyncMock())
         update = SimpleNamespace(effective_message=SimpleNamespace(reply_voice=AsyncMock(side_effect=deliver)))
         preferences = {"voice": "voice", "speed": 1, "pitch": 1, "volume": 1}
         with patch.object(bot, "get_voice_preferences", return_value=preferences), \
              patch.object(bot, "make_voice", new=AsyncMock(side_effect=synthesize)):
-            queue = bot.TelegramSpeechQueue(update, telegram, 42)
-            queue.enqueue("first")
-            queue.enqueue("second")
-            await asyncio.wait_for(first_played.wait(), 1)
-            self.assertEqual(played[0], "first")
-            self.assertFalse(queue.worker.done())
-            await queue.finish()
-        self.assertEqual(played, ["first", "second"])
+            self.assertTrue(await bot._deliver_telegram_final_voice(
+                update, telegram, 42, "one canonical answer", 0
+            ))
+        self.assertEqual(played, ["one canonical answer"])
+        self.assertEqual(update.effective_message.reply_voice.await_count, 1)
         for metric in ("tts_prepare_start_ms", "tts_first_audio_ready_ms", "tts_playback_start_ms"):
             self.assertIn(metric, bot.RUNTIME_METRICS)
+
+    async def test_streamed_telegram_voice_answer_sends_exactly_one_voice(self):
+        async def synthesize(text, *, chat_id=None, preferences=None):
+            handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            handle.write(text.encode()); handle.close()
+            return Path(handle.name)
+
+        telegram = SimpleNamespace(send_chat_action=AsyncMock())
+        message = SimpleNamespace(reply_voice=AsyncMock())
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), effective_message=message)
+        final = "Первый фрагмент. Второй фрагмент."
+        events = iter([
+            {"type": "delta", "text": "Первый фрагмент. "},
+            {"type": "delta", "text": "Второй фрагмент."},
+            {"type": "done", "text": final, "canonical_message_id": 703},
+        ])
+        with patch.object(bot, "stream_agent_response", return_value=events), \
+             patch.object(bot, "get_mode", return_value="voice"), \
+             patch.object(bot, "get_voice_preferences", return_value={"voice": "voice", "speed": 1, "pitch": 1, "volume": 1}), \
+             patch.object(bot, "make_voice", new=AsyncMock(side_effect=synthesize)) as synthesize_once:
+            self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
+        synthesize_once.assert_awaited_once()
+        self.assertEqual(synthesize_once.await_args.args[0], final)
+        message.reply_voice.assert_awaited_once()
 
     def test_effective_model_is_global_and_legacy_user_override_is_ignored(self):
         database = sqlite3.connect(":memory:")
