@@ -451,6 +451,12 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"reminder_list",
+        "description":"Получить точные напоминания текущего пользователя из базы. Используй для вопросов о существующих напоминаниях, сегодня, завтра, просроченных, будущих или поиске по тексту; не используй память как источник истины.",
+        "parameters":{"type":"object","properties":{"scope":{"type":"string","enum":["today","tomorrow","overdue","upcoming","all","custom"]},"date_from":{"type":"string"},"date_to":{"type":"string"},"query":{"type":"string"},"include_acknowledged":{"type":"boolean"},"limit":{"type":"integer"}}}
+    }},
+
+    {"type":"function","function":{
 
         "name":"add_income",
 
@@ -3070,6 +3076,40 @@ def get_expenses(chat_id,date_from="",date_to="",category=""):
 
 
 
+def reminder_list(chat_id, scope="upcoming", date_from="", date_to="", query="", include_acknowledged=False, limit=100):
+    """Canonical owner-scoped reminder read model, expressed in user local time."""
+    chat_tz = timezone_for(chat_id)
+    today = datetime.now(chat_tz).date()
+    scope = str(scope or "upcoming").lower()
+    if scope not in {"today", "tomorrow", "overdue", "upcoming", "all", "custom"}:
+        raise ValueError("invalid_reminder_scope")
+    limit = max(1, min(int(limit or 100), 200))
+    with conn() as c:
+        rows = [dict(row) for row in c.execute(
+            "SELECT id,text,remind_at_utc,acknowledged,sent,followup_count FROM reminders WHERE chat_id=? ORDER BY remind_at_utc,id",
+            (chat_id,)).fetchall()]
+    selected = []
+    needle = str(query or "").strip().casefold()
+    for row in rows:
+        local = datetime.fromisoformat(row["remind_at_utc"]).astimezone(chat_tz)
+        day = local.date()
+        matches_scope = (
+            scope == "all" or
+            (scope == "today" and day == today) or
+            (scope == "tomorrow" and day == today + timedelta(days=1)) or
+            (scope == "overdue" and day < today and not row["acknowledged"]) or
+            (scope == "upcoming" and day >= today and not row["acknowledged"]) or
+            (scope == "custom" and (not date_from or day >= datetime.fromisoformat(date_from).date()) and (not date_to or day <= datetime.fromisoformat(date_to).date()))
+        )
+        if not matches_scope or (not include_acknowledged and row["acknowledged"]) or (needle and needle not in str(row["text"] or "").casefold()):
+            continue
+        selected.append({"id": row["id"], "text": row["text"], "remind_at_utc": row["remind_at_utc"],
+                         "local_time": local.isoformat(), "date": day.isoformat(), "time": local.strftime("%H:%M"),
+                         "acknowledged": bool(row["acknowledged"]), "sent": bool(row["sent"]), "followup_count": row["followup_count"]})
+    return {"ok": True, "tool": "reminder_list", "scope": scope, "timezone": chat_tz.key,
+            "count": len(selected), "items": selected[:limit]}
+
+
 def get_plan_for_date(chat_id, day):
     """Return a calendar day without silently completing anything overdue."""
     selected = datetime.fromisoformat(day).date()
@@ -3347,6 +3387,8 @@ def execute_tool(chat_id,name,args):
         "finance_list_transactions":finance_list_transactions,
 
         "get_today_plan":get_today_plan,
+
+        "reminder_list":reminder_list,
 
         "set_briefing_preferences":set_briefing_preferences,
 
@@ -3800,7 +3842,7 @@ def system_prompt(chat_id):
 
         "Если в одном сообщении человек + созвон/задача/напоминание — вызови несколько tools. "
 
-        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, get_today_plan для задач и напоминаний, get_people для людей, get_notes для заметок и get_files для файлов. Если finance tool вернул операции, их нельзя игнорировать или называть отсутствующими. "
+        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, reminder_list для существующих напоминаний, get_today_plan для задач на сегодня, get_people для людей, get_notes для заметок и get_files для файлов. Если exact tool вернул 0 строк, не выдумывай запись из памяти или истории. "
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
@@ -3891,7 +3933,7 @@ def stream_progress_for_tool(name):
     """Only report an action after its corresponding tool was actually run."""
     if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
         return "Вспоминаю…"
-    if name in {"get_today_plan", "add_task", "update_task", "delete_task", "set_reminder", "update_reminder", "delete_reminder"}:
+    if name in {"get_today_plan", "reminder_list", "add_task", "update_task", "delete_task", "set_reminder", "update_reminder", "delete_reminder"}:
         return "Проверяю задачи…"
     if name in {"get_expenses", "add_expense", "add_income", "update_expense", "delete_expense", "update_last_expense"}:
         return "Смотрю бюджет…"
@@ -4810,6 +4852,8 @@ def write_confirmation(results):
         elif n=="person_interaction": parts.append(f'Взаимодействие с {r["name"]} записано.')
 
         elif n=="set_reminder": parts.append(f'Напоминание поставлено на {r["local_time"]}.')
+
+        elif n=="reminder_list": parts.append("Активных напоминаний по выбранному периоду нет." if not r.get("count") else f"Найдено напоминаний: {r.get('count')}.")
 
         elif n=="add_task": parts.append(f'Задача добавлена: {r["text"]}.')
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 TOOL_PACKS = {
     "core_memory": {"knowledge_search", "knowledge_get"},
-    "planning": {"add_task", "get_today_plan", "delete_task", "set_reminder", "delete_reminder"},
+    "planning": {"add_task", "get_today_plan", "reminder_list", "delete_task", "set_reminder", "delete_reminder"},
     "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "finance_summary", "finance_list_transactions", "delete_expense"},
     "people": {"person_upsert", "person_interaction", "get_people", "delete_person", "delete_interaction"},
     "web": {"internet_search", "get_weather"},
@@ -134,6 +134,9 @@ class ToolPackResolver:
         its structured result before composing the response.
         """
         lowered = str(text or "").lower()
+        reminder_words = ("какие у меня напоминания", "какие напоминания", "что мне нужно сегодня", "напоминание завтра", "напоминания завтра", "есть ли напоминание", "покажи напомин")
+        if any(word in lowered for word in reminder_words):
+            return {"type": "function", "function": {"name": "reminder_list"}}
         artifact_words = ("дай файлом", "сделай файл", "сделай документ", "сделай word", "сделай таблиц", "сделай excel", "сделай html", "сделай json", "создай скрипт", "собери сайт")
         asks_finance = any(word in lowered for word in ("трат", "расход", "доход", "баланс", "бюджет", "операци"))
         if asks_finance and any(word in lowered for word in artifact_words):
