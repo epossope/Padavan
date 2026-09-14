@@ -53,6 +53,16 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 400)
         self.core.set_mode.assert_not_called()
 
+    async def test_artifact_download_maps_owner_denial_to_403(self):
+        store = SimpleNamespace(metadata=Mock(side_effect=PermissionError("artifact_forbidden")))
+        self.core.artifact_store = Mock(return_value=store)
+        self.core.ADMIN_CHAT_IDS = set()
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "signed", "action": "artifact", "args": {"artifact_id": "a" * 32},
+        })
+        self.assertEqual(response.status, 403)
+        store.metadata.assert_called_once_with("a" * 32, 42, is_admin=False, include_path=True)
+
     async def test_signed_owner_used(self):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "mode", "args": {"mode": "text"}})
         self.assertEqual(response.status, 200)

@@ -86,7 +86,7 @@ class ProductPolishV14Tests(unittest.TestCase):
         bot.set_admin_runtime_config(1, "tts_default_volume", .8)
         self.assertEqual((.95, 1.25, .8), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
 
-    def test_telegram_voice_settings_are_compact_and_open_miniapp(self):
+    def test_telegram_response_mode_owns_user_voice_selection(self):
         with patch.object(bot, "QUICK_ACTIONS_BASE_URL", "https://noema.example"):
             text, markup = bot.voice_settings_page(77)
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row if button.callback_data]
@@ -101,7 +101,11 @@ class ProductPolishV14Tests(unittest.TestCase):
         self.assertIn("Конкретный голос, скорость, высоту и громкость задаёт администратор Noema.", text)
         self.assertEqual(["https://noema.example/app?screen=settings"], webapps)
         settings_callbacks = [button.callback_data for row in bot.settings_keyboard(77).inline_keyboard for button in row if button.callback_data]
-        self.assertIn("settings:voice", settings_callbacks)
+        self.assertNotIn("settings:voice", settings_callbacks)
+        with patch.object(bot, "get_mode", return_value="voice"), patch.object(bot, "get_voice_preferences", return_value={"gender": "male"}):
+            mode_callbacks = [button.callback_data for row in bot.mode_keyboard(77).inline_keyboard for button in row if button.callback_data]
+        self.assertIn("voice:gender:male", mode_callbacks)
+        self.assertIn("voice:gender:female", mode_callbacks)
 
     def test_edge_voice_adapter_receives_locked_rate_pitch_and_volume(self):
         communicator = SimpleNamespace(save=AsyncMock())

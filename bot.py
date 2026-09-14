@@ -73,9 +73,10 @@ from url_enricher import HttpUrlEnricher
 
 from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
+from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
-                               SentenceChunker,
+                               SentenceChunker, SpeechTextPolicy,
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
@@ -179,6 +180,8 @@ def canonical_voice_reply_mode(value, default="text"):
 DEFAULT_MODE = canonical_voice_reply_mode(os.getenv("VOICE_REPLY_MODE", "text"))
 
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "20"))
+ARTIFACT_MAX_BYTES = max(1024, int(os.getenv("ARTIFACT_MAX_MB", "15")) * 1024 * 1024)
+ARTIFACT_TTL_HOURS = max(1, int(os.getenv("ARTIFACT_TTL_HOURS", "72")))
 
 TZ = ZoneInfo(TZ_NAME)
 
@@ -625,18 +628,37 @@ TOOLS = [
 
     }},
 
+    {"type":"function","function":{
+        "name":"artifact_create",
+        "description":"Создать и прикрепить готовый безопасный файл. Обязательно используй при явном запросе дать файлом, создать документ, таблицу, HTML/JSON/скрипт или многофайловый проект. Маленький пример кода без просьбы о файле оставляй в чате. Для PDF передай имя .pdf: система честно создаст DOCX fallback. Для ZIP передавай только файлы текущего запроса.",
+        "parameters":{"type":"object","properties":{
+            "filename":{"type":"string"},
+            "content":{"description":"Полное содержимое одиночного файла или текст документа","type":"string"},
+            "rows":{"type":"array","items":{"type":"array","items":{"type":["string","number","boolean"]}}},
+            "files":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"content":{"type":"string"}},"required":["name","content"]}}
+        },"required":["filename"]}
+    }},
+
 ]
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
+
+# Files received from Telegram are handled by the ingestion pipeline, not by
+# model-callable filesystem tools. artifact_create is the sole generated-file
+# authority exposed to the LLM.
+TOOLS = [tool for tool in TOOLS if tool.get("function", {}).get("name") not in {"save_image_to_db", "get_file_from_telegram"}]
 
 
 
 # Database and originals must live together in Amvera's persistent mount.
 STORAGE_ROOT = PERSISTENT_ROOT / "storage"
+ARTIFACT_ROOT = PERSISTENT_ROOT / "artifacts"
 
 _pipeline = None
+_artifact_store = None
+_artifact_store_connector = None
 
 
 def _bot_save_file(cid, name, mime, path, kind, summary, source_file_id=None):
@@ -875,6 +897,25 @@ def conn():
     c.row_factory = sqlite3.Row
 
     return c
+
+
+def artifact_store():
+    """Canonical owner for generated files and their durable metadata."""
+    global _artifact_store, _artifact_store_connector
+    # Rebuild if a maintenance/test harness temporarily swaps the connector.
+    # In production ``conn`` is stable and every short-lived SQLite connection
+    # is closed by ArtifactService after its transaction.
+    if _artifact_store is None or _artifact_store_connector is not conn:
+        _artifact_store = ArtifactService(
+            conn, ARTIFACT_ROOT, max_bytes=ARTIFACT_MAX_BYTES, ttl_hours=ARTIFACT_TTL_HOURS,
+        )
+        _artifact_store_connector = conn
+    return _artifact_store
+
+
+def artifact_create(chat_id, filename, content="", rows=None, files=None):
+    metadata = artifact_store().create(chat_id, filename, content, rows=rows, files=files)
+    return {"ok": True, "tool": "artifact_create", "artifact": metadata}
 
 
 def app_setting(key, default=""):
@@ -1248,8 +1289,8 @@ def schedule_ephemeral_delete(context, message, delay=240):
 
 EPHEMERAL_CONFIRMATION_PREFIXES = (
     "Напоминание поставлено", "Задача добавлена", "Заметка сохранена",
-    "Записала расход", "Записала поступление", "Обновила расход",
-    "Сохранила данные", "Записала взаимодействие", "Правило добавлено",
+    "Расход записан", "Поступление записано", "Расход обновлён",
+    "Данные о", "Взаимодействие с", "Правило добавлено",
     "Правило обновлено", "Правило удалено", "Часовой пояс изменён",
 )
 
@@ -1872,12 +1913,23 @@ def history(chat_id, n=18):
 
                        (chat_id,n)).fetchall()
 
-    return [{
-        "message_id": r["id"],
-        "role": r["role"],
-        "content": sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""),
-        "created_at": r["created_at"],
-    } for r in reversed(rs)]
+    try:
+        attachments = artifact_store().for_messages(chat_id, [r["id"] for r in rs])
+    except (sqlite3.Error, RuntimeError):
+        # A pre-migration read-only snapshot can lack the artifact tables.
+        attachments = {}
+    result = []
+    for r in reversed(rs):
+        item = {
+            "message_id": r["id"],
+            "role": r["role"],
+            "content": sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""),
+            "created_at": r["created_at"],
+        }
+        if attachments.get(r["id"]):
+            item["artifacts"] = attachments[r["id"]]
+        result.append(item)
+    return result
 
 
 
@@ -1886,6 +1938,7 @@ def clear_history(chat_id):
     with conn() as c:
 
         c.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        c.execute("DELETE FROM conversation_summaries WHERE chat_id=?", (chat_id,))
 
 
 def ensure_behavior_rules(chat_id):
@@ -2278,10 +2331,9 @@ def shared_vision_model():
     return (row["setting_value"] if row else "") or snapshot["fields"]["vision_model"]["value"]
 
 
-def set_shared_vision_model(model):
-    # Compatibility for the existing Telegram setting flow. The normal admin
-    # Mini App route records the actual admin id; legacy callers are marked 0.
-    return set_admin_runtime_config(0, "vision_model", model)
+def set_shared_vision_model(updated_by, model):
+    """Compatibility name for the one authorized global Vision write path."""
+    return set_admin_runtime_config(updated_by, "vision_model", model)
 
 
 def vision_models_for(chat_id):
@@ -3263,6 +3315,8 @@ def execute_tool(chat_id,name,args):
 
         "knowledge_files":knowledge_files_tool
 
+        ,"artifact_create":artifact_create
+
     }
 
     if name not in funcs: return {"ok":False,"tool":name,"error":"unknown_tool"}
@@ -3630,7 +3684,7 @@ def direct_live_request(text):
 
         if cm: city=cm.group(1)
 
-        return format_links("🛍 Нашла варианты",search_products_live(text,max_price,city))
+        return format_links("🛍 Подходящие варианты",search_products_live(text,max_price,city))
 
     return None
 
@@ -3655,7 +3709,11 @@ def system_prompt(chat_id):
 
     return (
 
-        "Ты Noema (Noema Model v1) — персональный помощник. "
+        "Ты Noema (Noema Model v1) — цифровой персональный ассистент без мужского или женского гендера. "
+
+        "Мужской или женский голос меняет только звучание TTS и никогда не меняет твою личность, память или стиль. "
+
+        "В русском языке избегай самореференса в прошедшем времени с грамматическим родом: не говори «я сделала», «я подготовил», «я нашла», «я проверил», «я решила». Используй нейтральные конструкции: «готово», «документ подготовлен», «есть результат», «информация найдена», «сейчас проверю», «могу подготовить», «я на связи». Если спрашивают о твоём поле или гендере, ответь: «Noema — цифровой ассистент. Можно выбрать мужской или женский голос.» "
 
         "Ты работаешь с tools: ты можешь сохранять заметки, задачи, напоминания, расходы, "
 
@@ -3679,7 +3737,7 @@ def system_prompt(chat_id):
 
         "Правила можно показать через get_behavior_rules, изменить через update_behavior_rule и удалить через delete_behavior_rule. "
 
-        "Никогда не создавай заметку, задачу, напоминание или правило только из короткого ответа «да», «давай», «ок», «продолжай» или другой реплики-подтверждения. Это продолжение разговора, а не команда сохранения. Если до этого предложила рассказ, объяснить или показать что-то — выполни обещанное, а не сохраняй служебную запись. "
+        "Никогда не создавай заметку, задачу, напоминание или правило только из короткого ответа «да», «давай», «ок», «продолжай» или другой реплики-подтверждения. Это продолжение разговора, а не команда сохранения. Если до этого было предложение рассказать, объяснить или показать что-то — выполни обещанное, а не сохраняй служебную запись. "
 
         "Если пользователь говорит, что находится, переехал или путешествует в другой стране/часовом поясе — используй set_timezone с подходящим IANA ID (например Китай — Asia/Shanghai). Если пользователь явно просит изменить город, темы новостей, время или включение ежедневного брифинга — используй set_briefing_preferences. Состав и формат самого брифинга не меняй самовольно. "
 
@@ -3695,13 +3753,15 @@ def system_prompt(chat_id):
 
         "Если пользователь просит ПОКАЗАТЬ/ДАТЬ/отправить фото или скрин — после поиска вызови send_stored_image (id найденного knowledge или query) — бот реально отправит файл. "
 
-        "Если knowledge_search ничего не вернул — честно скажи «Я не нашла сохранённых данных по этому запросу», не выдумывай. "
+        "Если knowledge_search ничего не вернул — честно скажи «Сохранённых данных по этому запросу не найдено», не выдумывай. "
+
+        "Полноценно отвечай на research, рассказы, объяснения и длинные инструкции; не сокращай их ради транспорта. Когда результат по природе является готовым файлом или пользователь явно просит файл, документ, таблицу, HTML, JSON, скрипт, PDF, сайт или набор файлов — обязательно вызови artifact_create. Для нескольких файлов используй ZIP. PDF в этой версии создаётся как честно обозначенный DOCX fallback. После tool дай короткое нейтральное резюме и не дублируй огромный код или данные в чат, если пользователь явно не просил показать их и здесь, и файлом. Маленький пример кода без просьбы о файле оставляй inline. "
 
         "Никогда не заявляй, что что-то сохранено, если tool не вернул ok=true. "
 
         "Не раскрывай внутренние модели, OpenRouter или провайдера. "
 
-        "Отвечай коротко, естественно и персонально. "
+        "Отвечай естественно и персонально; длина должна соответствовать задаче, без искусственного обрезания полезного ответа. "
 
         f"Активные правила пользователя: {rules_text}. "
 
@@ -3717,7 +3777,7 @@ def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, strea
         "model": model,
         "messages": messages,
         "temperature": 0.25,
-        "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1800")),
+        "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "6000")),
         # Qwen/Alibaba otherwise exposes untagged chain-of-thought in content.
         # OpenRouter's exclude flag is insufficient for this provider route.
         "reasoning": {"enabled": False},
@@ -3822,6 +3882,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         record_runtime_metric("selected_global_model", _safe_model_metric_code(models[0]), model=models[0])
     record_runtime_metric("context_build_ms", (time.perf_counter() - context_started) * 1000)
     writes = []
+    artifacts = []
+    answer_parts = []
     total_visible_chars = 0
     total_reasoning_dropped = 0
     first_visible_marked = False
@@ -3908,13 +3970,21 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             raise RuntimeError("MODEL_BUSY" if last_error == 429 else "MODEL_ERROR")
         calls = message.get("tool_calls") or []
         if not calls:
-            answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
+            segment = sanitize_visible_content(message.get("content") or "")
+            if accumulator.finish_reason == "length" and round_index < 4:
+                answer_parts.append(segment)
+                messages.append({"role": "assistant", "content": segment})
+                messages.append({"role": "user", "content": "Продолжи ответ ровно с места остановки, без повторения уже выданного текста."})
+                continue
+            answer = "".join(answer_parts + [segment]).strip() or write_confirmation(writes)
             canonical_user_message_id = add_message(chat_id, "user", text)
             canonical_message_id = add_message(chat_id, "assistant", answer)
+            if artifacts:
+                artifact_store().link_message(canonical_message_id, [item["artifact_id"] for item in artifacts])
             record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
             record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
             record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
-            yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+            yield {"type": "done", "text": answer, "artifacts": artifacts, "canonical_message_id": canonical_message_id,
                    "canonical_user_message_id": canonical_user_message_id,
                    "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
@@ -3937,18 +4007,22 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 result = {"ok": False, "tool": name, "error": str(exc)}
             if name in WRITE_TOOLS:
                 writes.append(result)
+            if result.get("ok") and isinstance(result.get("artifact"), dict):
+                artifacts.append(result["artifact"])
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
             if cancel_event.is_set():
                 yield {"type": "cancelled"}
                 return
-    answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
+    answer = "".join(answer_parts).strip() or (write_confirmation(writes) if writes else "Не удалось завершить действие.")
     canonical_user_message_id = add_message(chat_id, "user", text)
     canonical_message_id = add_message(chat_id, "assistant", answer)
+    if artifacts:
+        artifact_store().link_message(canonical_message_id, [item["artifact_id"] for item in artifacts])
     record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
     record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
     record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
-    yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+    yield {"type": "done", "text": answer, "artifacts": artifacts, "canonical_message_id": canonical_message_id,
            "canonical_user_message_id": canonical_user_message_id}
 
 
@@ -4042,7 +4116,7 @@ async def stream_answer_to_telegram_draft(update, context, text):
 
     threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
     throttle = AdaptiveDraftThrottle(TELEGRAM_DRAFT_MIN_INTERVAL, TELEGRAM_DRAFT_MAX_INTERVAL, TELEGRAM_DRAFT_MIN_CHARS)
-    accumulated, final = "", ""
+    accumulated, final, artifacts = "", "", []
     draft_available = True
     try:
         try:
@@ -4089,6 +4163,7 @@ async def stream_answer_to_telegram_draft(update, context, text):
                         draft_available = False
             elif kind == "done":
                 final = event.get("text") or accumulated
+                artifacts = event.get("artifacts") or []
             elif kind == "tool" and draft_available:
                 # ``tool`` is emitted only after the canonical core actually
                 # executed it, so this status is truthful.
@@ -4105,7 +4180,8 @@ async def stream_answer_to_telegram_draft(update, context, text):
         if draft_available and final and throttle.should_send(final, force=True):
             with contextlib.suppress(Exception):
                 await context.bot.send_message_draft(chat_id, draft_id, final[-4096:], api_kwargs={"can_stop": False})
-        await send_answer(update, final, context=context, voice_in=False, force_voice=wants_voice(text))
+        await send_answer(update, final, context=context, voice_in=False, force_voice=wants_voice(text), artifacts=artifacts)
+        await _deliver_telegram_artifacts(context.bot, chat_id, artifacts)
         return True
     finally:
         cancelled.set()
@@ -4298,7 +4374,25 @@ def _telegram_live_stream_trace(request_id, chat_id, event_type, **fields):
     ))
 
 
-async def _deliver_telegram_final_voice(update, telegram_bot, chat_id, final, started_at):
+async def _deliver_telegram_artifacts(telegram_bot, chat_id, artifacts):
+    """Telegram adapter: deliver generated files, never expose storage paths."""
+    delivered = []
+    for artifact in artifacts or []:
+        try:
+            item = artifact_store().metadata(artifact.get("artifact_id"), chat_id, include_path=True)
+            with Path(item["local_path"]).open("rb") as stream:
+                message = await telegram_bot.send_document(
+                    chat_id=chat_id, document=stream, filename=item["filename"],
+                    caption=f"📎 {item['filename']}",
+                )
+            delivered.append(getattr(message, "message_id", None))
+        except Exception as exc:
+            LOGGER.warning("Artifact delivery failed chat_id_hash=%s error=%s",
+                           _telegram_stream_chat_id_hash(chat_id), type(exc).__name__)
+    return delivered
+
+
+async def _deliver_telegram_final_voice(update, telegram_bot, chat_id, final, started_at, artifacts=None):
     """Send one valid Telegram voice payload for one completed assistant answer.
 
     Mini App playback keeps its early chunk queue. Telegram voice bubbles cannot
@@ -4310,7 +4404,10 @@ async def _deliver_telegram_final_voice(update, telegram_bot, chat_id, final, st
     try:
         preferences = get_voice_preferences(chat_id)
         record_runtime_metric("tts_prepare_start_ms", elapsed_ms(), channel="telegram")
-        path = await make_voice(final, chat_id=chat_id, preferences=preferences)
+        voice_kwargs = {"chat_id": chat_id, "preferences": preferences}
+        if artifacts:
+            voice_kwargs["artifacts"] = artifacts
+        path = await make_voice(final, **voice_kwargs)
         record_runtime_metric("tts_first_audio_ready_ms", elapsed_ms(), channel="telegram")
         await telegram_runtime_action(telegram_bot, chat_id, "SPEAKING")
         # Telegram does not expose client playback callbacks. This is the
@@ -4348,7 +4445,7 @@ async def stream_answer_to_telegram(update, context, text):
     throttle = AdaptiveDraftThrottle(
         TELEGRAM_DRAFT_MIN_INTERVAL, TELEGRAM_DRAFT_MAX_INTERVAL, TELEGRAM_DRAFT_MIN_CHARS
     )
-    accumulated, final = "", ""
+    accumulated, final, artifacts = "", "", []
     canonical_message_id = working_message_id = None
     editing_available, first_visible_edit, finalized = True, False, False
     visible_chars = stream_edit_count = last_edited_visible_chars = 0
@@ -4451,6 +4548,7 @@ async def stream_answer_to_telegram(update, context, text):
                             )
             elif kind == "done":
                 final = event.get("text") or accumulated
+                artifacts = event.get("artifacts") or []
                 canonical_message_id = event.get("canonical_message_id")
                 done_received = True
             elif kind == "cancelled":
@@ -4463,7 +4561,7 @@ async def stream_answer_to_telegram(update, context, text):
         final_message_ids = []
         final_promotion_path = "not_applicable"
         fallback_path = False
-        if wants_text and final:
+        if (wants_text or artifacts) and final:
             canonical_chunks = _telegram_final_chunks(chat_id, final)
             promoted = False
             if working_message_id is not None and editing_available and canonical_chunks:
@@ -4504,8 +4602,10 @@ async def stream_answer_to_telegram(update, context, text):
                 )
             if final_message_ids:
                 working_message_id = final_message_ids[0]
+        if artifacts:
+            await _deliver_telegram_artifacts(context.bot, chat_id, artifacts)
         if wants_audio and final:
-            await _deliver_telegram_final_voice(update, context.bot, chat_id, final, response_started)
+            await _deliver_telegram_final_voice(update, context.bot, chat_id, final, response_started, artifacts=artifacts)
         finalized = bool(final) or not wants_text
         TELEGRAM_DELIVERY_CORRELATIONS.append({
             "request_id": request_id,
@@ -4555,7 +4655,9 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                     break
                 if choice.get("finish_reason") == "length":
                     print(f"LLM truncation chat_id={chat_id} model={model}")
-                return sanitize_assistant_message(choice["message"])
+                clean_message = sanitize_assistant_message(choice["message"])
+                clean_message["_finish_reason"] = choice.get("finish_reason")
+                return clean_message
 
             record_usage(chat_id, response_key_source(r, chat_id), model, {})
             last=(r.status_code,r.text)
@@ -4586,12 +4688,15 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
             if r.ok:
                 data = r.json()
                 record_usage(chat_id, response_key_source(r, chat_id), model, data)
-                message = data["choices"][0]["message"]
+                choice = data["choices"][0]
+                message = choice["message"]
                 if assistant_reasoning_contract_violated(message):
                     last = (502, "reasoning_contract")
                     LOGGER.warning("Reasoning-disabled contract rejected provider response model=%s", model)
                     continue
-                return sanitize_assistant_message(message)
+                clean_message = sanitize_assistant_message(message)
+                clean_message["_finish_reason"] = choice.get("finish_reason")
+                return clean_message
 
             record_usage(chat_id, response_key_source(r, chat_id), model, {})
             last=(r.status_code,r.text)
@@ -4612,15 +4717,15 @@ def write_confirmation(results):
 
         if n=="set_timezone": parts.append(f'Часовой пояс изменён: {r["timezone"]}.')
 
-        elif n=="add_expense": parts.append(f'Записала расход: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
+        elif n=="add_expense": parts.append(f'Расход записан: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
 
-        elif n=="add_income": parts.append(f'Записала поступление: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
+        elif n=="add_income": parts.append(f'Поступление записано: {r["amount"]:g} {r["currency"]} — {r["description"]}.')
 
-        elif n=="update_last_expense": parts.append(f'Обновила расход: {r["amount"]:g} {r["currency"]} — {r["category"]}, {r["description"]}.')
+        elif n=="update_last_expense": parts.append(f'Расход обновлён: {r["amount"]:g} {r["currency"]} — {r["category"]}, {r["description"]}.')
 
-        elif n=="person_upsert": parts.append(f'Сохранила данные о {r["name"]}.')
+        elif n=="person_upsert": parts.append(f'Данные о {r["name"]} сохранены.')
 
-        elif n=="person_interaction": parts.append(f'Записала взаимодействие с {r["name"]}.')
+        elif n=="person_interaction": parts.append(f'Взаимодействие с {r["name"]} записано.')
 
         elif n=="set_reminder": parts.append(f'Напоминание поставлено на {r["local_time"]}.')
 
@@ -4633,6 +4738,14 @@ def write_confirmation(results):
         elif n=="update_behavior_rule": parts.append("Правило обновлено.")
 
         elif n=="delete_behavior_rule": parts.append("Правило удалено.")
+
+        elif n=="artifact_create":
+            artifact = r.get("artifact") or {}
+            label = artifact.get("filename") or "файл"
+            if artifact.get("fallback_from") == ".pdf":
+                parts.append(f"Готово. Надёжная PDF-генерация недоступна, поэтому подготовлен DOCX-файл {label}.")
+            else:
+                parts.append(f"Готово. Файл {label} подготовлен и прикреплён к сообщению.")
 
     out=[]
 
@@ -4678,26 +4791,40 @@ def ask(chat_id,text):
     record_runtime_metric("context_build_ms", (time.perf_counter()-context_started)*1000)
 
     writes=[]
+    artifacts=[]
+    answer_parts=[]
+    selected_tools=ToolPackResolver().resolve(TOOLS, text)
 
-    for _ in range(5):
+    for round_index in range(5):
 
         # `required` made every ordinary conversation take at least two model
         # round trips. `auto` still exposes all tools, but allows a direct
         # answer when no database action is needed.
         tc="required" if _ == 0 and asks_external_web(text) else "auto"
 
-        msg=call_or(chat_id,msgs,TOOLS,tc)
+        msg=call_or(chat_id,msgs,selected_tools,tc)
 
         calls=msg.get("tool_calls") or []
 
         if not calls:
 
-            ans=sanitize_visible_content(msg.get("content") or "").strip() or write_confirmation(writes)
+            segment=sanitize_visible_content(msg.get("content") or "")
+            if msg.get("_finish_reason") == "length" and round_index < 4:
+                answer_parts.append(segment)
+                msgs.append({"role":"assistant","content":segment})
+                msgs.append({"role":"user","content":"Продолжи ответ ровно с места остановки, без повторения уже выданного текста."})
+                continue
 
-            add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans)
+            ans="".join(answer_parts + [segment]).strip() or write_confirmation(writes)
+
+            add_message(chat_id,"user",text)
+            assistant_id=add_message(chat_id,"assistant",ans)
+            if artifacts:
+                artifact_store().link_message(assistant_id, [item["artifact_id"] for item in artifacts])
             print(f"Request complete chat_id={chat_id} route=llm seconds={time.perf_counter()-started:.2f}")
             return ans
 
+        msg.pop("_finish_reason", None)
         msgs.append(msg)
 
         round_results=[]
@@ -4720,6 +4847,8 @@ def ask(chat_id,text):
 
             if name in WRITE_TOOLS: writes.append(result)
 
+            if result.get("ok") and isinstance(result.get("artifact"), dict): artifacts.append(result["artifact"])
+
             round_results.append((name,result))
 
             msgs.append({"role":"tool","tool_call_id":tc.get("id"),"content":json.dumps(result,ensure_ascii=False)})
@@ -4728,11 +4857,15 @@ def ask(chat_id,text):
 
             ans=write_confirmation(writes)
 
-            add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans); return ans
+            add_message(chat_id,"user",text); assistant_id=add_message(chat_id,"assistant",ans)
+            if artifacts: artifact_store().link_message(assistant_id, [item["artifact_id"] for item in artifacts])
+            return ans
 
-        ans=write_confirmation(writes) if writes else "Не удалось завершить действие."
+        ans="".join(answer_parts).strip() or (write_confirmation(writes) if writes else "Не удалось завершить действие.")
 
-    add_message(chat_id,"user",text); add_message(chat_id,"assistant",ans); return ans
+    add_message(chat_id,"user",text); assistant_id=add_message(chat_id,"assistant",ans)
+    if artifacts: artifact_store().link_message(assistant_id, [item["artifact_id"] for item in artifacts])
+    return ans
 
 
 
@@ -4955,7 +5088,7 @@ def server_tts_provider(runtime=None):
     return "edge"
 
 
-async def make_voice(text, chat_id=None, preferences=None):
+async def make_voice(text, chat_id=None, preferences=None, artifacts=None):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
     try:
@@ -4969,7 +5102,8 @@ async def make_voice(text, chat_id=None, preferences=None):
         volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
         if provider != "edge":
             raise RuntimeError("TTS_SERVER_PROVIDER_UNAVAILABLE")
-        await edge_tts.Communicate(clean_tts(text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
+        speech_text = SpeechTextPolicy().build(text, artifacts=artifacts)
+        await edge_tts.Communicate(clean_tts(speech_text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
         return p
     except BaseException:
         p.unlink(missing_ok=True)
@@ -4985,13 +5119,13 @@ def wants_voice(text):
 
 
 
-async def send_answer(update,answer,context=None,voice_in=False,force_voice=False):
+async def send_answer(update,answer,context=None,voice_in=False,force_voice=False,artifacts=None):
 
     mode=get_mode(update.effective_chat.id)
 
     eff="voice_and_text" if force_voice else mode
 
-    if eff in ("text","voice_and_text"):
+    if eff in ("text","voice_and_text") or artifacts:
         total_emoji_limit = reply_emoji_limit(len(str(answer or "")))
         for index, chunk in enumerate(TelegramRenderer.chunks(answer)):
             # The reply keyboard belongs to a lasting answer, never to the
@@ -5011,7 +5145,10 @@ async def send_answer(update,answer,context=None,voice_in=False,force_voice=Fals
 
     if eff in ("voice","voice_and_text"):
 
-        p=await make_voice(answer, chat_id=update.effective_chat.id)
+        voice_kwargs = {"chat_id": update.effective_chat.id}
+        if artifacts:
+            voice_kwargs["artifacts"] = artifacts
+        p=await make_voice(answer, **voice_kwargs)
 
         try:
 
@@ -5573,7 +5710,8 @@ async def callback(update,context):
 
     # Model and key management is a platform setting now. Older inline
     # messages may still contain these buttons, so protect those too.
-    admin_only = ("settings:model", "settings:vision", "settings:keys", "model:", "vision:", "keys:", "voice:admin:")
+    admin_only = ("settings:model", "settings:vision", "settings:keys", "settings:status", "settings:emoji",
+                  "model:", "vision:", "keys:", "voice:admin:", "emoji:")
     if q.data.startswith(admin_only) and q.message.chat_id not in ADMIN_CHAT_IDS:
         return await q.edit_message_text("Модели и ключи уже настроены Noema.", reply_markup=settings_keyboard(q.message.chat_id))
 
@@ -5690,7 +5828,15 @@ async def callback(update,context):
         await q.edit_message_text("⚙️ Настройки", reply_markup=settings_keyboard(q.message.chat_id))
         return
 
+    if q.data == "settings:timezone":
+        return await q.edit_message_text(
+            "Напиши в чат, например: «Смени часовой пояс на Europe/Moscow».",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Настройки", callback_data="settings:back")]]),
+        )
+
     if q.data == "settings:voice":
+        if q.message.chat_id not in ADMIN_CHAT_IDS:
+            return await q.edit_message_text("💬 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
         text, markup = voice_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -5700,8 +5846,7 @@ async def callback(update,context):
             return
         prefs = get_voice_preferences(q.message.chat_id)
         set_voice_preferences(q.message.chat_id, gender, prefs["speed"], prefs["pitch"], prefs["volume"])
-        text, markup = voice_settings_page(q.message.chat_id)
-        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        return await q.edit_message_text("💬 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
 
     if q.data.startswith("voice:admin:edit:"):
         field = q.data.removeprefix("voice:admin:edit:")
@@ -5716,7 +5861,7 @@ async def callback(update,context):
             ]]))
 
     if q.data in ("menu:mode", "settings:mode"):
-        await q.edit_message_text("🔊 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
+        await q.edit_message_text("💬 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
         return
 
     if q.data.startswith("mode:set:"):
@@ -5726,6 +5871,8 @@ async def callback(update,context):
         set_mode(q.message.chat_id, mode)
         labels = {"text": "💬 Текст", "voice": "🎙 Голос", "voice_and_text": "🔊 Голос + текст"}
         await q.edit_message_text(f"Режим: {labels[mode]}.", reply_markup=mode_keyboard(q.message.chat_id))
+        return
+    if q.data == "mode:noop":
         return
 
     if q.data == "menu:reminders":
@@ -6151,6 +6298,14 @@ async def callback(update,context):
             [InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")],
         ]))
     if q.data == "settings:clear":
+        return await q.edit_message_text(
+            "Очистить только историю текущего диалога? Заметки, файлы, знания и настройки сохранятся.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧹 Очистить диалог", callback_data="settings:clear:confirm")],
+                [InlineKeyboardButton("‹ Настройки", callback_data="settings:back")],
+            ]),
+        )
+    if q.data == "settings:clear:confirm":
         clear_history(q.message.chat_id)
         return await q.edit_message_text(
             "Контекст диалога очищен. Заметки, люди, файлы и знания сохранены.",
@@ -6196,24 +6351,23 @@ def more_page():
 
 
 def settings_keyboard(chat_id=None):
+    timezone_button = (InlineKeyboardButton("🌍 Часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))
+                       if QUICK_ACTIONS_BASE_URL else InlineKeyboardButton("🌍 Часовой пояс", callback_data="settings:timezone"))
+    user_rows = [
+        [interface_inline_button("replymode", "💬", "Режим ответа", "menu:mode")],
+        [interface_inline_button("rules", "👉", "Правила", "settings:rules")],
+        [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), timezone_button],
+        [interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
+    ]
     if chat_id in ADMIN_CHAT_IDS:
-        rows = [
+        rows = user_rows + [
             [interface_inline_button("model", "🧠", "Модель", "settings:model"), interface_inline_button("vision", "👁", "Vision", "settings:vision")],
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
-            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
-            [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("keys", "🔐", "Управление AI", "settings:keys")],
+            [interface_inline_button("voice", "🎙", "Admin Voice", "settings:voice"), interface_inline_button("keys", "🔐", "Управление AI", "settings:keys")],
             [InlineKeyboardButton("✨ Эмодзи", callback_data="settings:emoji")],
-            [interface_inline_button("status", "⚙️", "Статус", "settings:status"), interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
+            [interface_inline_button("status", "⚙️", "Статус", "settings:status")],
         ]
     else:
-        rows = [
-            [interface_inline_button("replymode", "🔊", "Режим ответа", "menu:mode"), interface_inline_button("voice", "🎙", "Голос", "settings:voice")],
-            [interface_inline_button("rules", "📜", "Правила", "settings:rules")],
-            [interface_inline_button("iphone", "📱", "iPhone", "settings:iphone"), interface_inline_button("status", "⚙️", "Статус", "settings:status")],
-            [interface_inline_button("clear", "🧹", "Очистить диалог", "settings:clear")],
-        ]
-    if QUICK_ACTIONS_BASE_URL:
-        rows.append([InlineKeyboardButton("🌍 Определить часовой пояс", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/timezone"))])
+        rows = user_rows
     rows.append([InlineKeyboardButton("‹ Назад", callback_data="ui:close")])
     return live_markup(InlineKeyboardMarkup(rows))
 
@@ -6417,6 +6571,13 @@ def mode_keyboard(chat_id):
                               callback_data=f"mode:set:{value}")]
         for value, label in choices
     ]
+    if current in {"voice", "voice_and_text"}:
+        gender = get_voice_preferences(chat_id)["gender"]
+        rows.extend([
+            [InlineKeyboardButton("Голос:", callback_data="mode:noop")],
+            [InlineKeyboardButton(("● " if gender == "male" else "○ ") + "Мужской", callback_data="voice:gender:male"),
+             InlineKeyboardButton(("● " if gender == "female" else "○ ") + "Женский", callback_data="voice:gender:female")],
+        ])
     rows.append([InlineKeyboardButton("‹ Назад", callback_data="settings:back")])
     return live_markup(InlineKeyboardMarkup(rows))
 
@@ -6705,7 +6866,7 @@ async def text_handler(update,context):
                 f"👁 Vision FORCE включён для всех: <code>{html.escape(model)}</code>.",
                 parse_mode="HTML", reply_markup=settings_keyboard(cid))
         if vision_scope == "shared":
-            set_shared_vision_model(model)
+            set_shared_vision_model(cid, model)
             return await update.effective_message.reply_text(
                 f"👁 Общая Vision-модель изменена: <code>{html.escape(model)}</code>.", parse_mode="HTML", reply_markup=settings_keyboard(cid))
         if not has_personal_api_key(cid):
@@ -6858,7 +7019,7 @@ async def text_handler(update,context):
 
             except Exception:
 
-                return await update.effective_message.reply_text("Нашла запись, но файл недоступен локально.")
+                return await update.effective_message.reply_text("Запись найдена, но файл недоступен локально.")
 
 
 

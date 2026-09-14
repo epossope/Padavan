@@ -9,11 +9,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from aiohttp import web
 
 
-APP_BUILD_ID = "ui-1.10.0"
+APP_BUILD_ID = "ui-1.11.0"
 BOOT_TELEMETRY_STAGES = {
     "boot_started", "js_ready", "telegram_ready", "initdata_present",
     "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
@@ -320,6 +321,28 @@ def register_miniapp(app, core):
                 if not row or not row["local_path"] or not Path(row["local_path"]).is_file():
                     raise web.HTTPNotFound(text="Файл недоступен")
                 return web.FileResponse(row["local_path"], headers={"Cache-Control": "no-store", "Content-Disposition": "attachment"})
+            elif action == "artifact":
+                artifact_id = str(args.get("artifact_id") or "")
+                if not artifact_id or len(artifact_id) > 64:
+                    raise ValueError("Некорректный файл")
+                try:
+                    item = core.artifact_store().metadata(
+                        artifact_id, cid,
+                        is_admin=cid in getattr(core, "ADMIN_CHAT_IDS", set()),
+                        include_path=True,
+                    )
+                except PermissionError:
+                    raise web.HTTPForbidden(text="Недостаточно прав")
+                except FileNotFoundError:
+                    raise web.HTTPNotFound(text="Файл недоступен")
+                suffix = Path(item["filename"]).suffix.lower().lstrip(".") or "bin"
+                disposition = f"attachment; filename=artifact.{suffix}; filename*=UTF-8''{quote(item['filename'])}"
+                return web.FileResponse(item["local_path"], headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": disposition,
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Security-Policy": "sandbox",
+                })
             elif action == "chat":
                 text = str(args.get("text", "")).strip()
                 if not text or len(text) > 12000:
@@ -450,6 +473,7 @@ def register_miniapp(app, core):
                 "history": core.history(cid, 50), "rules": core.behavior_rules_for(cid),
                 "settings": {"timezone": core.timezone_name_for(cid), "mode": core.get_mode(cid),
                              "home_widgets": widgets_for(cid),
+                             "is_admin": beta_available,
                              "experimental_realtime": realtime_beta,
                              "experimental_realtime_available": beta_available,
                              "experimental_wake_enabled": wake_enabled,
