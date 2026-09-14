@@ -6280,16 +6280,19 @@ async def callback(update,context):
         rows = admin_user_usage_rows(user["chat_id"])
         text = usage_text(rows, f'📊 <b>Пользователь Noema · #{int(user["user_number"]):03d} {html.escape(user_caption(user))}</b>')
         if summary:
-            source = "user key" if summary["has_personal_key"] else "нет"
-            managed = "да" if summary["has_managed_key"] else "нет"
             limit = f"${float(summary['monthly_limit_usd']):.2f}/мес." if summary["has_managed_key"] else "общий ключ · без отдельного лимита"
-            last = str(summary.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
+            last = str(summary.get("last_activity") or "")[:16].replace("T", " ") or "ещё не было"
             text += ("\n\n<b>Профиль и учёт</b>\n"
                      f"Telegram ID: <code>{int(user['chat_id'])}</code>\n"
-                     f"Personal API key: {source} · managed key: {managed}\n"
+                     f"Requests: <b>{int(summary['requests'] or 0):,}</b>\n"
+                     f"LLM calls: <b>{int(summary['llm_calls'] or 0):,}</b>\n"
+                     f"Input tokens: <b>{int(summary['input_tokens'] or 0):,}</b>\n"
+                     f"Output tokens: <b>{int(summary['output_tokens'] or 0):,}</b>\n"
+                     f"Cost: <b>${float(summary['cost'] or 0):.4f}</b>\n"
+                     f"Key type: <code>{html.escape(str(summary['key_type']))}</code>\n"
                      f"Effective model: <code>{html.escape(str(summary['effective_model']))}</code>\n"
                      f"Лимит: {limit}\n"
-                     f"Последняя LLM-активность: {html.escape(last)}")
+                     f"Последняя активность: {html.escape(last)}")
         text += managed_key_lifecycle_text(user["chat_id"])
         return await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("‹ Пользователи", callback_data=f"keys:admin_users:{page}")],
@@ -6468,19 +6471,21 @@ def usage_text(rows, title, show_chats=False):
     if not rows:
         return title + "\n\nЗа последние 30 дней обращений ещё не было."
     total_cost = sum(float(row["cost"] or 0) for row in rows)
-    total_requests = sum(int(row["requests"] or 0) for row in rows)
-    total_tokens = sum(int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in rows)
-    lines = [title, f"Запросов: <b>{total_requests:,}</b> · Токенов: <b>{total_tokens:,}</b> · Estimated cost: <b>${total_cost:.4f}</b>", "",
-             "<pre>Модель                    Запр.  In / Out       $</pre>"]
+    total_calls = sum(int(row.get("llm_calls", row.get("requests", 0)) or 0) for row in rows)
+    total_input = sum(int(row["input_tokens"] or 0) for row in rows)
+    total_output = sum(int(row["output_tokens"] or 0) for row in rows)
+    lines = [title,
+             f"LLM вызовов: <b>{total_calls:,}</b> · Input: <b>{total_input:,}</b> · Output: <b>{total_output:,}</b> · Стоимость: <b>${total_cost:.4f}</b>", "",
+             "<pre>Модель                     LLM  In / Out       $</pre>"]
     for row in rows[:8]:
-        source = {"personal": "личный", "managed": "отдельный"}.get(row["source"], "общий")
         chat = f'чат <code>{row["chat_id"]}</code> · ' if show_chats else ""
         model = str(row["model"] or "—")
         model = (model[:23] + "…") if len(model) > 24 else model
         input_tokens, output_tokens = int(row["input_tokens"] or 0), int(row["output_tokens"] or 0)
-        lines.append(f'{chat}<pre>{html.escape(model):<25}{int(row["requests"] or 0):>5,}{input_tokens:>5,}/{output_tokens:<5,} ${float(row["cost"] or 0):>8.4f}</pre>')
+        calls = int(row.get("llm_calls", row.get("requests", 0)) or 0)
+        lines.append(f'{chat}<pre>{html.escape(model):<25}{calls:>5,}{input_tokens:>5,}/{output_tokens:<5,} ${float(row["cost"] or 0):>8.4f}</pre>')
         if not show_chats:
-            lines.append(f"  {source} ключ · provider: {html.escape(str(row.get('provider') or 'openrouter'))}")
+            lines.append(f"  key: {html.escape(str(row.get('source') or 'shared'))} · type: {html.escape(str(row.get('call_type') or 'llm'))} · provider: {html.escape(str(row.get('provider') or 'openrouter'))}")
     if len(rows) > 8:
         lines.append(f"\nПоказаны 8 из {len(rows)} моделей.")
     return "\n".join(lines)
@@ -6521,15 +6526,23 @@ def shared_usage_users_page(page=0, page_size=8):
                 InlineKeyboardMarkup([[InlineKeyboardButton("‹ API-ключи", callback_data="settings:keys")]]))
     total_cost = sum(float(row["cost"] or 0) for row in users)
     total_requests = sum(int(row["requests"] or 0) for row in users)
+    total_calls = sum(int(row["llm_calls"] or 0) for row in users)
+    total_input = sum(int(row["input_tokens"] or 0) for row in users)
+    total_output = sum(int(row["output_tokens"] or 0) for row in users)
     lines = ["📈 <b>Ключи Noema · пользователи</b>",
-             f"Текущий месяц · пользователей: <b>{len(users)}</b> · запросов: <b>{total_requests:,}</b> · estimated cost: <b>${total_cost:.4f}</b>", ""]
+             f"Текущий месяц · пользователей: <b>{len(users)}</b> · Requests: <b>{total_requests:,}</b> · LLM calls: <b>{total_calls:,}</b>",
+             f"Input: <b>{total_input:,}</b> · Output: <b>{total_output:,}</b> · Cost: <b>${total_cost:.4f}</b>", ""]
     buttons = []
     for row in shown:
         number = int(row["user_number"])
         caption = user_caption(row)
-        total_tokens = int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0)
-        activity = str(row.get("last_llm_activity") or "")[:16].replace("T", " ") or "ещё не было"
-        lines.append(f'<code>#{number:03d}</code> {html.escape(caption)} · {int(row["requests"]):,} запр. · {total_tokens:,} ток. · ${float(row["cost"] or 0):.4f} · {activity}')
+        activity = str(row.get("last_activity") or "")[:16].replace("T", " ") or "ещё не было"
+        lines.extend([
+            f'<b><code>#{number:03d}</code> {html.escape(caption)}</b> · key: <code>{html.escape(str(row["key_type"]))}</code>',
+            f'Requests: {int(row["requests"] or 0):,} · LLM calls: {int(row["llm_calls"] or 0):,} · Input: {int(row["input_tokens"] or 0):,} · Output: {int(row["output_tokens"] or 0):,}',
+            f'Cost: ${float(row["cost"] or 0):.4f} · Последняя активность: {html.escape(activity)}',
+            "",
+        ])
         buttons.append(InlineKeyboardButton(f"#{number:03d} {caption}"[:60], callback_data=f"keys:admin_user:{number}:{page}"))
     markup_rows = button_rows(buttons, 2)
     if pages > 1:

@@ -58,7 +58,27 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({row["provider"] for row in rows}, {"openrouter"})
             self.assertEqual({row["source"] for row in rows}, {"shared", "managed", "personal"})
             self.assertEqual(sum(row["llm_calls"] for row in rows), 3)
+            page_text, _ = bot.shared_usage_users_page()
+            self.assertRegex(page_text, r"<code>#\d{3}</code> @new_user")
+            self.assertIn("Requests: 3", page_text)
+            self.assertIn("LLM calls: 3", page_text)
+            self.assertIn("Input: 17", page_text)
+            self.assertIn("Output: 11", page_text)
+            self.assertIn("Cost: $0.0060", page_text)
+            self.assertIn("key: <code>personal</code>", page_text)
+            self.assertIn("Последняя активность:", page_text)
         database.close()
+
+    def test_usage_text_keeps_llm_calls_separate_and_never_exposes_keys(self):
+        text = bot.usage_text([{
+            "source": "managed", "model": "qwen/test", "provider": "openrouter",
+            "call_type": "llm", "llm_calls": 2, "requests": 99,
+            "input_tokens": 10, "output_tokens": 4, "cost": 0.002,
+        }], "Usage")
+        self.assertIn("LLM вызовов: <b>2</b>", text)
+        self.assertIn("key: managed", text)
+        self.assertNotIn("secret", text.lower())
+        self.assertNotIn("encrypted", text.lower())
 
     def test_admin_runtime_config_has_admin_precedence_and_safe_metadata(self):
         defaults = {"fast_model": ("env/model", "ENV")}
