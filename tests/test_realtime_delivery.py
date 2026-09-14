@@ -21,7 +21,8 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         database.row_factory = sqlite3.Row
         database.executescript("""
             CREATE TABLE bot_users(user_number INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER UNIQUE,username TEXT NOT NULL DEFAULT '',display_name TEXT NOT NULL DEFAULT '',first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL);
-            CREATE TABLE usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,cost REAL NOT NULL DEFAULT 0,provider TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
+            CREATE TABLE usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,cost REAL NOT NULL DEFAULT 0,provider TEXT NOT NULL DEFAULT '',call_type TEXT NOT NULL DEFAULT 'llm',created_at TEXT NOT NULL);
+            CREATE TABLE user_request_events(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,channel TEXT NOT NULL DEFAULT 'chat',created_at TEXT NOT NULL);
             CREATE TABLE user_settings(chat_id INTEGER PRIMARY KEY,primary_model TEXT NOT NULL DEFAULT '',fallback_model TEXT NOT NULL DEFAULT '',vision_model TEXT NOT NULL DEFAULT '');
             CREATE TABLE user_api_keys(chat_id INTEGER PRIMARY KEY,encrypted_key TEXT NOT NULL,key_hint TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL);
             CREATE TABLE managed_api_keys(chat_id INTEGER PRIMARY KEY,encrypted_key TEXT NOT NULL,key_hash TEXT NOT NULL DEFAULT '',key_hint TEXT NOT NULL DEFAULT '',limit_usd REAL NOT NULL DEFAULT 2,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -31,6 +32,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                   "strong_model": "deepseek/test", "strong_model_providers": [], "strong_model_allow_provider_fallback": True}
         with patch.object(bot, "conn", return_value=database), patch.object(bot, "runtime_config_values", return_value=config):
             bot.register_bot_user(6999, SimpleNamespace(username="existing", first_name="Старый", last_name="Пользователь"))
+            bot.record_user_request(6999)
             bot.record_usage(6999, "shared", "qwen/test", {"usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.001}})
             bot.register_bot_user(7001, SimpleNamespace(username="new_user", first_name="Новый", last_name="Пользователь"))
             before = bot.admin_usage_users()
@@ -40,16 +42,22 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fresh["effective_model"], "qwen/test")
             self.assertEqual(next(row for row in before if row["chat_id"] == 6999)["requests"], 1)
 
+            for _ in range(3):
+                bot.record_user_request(7001)
             bot.record_usage(7001, "shared", "qwen/test", {"usage": {"prompt_tokens": 12, "completion_tokens": 8, "cost": 0.004}})
             bot.record_usage(7001, "managed", "deepseek/test", {"usage": {"prompt_tokens": 5, "completion_tokens": 3, "cost": 0.002}})
+            bot.record_usage(7001, "personal", "qwen/test", {})
+            database.execute("INSERT INTO user_api_keys(chat_id,encrypted_key,key_hint,active,updated_at) VALUES(7001,'encrypted','hint',1,'now')")
             after = bot.admin_usage_users()
             accounted = next(row for row in after if row["chat_id"] == 7001)
-            self.assertEqual((accounted["input_tokens"], accounted["output_tokens"], accounted["requests"]), (17, 11, 2))
+            self.assertEqual((accounted["input_tokens"], accounted["output_tokens"], accounted["requests"], accounted["llm_calls"]), (17, 11, 3, 3))
             self.assertAlmostEqual(accounted["cost"], 0.006)
+            self.assertEqual(accounted["key_type"], "personal")
             self.assertEqual(next(row for row in after if row["chat_id"] == 6999)["requests"], 1)
             rows = bot.admin_user_usage_rows(7001)
             self.assertEqual({row["provider"] for row in rows}, {"openrouter"})
-            self.assertEqual({row["source"] for row in rows}, {"shared", "managed"})
+            self.assertEqual({row["source"] for row in rows}, {"shared", "managed", "personal"})
+            self.assertEqual(sum(row["llm_calls"] for row in rows), 3)
         database.close()
 
     def test_admin_runtime_config_has_admin_precedence_and_safe_metadata(self):
@@ -89,8 +97,9 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                   patch.object(bot, "conversation_context", return_value=[]),
                   patch.object(bot, "system_prompt", return_value="system"),
                   patch.object(bot, "request_chat_stream", side_effect=response_for),
-                  patch.object(bot, "record_usage"), patch.object(bot, "add_message", side_effect=range(1, 100))]
-        with common[0], common[1], common[2], common[3], common[4], common[5], common[6]:
+                  patch.object(bot, "record_usage"), patch.object(bot, "record_user_request"),
+                  patch.object(bot, "add_message", side_effect=range(1, 100))]
+        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7]:
             for user in (100, 101, 102):
                 list(bot.stream_agent_response(user, "test"))
             self.assertEqual(outbound, ["router/fast"] * 3)
@@ -190,6 +199,15 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot, "FAST_MODEL_PROVIDERS", ("configured-fast",)):
                 bot.request_chat_stream(42, bot.FAST_MODEL, [{"role": "user", "content": "тест"}])
         self.assertEqual(post.call_args.kwargs["json"]["provider"]["only"], ["configured-fast"])
+        self.assertEqual(response.noema_key_source, "")
+
+    def test_outbound_response_keeps_the_key_source_that_was_actually_used(self):
+        response = Mock()
+        with patch.object(bot, "api_key_for_chat", return_value=("test-key", "personal")), \
+             patch.object(bot.requests, "post", return_value=response):
+            returned = bot.request_chat_stream(42, bot.FAST_MODEL, [{"role": "user", "content": "test"}])
+        self.assertIs(returned, response)
+        self.assertEqual(bot.response_key_source(response, 42), "personal")
 
     def test_mistral_session_mints_scoped_token(self):
         response = Mock(ok=True)

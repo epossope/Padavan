@@ -1692,8 +1692,13 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
             source TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0,
-            provider TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '', call_type TEXT NOT NULL DEFAULT 'llm',
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS user_request_events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'chat', created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS bot_users(
@@ -1730,11 +1735,15 @@ def init_db():
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
             ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
             ("app_settings","updated_by","INTEGER"),
-            ("usage_events","provider","TEXT NOT NULL DEFAULT ''")
+            ("usage_events","provider","TEXT NOT NULL DEFAULT ''"),
+            ("usage_events","call_type","TEXT NOT NULL DEFAULT 'llm'")
 
         ]:
 
             ensure_column(c, table, col, typ)
+
+        c.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_chat_created ON usage_events(chat_id,created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_user_request_events_chat_created ON user_request_events(chat_id,created_at)")
 
     KnowledgeStore(DB).init_schema()
 
@@ -2356,20 +2365,47 @@ def usage_provider(payload, model):
     return choices[0] if len(choices) == 1 else "openrouter"
 
 
-def record_usage(chat_id, source, model, payload):
-    """Record billing on the canonical Telegram user for every key source."""
+def response_key_source(response, chat_id):
+    source = getattr(response, "noema_key_source", "")
+    if source in {"shared", "managed", "personal"}:
+        return source
+    # Only request_* helpers know which credential was actually attached.
+    # Never perform a second lookup after the provider call.
+    return "shared"
+
+
+def record_usage(chat_id, source, model, payload, call_type="llm"):
+    """Record one provider call, even when its usage counters are unavailable."""
     usage = (payload or {}).get("usage") or {}
+    usage = usage if isinstance(usage, dict) else {}
     input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     cost = float(usage.get("cost") or usage.get("total_cost") or 0)
+    call_type = str(call_type or "llm").strip().lower()
+    if call_type not in {"llm", "vision", "stt"}:
+        call_type = "llm"
     # A request can arrive through Mini App or a legacy endpoint before a
     # Telegram update handler had a chance to register its profile. Keep that
     # event attached to a canonical user row instead of creating an orphan.
     register_bot_user(chat_id, None)
     with conn() as c:
-        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,provider,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ensure_column(c, "usage_events", "provider", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(c, "usage_events", "call_type", "TEXT NOT NULL DEFAULT 'llm'")
+        c.execute("INSERT INTO usage_events(chat_id,source,model,input_tokens,output_tokens,cost,provider,call_type,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                   (chat_id, source, model, input_tokens, output_tokens, cost,
-                   usage_provider(payload, model), datetime.now(timezone.utc).isoformat()))
+                   usage_provider(payload, model), call_type, datetime.now(timezone.utc).isoformat()))
+
+
+def record_user_request(chat_id, channel="chat"):
+    """Count one real user turn independently from provider/tool-call fan-out."""
+    register_bot_user(chat_id, None)
+    channel = re.sub(r"[^a-z_]", "", str(channel or "chat").lower())[:24] or "chat"
+    with conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS user_request_events("
+                  "id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,"
+                  "channel TEXT NOT NULL DEFAULT 'chat',created_at TEXT NOT NULL)")
+        c.execute("INSERT INTO user_request_events(chat_id,channel,created_at) VALUES(?,?,?)",
+                  (chat_id, channel, datetime.now(timezone.utc).isoformat()))
 
 
 def register_bot_user(chat_id, user):
@@ -2401,7 +2437,7 @@ def usage_summary(chat_id=None, days=30, source=None):
     if source:
         where += " AND source=?"; args.append(source)
     with conn() as c:
-        rows = c.execute(f"SELECT chat_id,source,model,provider,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model,provider ORDER BY cost DESC,requests DESC", args).fetchall()
+        rows = c.execute(f"SELECT chat_id,source,model,provider,call_type,SUM(input_tokens) AS input_tokens,SUM(output_tokens) AS output_tokens,SUM(cost) AS cost,COUNT(*) AS llm_calls,COUNT(*) AS requests FROM usage_events WHERE {where} GROUP BY chat_id,source,model,provider,call_type ORDER BY cost DESC,llm_calls DESC", args).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -2454,21 +2490,32 @@ def admin_usage_users():
                    ? AS effective_model,
                    CASE WHEN p.chat_id IS NULL THEN 0 ELSE 1 END AS has_personal_key,
                    CASE WHEN m.chat_id IS NULL THEN 0 ELSE 1 END AS has_managed_key,
+                   CASE WHEN m.chat_id IS NOT NULL THEN 'managed'
+                        WHEN p.chat_id IS NOT NULL THEN 'personal' ELSE 'shared' END AS key_type,
                    COALESCE(m.limit_usd, 0) AS monthly_limit_usd,
-                   COUNT(e.id) AS requests,
+                   (SELECT COUNT(*) FROM user_request_events request
+                    WHERE request.chat_id=u.chat_id AND substr(request.created_at,1,10)>=?) AS requests,
+                   COUNT(e.id) AS llm_calls,
                    COALESCE(SUM(e.input_tokens),0) AS input_tokens,
                    COALESCE(SUM(e.output_tokens),0) AS output_tokens,
                    COALESCE(SUM(e.cost),0) AS cost,
                    (SELECT MAX(last_event.created_at) FROM usage_events last_event
-                    WHERE last_event.chat_id=u.chat_id) AS last_llm_activity
+                    WHERE last_event.chat_id=u.chat_id AND last_event.call_type IN ('llm','vision')) AS last_llm_activity,
+                   COALESCE(
+                       (SELECT MAX(request.created_at) FROM user_request_events request WHERE request.chat_id=u.chat_id),
+                       (SELECT MAX(last_event.created_at) FROM usage_events last_event
+                        WHERE last_event.chat_id=u.chat_id AND last_event.call_type IN ('llm','vision')),
+                       u.last_seen_at
+                   ) AS last_activity
             FROM bot_users u
             LEFT JOIN user_api_keys p ON p.chat_id=u.chat_id AND p.active=1
             LEFT JOIN managed_api_keys m ON m.chat_id=u.chat_id AND m.active=1
             LEFT JOIN usage_events e ON e.chat_id=u.chat_id AND substr(e.created_at,1,10)>=?
+                                    AND e.call_type IN ('llm','vision')
             GROUP BY u.chat_id
             ORDER BY CASE WHEN MAX(e.created_at) IS NULL THEN 1 ELSE 0 END,
-                     MAX(e.created_at) DESC,last_llm_activity DESC,u.user_number DESC
-        """, (config["fast_model"], month_start)).fetchall()
+                     last_activity DESC,u.user_number DESC
+        """, (config["fast_model"], month_start, month_start)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -2477,14 +2524,14 @@ def admin_user_usage_rows(chat_id):
     month_start = datetime.now(TZ).date().replace(day=1).isoformat()
     with conn() as c:
         rows = c.execute("""
-            SELECT source,model,provider,COUNT(*) AS requests,
+            SELECT source,model,provider,call_type,COUNT(*) AS llm_calls,COUNT(*) AS requests,
                    COALESCE(SUM(input_tokens),0) AS input_tokens,
                    COALESCE(SUM(output_tokens),0) AS output_tokens,
                    COALESCE(SUM(cost),0) AS cost,MAX(created_at) AS last_activity
             FROM usage_events
-            WHERE chat_id=? AND substr(created_at,1,10)>=?
-            GROUP BY source,model,provider
-            ORDER BY cost DESC,requests DESC,model
+            WHERE chat_id=? AND substr(created_at,1,10)>=? AND call_type IN ('llm','vision')
+            GROUP BY source,model,provider,call_type
+            ORDER BY cost DESC,llm_calls DESC,model
         """, (chat_id, month_start)).fetchall()
     return [dict(row) for row in rows]
 
@@ -3690,17 +3737,20 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
 
     payload = build_chat_payload(model, messages, tools, tool_choice)
 
-    key, _ = api_key_for_chat(chat_id)
-    return requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-
-                         json=payload,timeout=180)
+    key, source = api_key_for_chat(chat_id)
+    response = requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                             json=payload,timeout=180)
+    response.noema_key_source = source
+    return response
 
 
 def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"):
     payload = build_chat_payload(model, messages, tools, tool_choice, stream=True)
-    key, _ = api_key_for_chat(chat_id)
-    return requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                         json=payload, timeout=(20, 180), stream=True)
+    key, source = api_key_for_chat(chat_id)
+    response = requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                             json=payload, timeout=(20, 180), stream=True)
+    response.noema_key_source = source
+    return response
 
 
 def _safe_model_metric_code(model):
@@ -3752,6 +3802,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     if cancel_event.is_set():
         yield {"type": "cancelled"}
         return
+    record_user_request(chat_id, "chat")
     # A truthful pre-stream state: no claim about a search or tool is made.
     yield runtime_state_event("REQUESTING", text="Думаю…")
     live = direct_live_request(text)
@@ -3785,6 +3836,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             response = request_chat_stream(chat_id, model, messages, tools, "required" if round_index == 0 and asks_external_web(text) else "auto")
             if not response.ok:
                 last_error = response.status_code
+                record_usage(chat_id, response_key_source(response, chat_id), model, {})
                 response.close()
                 record_runtime_metric("llm_total_ms", (time.perf_counter() - request_started) * 1000)
                 continue
@@ -3819,6 +3871,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         yield {"type": "delta", "text": delta}
                 if contract_violated:
                     record_runtime_metric("reasoning_chunks_dropped", max(1, accumulator.reasoning_chunks_dropped))
+                    record_usage(chat_id, response_key_source(response, chat_id), model,
+                                 {"usage": accumulator.usage})
                     LOGGER.warning("Reasoning-disabled contract rejected provider response model=%s", model)
                     continue
                 tail = accumulator.finish()
@@ -3834,10 +3888,12 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 message = accumulator.message()
                 total_visible_chars += accumulator.visible_chars
                 total_reasoning_dropped += accumulator.reasoning_chunks_dropped
-                if accumulator.usage:
-                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, {"usage": accumulator.usage})
+                record_usage(chat_id, response_key_source(response, chat_id), model,
+                             {"usage": accumulator.usage})
                 break
             except requests.RequestException:
+                record_usage(chat_id, response_key_source(response, chat_id), model,
+                             {"usage": accumulator.usage})
                 if cancel_event.is_set():
                     yield {"type": "cancelled"}
                     return
@@ -4639,7 +4695,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
             if r.ok:
                 data = r.json()
-                record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                record_usage(chat_id, response_key_source(r, chat_id), model, data)
                 choice = data["choices"][0]
                 if assistant_reasoning_contract_violated(choice["message"]):
                     last = (502, "reasoning_contract")
@@ -4649,6 +4705,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                     print(f"LLM truncation chat_id={chat_id} model={model}")
                 return sanitize_assistant_message(choice["message"])
 
+            record_usage(chat_id, response_key_source(r, chat_id), model, {})
             last=(r.status_code,r.text)
 
             if not recovered_key and recover_missing_managed_key(chat_id, r):
@@ -4676,7 +4733,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
 
             if r.ok:
                 data = r.json()
-                record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                record_usage(chat_id, response_key_source(r, chat_id), model, data)
                 message = data["choices"][0]["message"]
                 if assistant_reasoning_contract_violated(message):
                     last = (502, "reasoning_contract")
@@ -4684,6 +4741,7 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                     continue
                 return sanitize_assistant_message(message)
 
+            record_usage(chat_id, response_key_source(r, chat_id), model, {})
             last=(r.status_code,r.text)
 
     raise RuntimeError("MODEL_BUSY" if last and last[0]==429 else "MODEL_ERROR")
@@ -4737,6 +4795,7 @@ def write_confirmation(results):
 def ask(chat_id,text):
 
     started = time.perf_counter()
+    record_user_request(chat_id, "chat")
 
     live=direct_live_request(text)
 
@@ -4849,14 +4908,16 @@ def request_vision(chat_id, model, messages):
 
     payload={"model":model,"messages":messages,"temperature":0.3,"max_tokens":2000}
 
-    key, _ = api_key_for_chat(chat_id)
-    return requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
-
-                         json=payload,timeout=180)
+    key, source = api_key_for_chat(chat_id)
+    response = requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                             json=payload,timeout=180)
+    response.noema_key_source = source
+    return response
 
 
 
 def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
+    record_user_request(chat_id, "vision")
 
     b64=base64.b64encode(Path(image_path).read_bytes()).decode()
 
@@ -4885,19 +4946,20 @@ def describe_image(chat_id, image_path,mime="image/jpeg",caption=""):
             if r.ok:
 
                 data = r.json()
-                record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                record_usage(chat_id, response_key_source(r, chat_id), model, data, "vision")
                 msg=data["choices"][0]["message"]
 
                 content=msg.get("content","") or ""
 
                 return content.strip()
 
+            record_usage(chat_id, response_key_source(r, chat_id), model, {}, "vision")
             last=(r.status_code,r.text)
             if recover_missing_managed_key(chat_id, r):
                 r=request_chat(chat_id, model, messages, tools, "auto")
                 if r.ok:
                     data = r.json()
-                    record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
+                    record_usage(chat_id, response_key_source(r, chat_id), model, data, "vision")
                     return data["choices"][0]["message"]
                 last=(r.status_code,r.text)
 
@@ -4937,7 +4999,7 @@ def _transcribe_unmeasured(chat_id, path):
     if not r.ok: raise RuntimeError("STT_BUSY" if r.status_code==429 else "STT_ERROR")
 
     data = r.json()
-    record_usage(chat_id, source, runtime_config_values()["batch_stt_model"], data)
+    record_usage(chat_id, source, runtime_config_values()["batch_stt_model"], data, "stt")
     text=data.get("text","").strip()
 
     if not text: raise RuntimeError("STT_EMPTY")
