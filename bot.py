@@ -429,6 +429,18 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"finance_summary",
+        "description":"Получить точную финансовую сводку из базы пользователя. Используй для вопросов о сумме расходов, доходов или балансе; не отвечай по памяти.",
+        "parameters":{"type":"object","properties":{"period":{"type":"string","enum":["today","yesterday","7_days","current_month","custom"]},"date_from":{"type":"string"},"date_to":{"type":"string"}}}
+    }},
+
+    {"type":"function","function":{
+        "name":"finance_list_transactions",
+        "description":"Получить точные операции пользователя из finance DB с фильтрами и пагинацией. Используй для списка трат, доходов, категорий и подготовки таблицы.",
+        "parameters":{"type":"object","properties":{"period":{"type":"string","enum":["today","yesterday","7_days","current_month","custom"]},"date_from":{"type":"string"},"date_to":{"type":"string"},"kind":{"type":"string","enum":["expense","income"]},"query":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"}}}
+    }},
+
+    {"type":"function","function":{
 
         "name":"get_today_plan",
 
@@ -2981,6 +2993,59 @@ def update_last_expense(chat_id,category="",description="",merchant="",amount=No
 
 
 
+def _finance_dates(chat_id, period="current_month", date_from="", date_to=""):
+    """Resolve a finance period in the user's configured timezone."""
+    today = datetime.now(timezone_for(chat_id)).date()
+    period = str(period or "custom").lower()
+    if period == "today": date_from = date_to = today.isoformat()
+    elif period == "yesterday": date_from = date_to = (today - timedelta(days=1)).isoformat()
+    elif period == "7_days": date_from, date_to = (today - timedelta(days=6)).isoformat(), today.isoformat()
+    elif period == "current_month": date_from, date_to = today.replace(day=1).isoformat(), today.isoformat()
+    elif period != "custom": raise ValueError("invalid_finance_period")
+    if date_from and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_from)): raise ValueError("invalid_finance_date")
+    if date_to and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_to)): raise ValueError("invalid_finance_date")
+    return str(date_from or ""), str(date_to or ""), period
+
+
+def finance_list_transactions(chat_id, period="current_month", date_from="", date_to="", kind="", query="", limit=100, offset=0):
+    """Canonical, owner-scoped exact finance read model."""
+    date_from, date_to, resolved_period = _finance_dates(chat_id, period, date_from, date_to)
+    limit, offset = max(1, min(int(limit or 100), 200)), max(0, int(offset or 0))
+    kind = str(kind or "").lower()
+    if kind not in {"", "expense", "income"}: raise ValueError("invalid_finance_kind")
+    clauses, args = ["chat_id=?"], [chat_id]
+    if date_from: clauses.append("substr(spent_at,1,10)>=?"); args.append(date_from)
+    if date_to: clauses.append("substr(spent_at,1,10)<=?"); args.append(date_to)
+    if kind: clauses.append("kind=?"); args.append(kind)
+    query = str(query or "").strip()
+    if query:
+        clauses.append("(lower(category) LIKE ? OR lower(description) LIKE ? OR lower(merchant) LIKE ?)")
+        needle = "%" + query.lower().replace("%", "\\%").replace("_", "\\_") + "%"
+        args.extend([needle, needle, needle])
+    where = " AND ".join(clauses)
+    with conn() as c:
+        count = c.execute("SELECT count(*) FROM expenses WHERE " + where, args).fetchone()[0]
+        rows = [dict(row) for row in c.execute("SELECT id,amount,currency,category,description,merchant,spent_at,kind FROM expenses WHERE " + where + " ORDER BY spent_at DESC,id DESC LIMIT ? OFFSET ?", args + [limit, offset]).fetchall()]
+    return {"ok": True, "tool": "finance_list_transactions", "period": resolved_period, "date_from": date_from, "date_to": date_to, "count": count, "limit": limit, "offset": offset, "items": rows}
+
+
+def finance_summary(chat_id, period="current_month", date_from="", date_to=""):
+    date_from, date_to, resolved_period = _finance_dates(chat_id, period, date_from, date_to)
+    clauses, args = ["chat_id=?"], [chat_id]
+    if date_from: clauses.append("substr(spent_at,1,10)>=?"); args.append(date_from)
+    if date_to: clauses.append("substr(spent_at,1,10)<=?"); args.append(date_to)
+    where = " AND ".join(clauses)
+    with conn() as c:
+        rows = c.execute("SELECT currency,kind,count(*) AS count,sum(abs(amount)) AS amount FROM expenses WHERE " + where + " GROUP BY currency,kind", args).fetchall()
+    currency_totals = {}
+    for row in rows:
+        total = currency_totals.setdefault(row["currency"] or "RUB", {"income": 0.0, "expenses": 0.0, "net": 0.0, "count": 0})
+        total["income" if row["kind"] == "income" else "expenses"] += float(row["amount"] or 0); total["count"] += int(row["count"] or 0)
+    for total in currency_totals.values():
+        total["income"] = round(total["income"], 2); total["expenses"] = round(total["expenses"], 2); total["net"] = round(total["income"] - total["expenses"], 2)
+    return {"ok": True, "tool": "finance_summary", "period": resolved_period, "date_from": date_from, "date_to": date_to, "count": sum(v["count"] for v in currency_totals.values()), "currency_totals": currency_totals, "income": round(sum(v["income"] for v in currency_totals.values()), 2), "expenses": round(sum(v["expenses"] for v in currency_totals.values()), 2), "net": round(sum(v["net"] for v in currency_totals.values()), 2)}
+
+
 def get_expenses(chat_id,date_from="",date_to="",category=""):
 
     q="SELECT * FROM expenses WHERE chat_id=?"; args=[chat_id]
@@ -3276,6 +3341,10 @@ def execute_tool(chat_id,name,args):
         "update_last_expense":update_last_expense,
 
         "get_expenses":get_expenses,
+
+        "finance_summary":finance_summary,
+
+        "finance_list_transactions":finance_list_transactions,
 
         "get_today_plan":get_today_plan,
 
@@ -3731,7 +3800,7 @@ def system_prompt(chat_id):
 
         "Если в одном сообщении человек + созвон/задача/напоминание — вызови несколько tools. "
 
-        "Для чтения сохранённых данных используй get_notes, get_people, get_expenses, get_today_plan — не выдумывай. "
+        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, get_today_plan для задач и напоминаний, get_people для людей, get_notes для заметок и get_files для файлов. Если finance tool вернул операции, их нельзя игнорировать или называть отсутствующими. "
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
@@ -3755,7 +3824,7 @@ def system_prompt(chat_id):
 
         "Если knowledge_search ничего не вернул — честно скажи «Сохранённых данных по этому запросу не найдено», не выдумывай. "
 
-        "Полноценно отвечай на research, рассказы, объяснения и длинные инструкции; не сокращай их ради транспорта. Когда результат по природе является готовым файлом или пользователь явно просит файл, документ, таблицу, HTML, JSON, скрипт, PDF, сайт или набор файлов — обязательно вызови artifact_create. Для нескольких файлов используй ZIP. PDF в этой версии создаётся как честно обозначенный DOCX fallback. После tool дай короткое нейтральное резюме и не дублируй огромный код или данные в чат, если пользователь явно не просил показать их и здесь, и файлом. Маленький пример кода без просьбы о файле оставляй inline. "
+        "Ты умеешь создавать и передавать готовые файлы через artifact_create. Когда пользователь явно просит файл, документ, Word, таблицу, Excel, HTML, JSON, скрипт, сайт или набор файлов — обязательно вызови artifact_create; не говори, что ты текстовая модель и что не можешь прикреплять файлы. Для таблицы финансов сначала запроси точные операции через finance_list_transactions, затем создай XLSX или CSV на их основе. Для нескольких файлов используй ZIP. PDF в этой версии создаётся как честно обозначенный DOCX fallback. После tool дай короткое нейтральное резюме и не дублируй огромный код или данные в чат, если пользователь явно не просил показать их и здесь, и файлом. Маленький пример кода без просьбы о файле оставляй inline. "
 
         "Никогда не заявляй, что что-то сохранено, если tool не вернул ok=true. "
 
@@ -3877,7 +3946,9 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         return
     context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
-    tools = ToolPackResolver().resolve(TOOLS, text)
+    tool_router = ToolPackResolver()
+    tools = tool_router.resolve(TOOLS, text)
+    initial_tool_choice = tool_router.required_tool_choice(text)
     models = chat_model_candidates(chat_id)
     if models:
         record_runtime_metric("selected_global_model", _safe_model_metric_code(models[0]), model=models[0])
@@ -3897,7 +3968,10 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 yield {"type": "cancelled"}
                 return
             request_started = time.perf_counter()
-            response = request_chat_stream(chat_id, model, messages, tools, "required" if round_index == 0 and asks_external_web(text) else "auto")
+            tool_choice = initial_tool_choice if round_index == 0 else "auto"
+            if round_index == 0 and asks_external_web(text) and tool_choice == "auto":
+                tool_choice = "required"
+            response = request_chat_stream(chat_id, model, messages, tools, tool_choice)
             if not response.ok:
                 last_error = response.status_code
                 record_usage(chat_id, response_key_source(response, chat_id), model, {})
@@ -4754,6 +4828,12 @@ def write_confirmation(results):
                 parts.append(f"Готово. Надёжная PDF-генерация недоступна, поэтому подготовлен DOCX-файл {label}.")
             else:
                 parts.append(f"Готово. Файл {label} подготовлен и прикреплён к сообщению.")
+
+        elif n=="finance_summary":
+            parts.append(f"За выбранный период: расходов {r.get('expenses', 0):g}, доходов {r.get('income', 0):g}, баланс {r.get('net', 0):g}. Операций: {r.get('count', 0)}.")
+
+        elif n=="finance_list_transactions":
+            parts.append("Операций за выбранный период нет." if not r.get("count") else f"Найдено операций: {r.get('count')}. Точные данные учтены в ответе.")
 
     out=[]
 

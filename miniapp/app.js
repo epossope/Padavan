@@ -14,6 +14,19 @@ telemetry.record=telemetry.record||function(name,value,detail={}){const sample={
 let lagExpected=performance.now()+2000;
 setInterval(()=>{const current=performance.now(),lag=Math.max(0,current-lagExpected);lagExpected=current+2000;if(!document.hidden)telemetry.record('event_loop_lag_ms',lag)},2000);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// Presentation boundary: canonical assistant Markdown is never inserted as raw
+// HTML or exposed as literal Markdown markers in the Mini App.
+const renderAssistantContent=value=>{
+ let safe=esc(value??'').replace(/\r\n/g,'\n');
+ safe=safe.replace(/```[\w+-]*\n?([\s\S]*?)```/g,'<pre><code>$1</code></pre>');
+ safe=safe.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+ safe=safe.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/__([^_\n]+)__/g,'<strong>$1</strong>');
+ safe=safe.replace(/^\s{0,3}#{1,6}\s+(.+)$/gm,'<strong>$1</strong>');
+ safe=safe.replace(/^\s*[-*+]\s+(.+)$/gm,'• $1');
+ safe=safe.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+ return safe.replace(/\n/g,'<br>');
+};
+window.NoemaMiniAppRenderer={render:renderAssistantContent};
 const money=v=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:0}).format(Number(v)||0);
 const date=v=>v?new Date(v).toLocaleDateString('ru-RU',{day:'numeric',month:'long'}):'Без даты';
 function say(message){
@@ -257,10 +270,10 @@ async function streamChat(text,options={}){
  const response=await fetch('/api/v1/miniapp/chat-stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:tg?.initData||'',text}),signal:options.signal});if(!response.ok)throw Error(await response.text()||'Не удалось получить ответ.');
  let thread=options.render===false?null:document.querySelector('.chat');let bubble=null,renderFrame=0,pending='',localVisibleText='',terminal=null,firstVisible=false;
  const ensureBubble=()=>{if(!thread||bubble)return bubble;thread.querySelector('.empty')?.remove();bubble=document.createElement('div');bubble.className='bubble assistant streaming';bubble.dataset.messageKey=`pending-assistant-${globalThis.crypto?.randomUUID?.()||Date.now()}`;window.NoemaChatScroll?.appendBubble(bubble);window.NoemaChatScroll?.incoming({newMessage:true});return bubble};
- const flush=()=>{renderFrame=0;if(!bubble?.isConnected)return;bubble.textContent=localVisibleText;window.NoemaChatScroll?.incoming()};
+ const flush=()=>{renderFrame=0;if(!bubble?.isConnected)return;bubble.innerHTML=`<span class="message-text">${renderAssistantContent(localVisibleText)}</span>`;window.NoemaChatScroll?.incoming()};
  const consume=event=>{if(event.type==='job')options.onJob?.(event.job_id);if(event.type==='state'){if(options.onState)options.onState(event);else window.NoemaRuntimeState.applyEvent(event)}if(event.type==='progress')window.NoemaRuntimeState.transition('REQUESTING',{text:event.text});if(event.type==='delta'){if(!firstVisible){firstVisible=true;window.NoemaRuntimeState.transition('STREAMING')}localVisibleText+=String(event.text||'');if(ensureBubble()&&!renderFrame)renderFrame=requestAnimationFrame(flush);options.onDelta?.(event.text)}if(event.type==='speech_delta')options.onSpeechDelta?.(String(event.text||''));if(event.type==='done')terminal=event;if(event.type==='cancelled')throw new DOMException('Generation stopped','AbortError');if(event.type==='error')throw Error('Не удалось получить ответ. Попробуй ещё раз.')};
  const reader=response.body.getReader(),decoder=new TextDecoder();while(true){const {value,done}=await reader.read();pending+=decoder.decode(value||new Uint8Array(),{stream:!done});const lines=pending.split('\n');pending=lines.pop()||'';for(const line of lines)if(line.trim())consume(JSON.parse(line));if(done)break}if(pending.trim())consume(JSON.parse(pending));if(renderFrame){cancelAnimationFrame(renderFrame);flush()}
- const canonical=String(terminal?.text??localVisibleText);if(canonical!==localVisibleText){const missing=canonical.startsWith(localVisibleText)?canonical.slice(localVisibleText.length):'';localVisibleText=canonical;if(missing)options.onDelta?.(missing)}if(!thread&&terminal?.artifacts?.length&&page==='chat')thread=document.querySelector('.chat');if(thread&&(canonical||terminal?.artifacts?.length)){ensureBubble();bubble.innerHTML=`<span class="message-text">${esc(canonical)}</span>${artifactCards(terminal?.artifacts||[])}`;bubble.classList.remove('streaming');if(terminal?.canonical_message_id){bubble.dataset.messageId=String(terminal.canonical_message_id);bubble.dataset.messageKey=`message-${terminal.canonical_message_id}`}}if(options.pendingUser&&terminal?.canonical_user_message_id){options.pendingUser.classList.remove('pending');options.pendingUser.dataset.messageId=String(terminal.canonical_user_message_id);options.pendingUser.dataset.messageKey=`message-${terminal.canonical_user_message_id}`}rememberCanonicalChat(options.userText||text,canonical,terminal);options.onDone?.(terminal,canonical);return canonical
+ const canonical=String(terminal?.text??localVisibleText);if(canonical!==localVisibleText){const missing=canonical.startsWith(localVisibleText)?canonical.slice(localVisibleText.length):'';localVisibleText=canonical;if(missing)options.onDelta?.(missing)}if(!thread&&terminal?.artifacts?.length&&page==='chat')thread=document.querySelector('.chat');if(thread&&(canonical||terminal?.artifacts?.length)){ensureBubble();bubble.innerHTML=`<span class="message-text">${renderAssistantContent(canonical)}</span>${artifactCards(terminal?.artifacts||[])}`;bubble.classList.remove('streaming');if(terminal?.canonical_message_id){bubble.dataset.messageId=String(terminal.canonical_message_id);bubble.dataset.messageKey=`message-${terminal.canonical_message_id}`}}if(options.pendingUser&&terminal?.canonical_user_message_id){options.pendingUser.classList.remove('pending');options.pendingUser.dataset.messageId=String(terminal.canonical_user_message_id);options.pendingUser.dataset.messageKey=`message-${terminal.canonical_message_id}`}rememberCanonicalChat(options.userText||text,canonical,terminal);options.onDone?.(terminal,canonical);return canonical
 }
 let chatSubmitting=false,chatSubmitGeneration=0;
 function resizeChatInput(input){if(!input)return;const snapshot=window.NoemaChatScroll?.snapshot?.();input.style.height='auto';input.style.height=Math.min(input.scrollHeight,122)+'px';window.NoemaChatScroll?.layoutChanged?.(snapshot)}

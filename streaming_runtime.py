@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 TOOL_PACKS = {
     "core_memory": {"knowledge_search", "knowledge_get"},
     "planning": {"add_task", "get_today_plan", "delete_task", "set_reminder", "delete_reminder"},
-    "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "delete_expense"},
+    "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "finance_summary", "finance_list_transactions", "delete_expense"},
     "people": {"person_upsert", "person_interaction", "get_people", "delete_person", "delete_interaction"},
     "web": {"internet_search", "get_weather"},
     "files": {"knowledge_files", "send_stored_image", "get_files", "artifact_create"},
@@ -103,7 +103,7 @@ class ToolPackResolver:
     """Cheap conservative routing: no extra LLM request and no lost common actions."""
     RULES = {
         "planning": ("задач", "напом", "план", "встреч", "календар"),
-        "finance": ("руб", "расход", "доход", "бюджет", "купил", "потрат"),
+        "finance": ("руб", "расход", "трат", "доход", "бюджет", "купил", "потрат", "баланс", "бензин", "операци"),
         "people": ("контакт", "человек", "день рождения", "познаком", "созвон"),
         "web": ("интернет", "найди", "проверь", "погода", "новост", "сайт"),
         "files": ("файл", "фото", "скрин", "документ", "отправ", "таблиц", "html", "json",
@@ -125,6 +125,28 @@ class ToolPackResolver:
         names = self.select_names(text)
         selected = [tool for tool in tools if tool.get("function", {}).get("name") in names]
         return selected or tools
+
+    def required_tool_choice(self, text: str):
+        """Require an exact-state tool for an unambiguous user request.
+
+        This is capability routing, not an answer shortcut: the selected tool
+        still performs the canonical read/create operation and the model sees
+        its structured result before composing the response.
+        """
+        lowered = str(text or "").lower()
+        artifact_words = ("дай файлом", "сделай файл", "сделай документ", "сделай word", "сделай таблиц", "сделай excel", "сделай html", "сделай json", "создай скрипт", "собери сайт")
+        asks_finance = any(word in lowered for word in ("трат", "расход", "доход", "баланс", "бюджет", "операци"))
+        if asks_finance and any(word in lowered for word in artifact_words):
+            return {"type": "function", "function": {"name": "finance_list_transactions"}}
+        if any(word in lowered for word in artifact_words):
+            return {"type": "function", "function": {"name": "artifact_create"}}
+        finance_words = ("сколько потрат", "сколько расходов", "какой баланс", "покажи доход", "сколько заработ")
+        if any(word in lowered for word in finance_words):
+            return {"type": "function", "function": {"name": "finance_summary"}}
+        transaction_words = ("какие у меня траты", "покажи мои траты", "какие были расходы", "расходы на", "операци")
+        if any(word in lowered for word in transaction_words):
+            return {"type": "function", "function": {"name": "finance_list_transactions"}}
+        return "required" if any(word in lowered for word in ("траты", "расход", "доход", "баланс", "бюджет")) else "auto"
 
 
 @dataclass
