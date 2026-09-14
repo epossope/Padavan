@@ -152,6 +152,8 @@ TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED",
 TELEGRAM_DRAFT_MIN_INTERVAL = max(0.3, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.4")))
 TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.45")))
 TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "12")))
+TELEGRAM_STREAM_FORCE_EDIT_CHARS = max(32, int(os.getenv("TELEGRAM_STREAM_FORCE_EDIT_CHARS", "64")))
+TELEGRAM_LIVE_STREAM_TELEMETRY = bool_env("TELEGRAM_LIVE_STREAM_TELEMETRY", True)
 TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
 TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
 TELEGRAM_READ_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15")))
@@ -4253,6 +4255,29 @@ async def _telegram_progress_update(bot, chat_id, current_message_id, event):
         return current_message_id
 
 
+def _telegram_stream_chat_id_hash(chat_id):
+    """Stable diagnostic identifier; never put a raw Telegram chat id in logs."""
+    return hashlib.blake2s(str(chat_id).encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _telegram_live_stream_trace(request_id, chat_id, event_type, **fields):
+    """Temporary production trace for the text-stream transport, without content."""
+    if not TELEGRAM_LIVE_STREAM_TELEMETRY:
+        return
+    safe = {
+        "request_id": request_id,
+        "chat_id_hash": _telegram_stream_chat_id_hash(chat_id),
+        "event_type": str(event_type or "unknown"),
+    }
+    for key, value in fields.items():
+        if key in {"text", "content", "message_id", "chat_id"}:
+            continue
+        safe[key] = value
+    LOGGER.info("telegram_live_stream %s", " ".join(
+        f"{key}={safe[key]}" for key in sorted(safe)
+    ))
+
+
 async def stream_answer_to_telegram(update, context, text):
     """Deliver one request as one persistent Telegram message edited in place."""
     chat_id = update.effective_chat.id
@@ -4279,10 +4304,18 @@ async def stream_answer_to_telegram(update, context, text):
     sent = None
     progress_message_id = None
     editing_available = True
+    preview_visible_chars = 0
+    done_received = False
     mode = get_mode(chat_id)
     effective_mode = "voice_and_text" if wants_voice(text) else mode
     wants_text = effective_mode in {"text", "voice_and_text"}
     wants_audio = effective_mode in {"voice", "voice_and_text"}
+    _telegram_live_stream_trace(
+        request_id, chat_id, "start", visible_chars=0, preview_created=False,
+        preview_message_id_exists=False, edit_attempt=False, edit_success=False,
+        done_received=False, delivery_mode="persistent", wants_text=wants_text,
+        wants_audio=wants_audio,
+    )
     try:
         while True:
             event = await queue.get()
@@ -4292,6 +4325,13 @@ async def stream_answer_to_telegram(update, context, text):
                 raise event
             kind = event.get("type")
             if kind == "state":
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "state", visible_chars=preview_visible_chars,
+                    preview_created=sent is not None,
+                    preview_message_id_exists=telegram_message_id is not None,
+                    edit_attempt=False, edit_success=False, done_received=done_received,
+                    state=str(event.get("state") or "").upper(),
+                )
                 await telegram_runtime_action(context.bot, chat_id, event.get("state"))
                 # Telegram's native "typing…" indicator does not communicate
                 # Noema's actual stage, so keep one temporary status card until
@@ -4302,6 +4342,13 @@ async def stream_answer_to_telegram(update, context, text):
                     )
             elif kind == "delta":
                 accumulated += event.get("text", "")
+                visible_chars = len(sanitize_visible_content(accumulated).strip())
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "delta", visible_chars=visible_chars,
+                    preview_created=sent is not None,
+                    preview_message_id_exists=telegram_message_id is not None,
+                    edit_attempt=False, edit_success=False, done_received=done_received,
+                )
                 if not wants_text:
                     continue
                 rendered = _telegram_stream_text(chat_id, accumulated)
@@ -4310,37 +4357,116 @@ async def stream_answer_to_telegram(update, context, text):
                 # Do not create a one-character Telegram bubble.  The same
                 # visible accumulator will still be sent immediately at final
                 # for short answers.
-                if sent is None and len(accumulated.strip()) >= TELEGRAM_DRAFT_MIN_CHARS:
+                if sent is None and visible_chars >= TELEGRAM_DRAFT_MIN_CHARS:
+                    _telegram_live_stream_trace(
+                        request_id, chat_id, "preview_send_attempt", visible_chars=visible_chars,
+                        preview_created=False, preview_message_id_exists=False,
+                        edit_attempt=False, edit_success=False, done_received=done_received,
+                    )
                     sent = await telegram_send_with_retry(
                         context.bot, source="telegram_stream_initial", chat_id=chat_id,
                         text=rendered, reply_markup=main_keyboard(),
                         parse_mode=TelegramRenderer.parse_mode,
                     )
                     telegram_message_id = getattr(sent, "message_id", None)
+                    preview_visible_chars = visible_chars
                     throttle.should_send(accumulated, force=True)
+                    _telegram_live_stream_trace(
+                        request_id, chat_id, "preview_created", visible_chars=visible_chars,
+                        preview_created=True,
+                        preview_message_id_exists=telegram_message_id is not None,
+                        edit_attempt=False, edit_success=False, done_received=done_received,
+                    )
                     if progress_message_id:
-                        await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
+                        removed = await _remove_telegram_stream_preview(
+                            context.bot, chat_id, progress_message_id
+                        )
+                        _telegram_live_stream_trace(
+                            request_id, chat_id, "status_cleanup", visible_chars=visible_chars,
+                            preview_created=True,
+                            preview_message_id_exists=telegram_message_id is not None,
+                            edit_attempt=False, edit_success=False, done_received=done_received,
+                            status_removed=removed, cleanup_before_final=True,
+                        )
                         progress_message_id = None
-                elif sent is not None and editing_available and throttle.should_send(accumulated):
-                    editing_available = bool(await telegram_edit_with_retry(
-                        context.bot, chat_id=chat_id, message_id=telegram_message_id,
-                        text=rendered,
-                    ))
+                elif sent is not None and editing_available:
+                    edit_due = throttle.should_send(accumulated)
+                    if (not edit_due and
+                            visible_chars - preview_visible_chars >= TELEGRAM_STREAM_FORCE_EDIT_CHARS):
+                        # A burst is still real provider output. Surface it
+                        # now rather than deferring every change until done.
+                        edit_due = throttle.should_send(accumulated, force=True)
+                    if edit_due:
+                        _telegram_live_stream_trace(
+                            request_id, chat_id, "preview_edit_attempt", visible_chars=visible_chars,
+                            preview_created=True,
+                            preview_message_id_exists=telegram_message_id is not None,
+                            edit_attempt=True, edit_success=False, done_received=done_received,
+                        )
+                        editing_available = bool(await telegram_edit_with_retry(
+                            context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                            text=rendered,
+                        ))
+                        if editing_available:
+                            preview_visible_chars = visible_chars
+                        _telegram_live_stream_trace(
+                            request_id, chat_id, "preview_edit_result", visible_chars=visible_chars,
+                            preview_created=True,
+                            preview_message_id_exists=telegram_message_id is not None,
+                            edit_attempt=True, edit_success=editing_available,
+                            done_received=done_received,
+                        )
             elif kind == "done":
                 final = event.get("text") or accumulated
                 canonical_message_id = event.get("canonical_message_id")
+                done_received = True
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "done",
+                    visible_chars=len(sanitize_visible_content(final).strip()),
+                    preview_created=sent is not None,
+                    preview_message_id_exists=telegram_message_id is not None,
+                    edit_attempt=False, edit_success=False, done_received=True,
+                )
             elif kind == "cancelled":
                 cancelled.set()
 
         if cancelled.is_set():
+            _telegram_live_stream_trace(
+                request_id, chat_id, "cancelled", visible_chars=preview_visible_chars,
+                preview_created=sent is not None,
+                preview_message_id_exists=telegram_message_id is not None,
+                edit_attempt=False, edit_success=False, done_received=done_received,
+            )
             return False
         final = sanitize_visible_content(final or accumulated).strip()
         record_runtime_metric("telegram_visible_chars", len(final))
         final_message_ids = []
+        final_promotion_path = "not_applicable"
+        fallback_path = False
         if wants_text and final:
             canonical_chunks = _telegram_final_chunks(chat_id, final)
+            # A short response can bypass preview creation. Its temporary
+            # status must still disappear before the immutable final is sent.
+            if progress_message_id:
+                removed = await _remove_telegram_stream_preview(
+                    context.bot, chat_id, progress_message_id
+                )
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "status_cleanup", visible_chars=len(final),
+                    preview_created=sent is not None,
+                    preview_message_id_exists=telegram_message_id is not None,
+                    edit_attempt=False, edit_success=False, done_received=True,
+                    status_removed=removed, cleanup_before_final=True,
+                )
+                progress_message_id = None
             promoted = False
             if sent is not None and telegram_message_id is not None and canonical_chunks:
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "final_promotion_attempt", visible_chars=len(final),
+                    preview_created=True, preview_message_id_exists=True,
+                    edit_attempt=True, edit_success=False, done_received=True,
+                    final_promotion_path="preview_edit", fallback_path=False,
+                )
                 promoted = bool(await telegram_edit_with_retry(
                     context.bot, chat_id=chat_id, message_id=telegram_message_id,
                     text=canonical_chunks[0], source="telegram_stream_final_edit",
@@ -4359,6 +4485,13 @@ async def stream_answer_to_telegram(update, context, text):
                     canonical_message_id=canonical_message_id,
                     chunks=canonical_chunks, start_index=1,
                 ))
+                final_promotion_path = "preview_edit"
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "final_promotion_result", visible_chars=len(final),
+                    preview_created=True, preview_message_id_exists=True,
+                    edit_attempt=True, edit_success=True, done_received=True,
+                    final_promotion_path="preview_edit", fallback_path=False,
+                )
             else:
                 # A failed/ambiguous edit must never risk losing done.text.
                 # Retain the P0 immutable path, then remove the stale preview
@@ -4371,9 +4504,15 @@ async def stream_answer_to_telegram(update, context, text):
                     await _remove_telegram_stream_preview(
                         context.bot, chat_id, telegram_message_id
                     )
-            if progress_message_id:
-                await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
-                progress_message_id = None
+                final_promotion_path = "immutable_final"
+                fallback_path = sent is not None
+                _telegram_live_stream_trace(
+                    request_id, chat_id, "final_fallback", visible_chars=len(final),
+                    preview_created=sent is not None,
+                    preview_message_id_exists=telegram_message_id is not None,
+                    edit_attempt=sent is not None, edit_success=False, done_received=True,
+                    final_promotion_path="immutable_final", fallback_path=fallback_path,
+                )
             if final_message_ids:
                 telegram_message_id = final_message_ids[0]
         if wants_audio and final:
@@ -4390,8 +4529,14 @@ async def stream_answer_to_telegram(update, context, text):
             "telegram_message_id": telegram_message_id,
             "final_message_ids": final_message_ids,
         })
-        LOGGER.info("Telegram delivery request_id=%s canonical_message_id=%s telegram_message_id=%s",
-                    request_id, canonical_message_id, telegram_message_id)
+        _telegram_live_stream_trace(
+            request_id, chat_id, "complete", visible_chars=len(final),
+            preview_created=sent is not None,
+            preview_message_id_exists=telegram_message_id is not None,
+            edit_attempt=False, edit_success=False, done_received=done_received,
+            final_promotion_path=final_promotion_path,
+            fallback_path=fallback_path,
+        )
         return True
     finally:
         if progress_message_id:
@@ -6661,8 +6806,15 @@ async def text_handler(update,context):
 
     if update.effective_chat.type == "private":
         try:
-            delivery = stream_answer_to_telegram_draft if TELEGRAM_DRAFT_STREAMING_ENABLED else stream_answer_to_telegram
-            completed = await delivery(update, context, t)
+            # The draft endpoint always finishes through ``send_answer()``,
+            # which creates a second immutable message.  It is therefore not
+            # a valid transport for the normal private-text stream contract.
+            # Keep the legacy flag readable for deployment compatibility, but
+            # route every ordinary private message through persistent preview
+            # promotion.
+            if TELEGRAM_DRAFT_STREAMING_ENABLED:
+                LOGGER.warning("Telegram draft transport is retired for private text; using persistent streaming")
+            completed = await stream_answer_to_telegram(update, context, t)
             if completed:
                 await drain_media_outbox(update, context)
         except Exception as e:
