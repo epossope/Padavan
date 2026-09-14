@@ -150,7 +150,7 @@ TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").strip().lower()
 TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lower()
 TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 TELEGRAM_DRAFT_MIN_INTERVAL = max(0.3, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.4")))
-TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.5")))
+TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.45")))
 TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "12")))
 TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
 TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
@@ -4118,6 +4118,11 @@ def _release_telegram_final_chunk(delivery_key):
             TELEGRAM_FINAL_CHUNK_ORDER.remove(delivery_key)
 
 
+def _telegram_final_delivery_key(chat_id, correlation, index, chunk):
+    digest = hashlib.blake2s(chunk.encode("utf-8"), digest_size=12).hexdigest()
+    return (int(chat_id), str(correlation), index, digest)
+
+
 async def _remove_telegram_stream_preview(bot, chat_id, message_id):
     if not message_id or not callable(getattr(bot, "delete_message", None)):
         return False
@@ -4129,14 +4134,15 @@ async def _remove_telegram_stream_preview(bot, chat_id, message_id):
         return False
 
 
-async def _deliver_telegram_final(bot, *, chat_id, final, request_id, canonical_message_id):
+async def _deliver_telegram_final(bot, *, chat_id, final, request_id, canonical_message_id,
+                                  chunks=None, start_index=0):
     """Send the immutable canonical answer exactly once per known chunk."""
-    chunks = _telegram_final_chunks(chat_id, final)
+    chunks = list(chunks) if chunks is not None else _telegram_final_chunks(chat_id, final)
     message_ids = []
     correlation = canonical_message_id if canonical_message_id is not None else request_id
-    for index, chunk in enumerate(chunks):
-        digest = hashlib.blake2s(chunk.encode("utf-8"), digest_size=12).hexdigest()
-        delivery_key = (int(chat_id), str(correlation), index, digest)
+    for index in range(start_index, len(chunks)):
+        chunk = chunks[index]
+        delivery_key = _telegram_final_delivery_key(chat_id, correlation, index, chunk)
         if not _claim_telegram_final_chunk(delivery_key):
             continue
         try:
@@ -4153,7 +4159,7 @@ async def _deliver_telegram_final(bot, *, chat_id, final, request_id, canonical_
 
 
 async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="telegram_stream"):
-    """Edit a known message without ever creating a duplicate fallback reply."""
+    """Boundedly edit a known message and report whether Telegram accepted it."""
     for attempt in range(TELEGRAM_SEND_RETRIES + 1):
         started = time.perf_counter()
         try:
@@ -4172,8 +4178,7 @@ async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="te
             message = str(error).casefold()
             if "message is not modified" in message:
                 return True
-            # Deleted/invalid/inaccessible messages cannot be safely replaced:
-            # a second send could duplicate an edit that Telegram already applied.
+            # Deleted, invalid, or inaccessible previews cannot be promoted.
             LOGGER.warning("Telegram stream edit stopped chat_id=%s message_id=%s: %s",
                            chat_id, message_id, error)
             return None
@@ -4265,7 +4270,9 @@ async def stream_answer_to_telegram(update, context, text):
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     threading.Thread(target=produce, name=f"telegram-stream-{chat_id}", daemon=True).start()
-    throttle = AdaptiveDraftThrottle(0.3, 0.5, TELEGRAM_DRAFT_MIN_CHARS)
+    throttle = AdaptiveDraftThrottle(
+        TELEGRAM_DRAFT_MIN_INTERVAL, TELEGRAM_DRAFT_MAX_INTERVAL, TELEGRAM_DRAFT_MIN_CHARS
+    )
     accumulated, final = "", ""
     canonical_message_id = None
     telegram_message_id = None
@@ -4331,15 +4338,39 @@ async def stream_answer_to_telegram(update, context, text):
         record_runtime_metric("telegram_visible_chars", len(final))
         final_message_ids = []
         if wants_text and final:
-            # A mutable preview is never promoted into the canonical answer.
-            # Deliver the immutable final first so cleanup failure cannot turn
-            # into data loss, then remove the superseded preview best-effort.
-            final_message_ids = await _deliver_telegram_final(
-                context.bot, chat_id=chat_id, final=final, request_id=request_id,
-                canonical_message_id=canonical_message_id,
-            )
-            if sent is not None:
-                await _remove_telegram_stream_preview(context.bot, chat_id, telegram_message_id)
+            canonical_chunks = _telegram_final_chunks(chat_id, final)
+            promoted = False
+            if sent is not None and telegram_message_id is not None and canonical_chunks:
+                promoted = bool(await telegram_edit_with_retry(
+                    context.bot, chat_id=chat_id, message_id=telegram_message_id,
+                    text=canonical_chunks[0], source="telegram_stream_final_edit",
+                ))
+            if promoted:
+                # The preview itself is now canonical chunk zero.  Deliver only
+                # the remaining chunks so the first one is never duplicated.
+                correlation = (canonical_message_id if canonical_message_id is not None
+                               else request_id)
+                _claim_telegram_final_chunk(_telegram_final_delivery_key(
+                    chat_id, correlation, 0, canonical_chunks[0]
+                ))
+                final_message_ids = [telegram_message_id]
+                final_message_ids.extend(await _deliver_telegram_final(
+                    context.bot, chat_id=chat_id, final=final, request_id=request_id,
+                    canonical_message_id=canonical_message_id,
+                    chunks=canonical_chunks, start_index=1,
+                ))
+            else:
+                # A failed/ambiguous edit must never risk losing done.text.
+                # Retain the P0 immutable path, then remove the stale preview
+                # only after all sends returned successfully.
+                final_message_ids = await _deliver_telegram_final(
+                    context.bot, chat_id=chat_id, final=final, request_id=request_id,
+                    canonical_message_id=canonical_message_id, chunks=canonical_chunks,
+                )
+                if sent is not None:
+                    await _remove_telegram_stream_preview(
+                        context.bot, chat_id, telegram_message_id
+                    )
             if progress_message_id:
                 await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
                 progress_message_id = None

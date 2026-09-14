@@ -299,10 +299,11 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         final_send.assert_awaited_once()
 
     async def test_production_stream_sends_once_then_edits_same_message(self):
+        final = "A" * 200
         telegram = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
             edit_message_text=AsyncMock(return_value=True),
-            send_message_draft=AsyncMock(),
+            delete_message=AsyncMock(return_value=True), send_message_draft=AsyncMock(),
         )
         context = SimpleNamespace(bot=telegram)
         update = SimpleNamespace(
@@ -310,19 +311,57 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             effective_message=SimpleNamespace(reply_voice=AsyncMock()),
         )
         events = iter([
-            {"type": "delta", "text": "При"},
-            {"type": "delta", "text": "вет"},
-            {"type": "done", "text": "Привет", "canonical_message_id": 9},
+            *({"type": "delta", "text": final[index:index + 20]}
+              for index in range(0, len(final), 20)),
+            {"type": "done", "text": final, "canonical_message_id": 9},
         ])
+        throttle = Mock(); throttle.should_send.return_value = True
         with patch.object(bot, "stream_agent_response", return_value=events), \
-             patch.object(bot, "get_mode", return_value="text"):
+             patch.object(bot, "get_mode", return_value="text"), \
+             patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
+             patch.object(bot, "reply_emoji_prefix", return_value=""):
             completed = await bot.stream_answer_to_telegram(update, context, "тест")
         self.assertTrue(completed)
         telegram.send_message.assert_awaited_once()
         telegram.send_message_draft.assert_not_awaited()
-        self.assertEqual(telegram.edit_message_text.await_count, 0)
+        self.assertGreaterEqual(telegram.edit_message_text.await_count, 2)
+        self.assertTrue(all(call.kwargs["message_id"] == 77
+                            for call in telegram.edit_message_text.await_args_list))
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"], final)
+        telegram.delete_message.assert_not_awaited()
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["canonical_message_id"], 9)
         self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["telegram_message_id"], 77)
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [77])
+
+    async def test_3000_char_preview_is_promoted_to_the_same_message(self):
+        final = "B" * 3000
+        telegram = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=78)),
+            edit_message_text=AsyncMock(return_value=True), delete_message=AsyncMock(),
+            send_message_draft=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
+                                 effective_message=SimpleNamespace(reply_voice=AsyncMock()))
+        events = iter([
+            {"type": "delta", "text": final[:40]},
+            {"type": "delta", "text": final[40:1500]},
+            {"type": "delta", "text": final[1500:]},
+            {"type": "done", "text": final, "canonical_message_id": 10},
+        ])
+        throttle = Mock(); throttle.should_send.return_value = True
+        with patch.object(bot, "stream_agent_response", return_value=events), \
+             patch.object(bot, "get_mode", return_value="text"), \
+             patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
+             patch.object(bot, "reply_emoji_prefix", return_value=""):
+            self.assertTrue(await bot.stream_answer_to_telegram(
+                update, SimpleNamespace(bot=telegram), "test"
+            ))
+        telegram.send_message.assert_awaited_once()
+        self.assertGreaterEqual(telegram.edit_message_text.await_count, 3)
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["message_id"], 78)
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"], final)
+        telegram.delete_message.assert_not_awaited()
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [78])
 
     async def test_production_stream_never_exposes_reasoning(self):
         telegram = SimpleNamespace(
@@ -358,7 +397,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("think", delivered.casefold())
 
     async def test_long_canonical_answer_is_delivered_as_every_telegram_chunk(self):
-        final = "A" * 10000
+        final = "A" * 9000
         ids = iter(range(100, 120))
         telegram = SimpleNamespace(
             send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
@@ -379,10 +418,15 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "reply_emoji_prefix", return_value=""):
             self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
             expected = bot._telegram_final_chunks(42, final)
-        delivered = [call.kwargs["text"] for call in telegram.send_message.await_args_list[1:]]
-        self.assertEqual(delivered, expected)
-        self.assertGreaterEqual(len(delivered), 3)
-        telegram.delete_message.assert_awaited_once_with(chat_id=42, message_id=100)
+        delivered_tail = [call.kwargs["text"] for call in telegram.send_message.await_args_list[1:]]
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"], expected[0])
+        self.assertEqual(delivered_tail, expected[1:])
+        self.assertEqual(telegram.send_message.await_count, len(expected))
+        self.assertEqual(telegram.edit_message_text.await_args.kwargs["text"] + "".join(delivered_tail),
+                         final)
+        telegram.delete_message.assert_not_awaited()
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"],
+                         list(range(100, 100 + len(expected))))
 
     async def test_canonical_chunk_correlation_guard_prevents_duplicate_final_send(self):
         telegram = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=700)))
@@ -410,7 +454,7 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(name=name):
                 with bot.TELEGRAM_FINAL_CHUNK_LOCK:
                     bot.TELEGRAM_FINAL_CHUNK_KEYS.clear(); bot.TELEGRAM_FINAL_CHUNK_ORDER.clear()
-                final = (name + "-final-") * 700
+                final = (name + "-final-") * 20
                 ids = iter(range(200 + offset * 20, 220 + offset * 20))
                 telegram = SimpleNamespace(
                     send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
@@ -421,21 +465,53 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
                                          effective_message=SimpleNamespace(reply_voice=AsyncMock()))
                 events = iter([
                     {"type": "delta", "text": final[:30]},
-                    {"type": "delta", "text": final[30:80]},
                     {"type": "done", "text": final, "canonical_message_id": 600 + offset},
                 ])
                 throttle = Mock(); throttle.should_send.return_value = True
                 with patch.object(bot, "stream_agent_response", return_value=events), \
                      patch.object(bot, "get_mode", return_value="text"), \
                      patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
-                     patch.object(bot, "reply_emoji_prefix", return_value=""):
+                     patch.object(bot, "reply_emoji_prefix", return_value=""), \
+                     patch.object(bot.asyncio, "sleep", new=AsyncMock()):
                     self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
                     expected = bot._telegram_final_chunks(42, final)
                 delivered = [call.kwargs["text"] for call in telegram.send_message.await_args_list[1:]]
                 self.assertEqual(delivered, expected)
-                telegram.delete_message.assert_awaited_once()
+                telegram.delete_message.assert_awaited_once_with(
+                    chat_id=42, message_id=200 + offset * 20
+                )
                 self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"],
                                  list(range(201 + offset * 20, 201 + offset * 20 + len(expected))))
+
+    async def test_progress_status_is_removed_when_first_stream_bubble_appears(self):
+        ids = iter((50, 51))
+        telegram = SimpleNamespace(
+            send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
+            edit_message_text=AsyncMock(return_value=True), delete_message=AsyncMock(return_value=True),
+            send_chat_action=AsyncMock(), send_message_draft=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
+                                 effective_message=SimpleNamespace(reply_voice=AsyncMock()))
+        final = "Visible streamed answer"
+        events = iter([
+            {"type": "state", "state": "REQUESTING", "text": "Думаю…"},
+            {"type": "delta", "text": final[:12]},
+            {"type": "delta", "text": final[12:]},
+            {"type": "done", "text": final, "canonical_message_id": 700},
+        ])
+        throttle = Mock(); throttle.should_send.return_value = True
+        with patch.object(bot, "stream_agent_response", return_value=events), \
+             patch.object(bot, "get_mode", return_value="text"), \
+             patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
+             patch.object(bot, "reply_emoji_prefix", return_value=""):
+            self.assertTrue(await bot.stream_answer_to_telegram(
+                update, SimpleNamespace(bot=telegram), "test"
+            ))
+        self.assertEqual(telegram.send_message.await_count, 2)
+        telegram.delete_message.assert_awaited_once_with(chat_id=42, message_id=50)
+        self.assertTrue(all(call.kwargs["message_id"] == 51
+                            for call in telegram.edit_message_text.await_args_list))
+        self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"], [51])
 
     async def test_output_modes_keep_text_voice_and_combined_contracts(self):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
