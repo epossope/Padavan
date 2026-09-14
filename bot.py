@@ -75,6 +75,7 @@ from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
+                               assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
 
@@ -188,6 +189,9 @@ ACTIVE_DRAFTS = {}
 ACTIVE_STREAM_RESPONSES_LOCK = threading.RLock()
 ACTIVE_STREAM_RESPONSES = {}
 TELEGRAM_DELIVERY_CORRELATIONS = deque(maxlen=256)
+TELEGRAM_FINAL_CHUNK_KEYS = set()
+TELEGRAM_FINAL_CHUNK_ORDER = deque()
+TELEGRAM_FINAL_CHUNK_LOCK = threading.RLock()
 RUNTIME_METRICS = {}
 LATENCY_METRICS = (
     "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
@@ -3656,12 +3660,31 @@ def system_prompt(chat_id):
 
 
 
+def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, stream=False):
+    """Build the single production-visible chat contract for every transport."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.25,
+        "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1800")),
+        # Qwen/Alibaba otherwise exposes untagged chain-of-thought in content.
+        # OpenRouter's exclude flag is insufficient for this provider route.
+        "reasoning": {"enabled": False},
+    }
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    if provider := provider_preferences_for(model):
+        payload["provider"] = provider
+    return payload
+
+
 def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
 
-    payload={"model":model,"messages":messages,"temperature":0.25,"max_tokens":int(os.getenv("CHAT_MAX_TOKENS", "1800"))}
-
-    if tools: payload["tools"]=tools; payload["tool_choice"]=tool_choice
-    if provider := provider_preferences_for(model): payload["provider"] = provider
+    payload = build_chat_payload(model, messages, tools, tool_choice)
 
     key, _ = api_key_for_chat(chat_id)
     return requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
@@ -3670,14 +3693,7 @@ def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
 
 
 def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"):
-    payload = {"model": model, "messages": messages, "temperature": 0.25,
-               "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1800")), "stream": True,
-               "stream_options": {"include_usage": True}}
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice
-    if provider := provider_preferences_for(model):
-        payload["provider"] = provider
+    payload = build_chat_payload(model, messages, tools, tool_choice, stream=True)
     key, _ = api_key_for_chat(chat_id)
     return requests.post(CHAT_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                          json=payload, timeout=(20, 180), stream=True)
@@ -3745,12 +3761,22 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             with ACTIVE_STREAM_RESPONSES_LOCK:
                 ACTIVE_STREAM_RESPONSES[cancel_event] = response
             try:
+                contract_violated = False
                 for payload in iter_sse_json(response.iter_lines()):
                     if cancel_event.is_set():
                         response.close()
                         yield {"type": "cancelled"}
                         return
-                    for delta in accumulator.add(payload):
+                    emitted = accumulator.add(payload)
+                    if accumulator.reasoning_contract_violated:
+                        # Do not try to classify chain-of-thought prose. An
+                        # explicit machine-readable contract violation rejects
+                        # this provider attempt and advances to the next model.
+                        contract_violated = True
+                        last_error = "REASONING_CONTRACT"
+                        response.close()
+                        break
+                    for delta in emitted:
                         if not first_delta:
                             first_delta = True
                             record_runtime_metric("llm_ttft_ms", (time.perf_counter() - request_started) * 1000)
@@ -3758,6 +3784,10 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                             first_visible_marked = True
                             record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
                         yield {"type": "delta", "text": delta}
+                if contract_violated:
+                    record_runtime_metric("reasoning_chunks_dropped", max(1, accumulator.reasoning_chunks_dropped))
+                    LOGGER.warning("Reasoning-disabled contract rejected provider response model=%s", model)
+                    continue
                 tail = accumulator.finish()
                 if tail:
                     if not first_delta:
@@ -3977,17 +4007,87 @@ async def stream_answer_to_telegram_draft(update, context, text):
 
 
 def _telegram_stream_text(chat_id, text):
-    """Render one safe, bounded Telegram bubble from canonical visible text."""
+    """Render a bounded mutable preview; never use this for final delivery."""
     visible = sanitize_visible_content(text).strip()
     if not visible:
         return ""
     chunks = TelegramRenderer.chunks(visible)
     rendered = chunks[0]
-    if len(chunks) > 1:
-        rendered = TelegramRenderer.render(visible[:3600].rstrip() + "\n\n…")
     available = max(0, reply_emoji_limit(len(visible)) - 1)
     rendered, _ = animate_configured_emojis(rendered, available)
     return reply_emoji_prefix(chat_id) + rendered
+
+
+def _telegram_final_chunks(chat_id, text):
+    """Render every canonical final chunk without the preview truncation path."""
+    visible = sanitize_visible_content(text).strip()
+    if not visible:
+        return []
+    rendered = []
+    remaining_emoji = reply_emoji_limit(len(visible))
+    for index, chunk in enumerate(TelegramRenderer.chunks(visible)):
+        available = max(0, remaining_emoji - (1 if index == 0 else 0))
+        chunk, used = animate_configured_emojis(chunk, available)
+        remaining_emoji -= used
+        if index == 0:
+            chunk = reply_emoji_prefix(chat_id) + chunk
+            remaining_emoji -= 1
+        rendered.append(chunk)
+    return rendered
+
+
+def _claim_telegram_final_chunk(delivery_key):
+    """Process-local idempotency guard for one canonical final chunk."""
+    with TELEGRAM_FINAL_CHUNK_LOCK:
+        if delivery_key in TELEGRAM_FINAL_CHUNK_KEYS:
+            return False
+        if len(TELEGRAM_FINAL_CHUNK_ORDER) >= 1024:
+            expired = TELEGRAM_FINAL_CHUNK_ORDER.popleft()
+            TELEGRAM_FINAL_CHUNK_KEYS.discard(expired)
+        TELEGRAM_FINAL_CHUNK_ORDER.append(delivery_key)
+        TELEGRAM_FINAL_CHUNK_KEYS.add(delivery_key)
+        return True
+
+
+def _release_telegram_final_chunk(delivery_key):
+    with TELEGRAM_FINAL_CHUNK_LOCK:
+        TELEGRAM_FINAL_CHUNK_KEYS.discard(delivery_key)
+        with contextlib.suppress(ValueError):
+            TELEGRAM_FINAL_CHUNK_ORDER.remove(delivery_key)
+
+
+async def _remove_telegram_stream_preview(bot, chat_id, message_id):
+    if not message_id or not callable(getattr(bot, "delete_message", None)):
+        return False
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except (BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError):
+        LOGGER.warning("Telegram mutable preview cleanup failed chat_id=%s message_id=%s", chat_id, message_id)
+        return False
+
+
+async def _deliver_telegram_final(bot, *, chat_id, final, request_id, canonical_message_id):
+    """Send the immutable canonical answer exactly once per known chunk."""
+    chunks = _telegram_final_chunks(chat_id, final)
+    message_ids = []
+    correlation = canonical_message_id if canonical_message_id is not None else request_id
+    for index, chunk in enumerate(chunks):
+        digest = hashlib.blake2s(chunk.encode("utf-8"), digest_size=12).hexdigest()
+        delivery_key = (int(chat_id), str(correlation), index, digest)
+        if not _claim_telegram_final_chunk(delivery_key):
+            continue
+        try:
+            sent = await telegram_send_with_retry(
+                bot, source="telegram_stream_final", chat_id=chat_id, text=chunk,
+                parse_mode=TelegramRenderer.parse_mode,
+                **({"reply_markup": main_keyboard()} if index == 0 else {}),
+            )
+        except Exception:
+            _release_telegram_final_chunk(delivery_key)
+            raise
+        message_ids.append(getattr(sent, "message_id", None))
+    return message_ids
 
 
 async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="telegram_stream"):
@@ -4102,20 +4202,19 @@ async def stream_answer_to_telegram(update, context, text):
             return False
         final = sanitize_visible_content(final or accumulated).strip()
         record_runtime_metric("telegram_visible_chars", len(final))
+        final_message_ids = []
         if wants_text and final:
-            rendered = _telegram_stream_text(chat_id, final)
-            if sent is None:
-                sent = await telegram_send_with_retry(
-                    context.bot, source="telegram_stream_initial", chat_id=chat_id,
-                    text=rendered, reply_markup=main_keyboard(),
-                    parse_mode=TelegramRenderer.parse_mode,
-                )
-                telegram_message_id = getattr(sent, "message_id", None)
-            elif editing_available:
-                editing_available = bool(await telegram_edit_with_retry(
-                    context.bot, chat_id=chat_id, message_id=telegram_message_id,
-                    text=rendered, source="telegram_stream_final",
-                ))
+            # A mutable preview is never promoted into the canonical answer.
+            # Deliver the immutable final first so cleanup failure cannot turn
+            # into data loss, then remove the superseded preview best-effort.
+            final_message_ids = await _deliver_telegram_final(
+                context.bot, chat_id=chat_id, final=final, request_id=request_id,
+                canonical_message_id=canonical_message_id,
+            )
+            if sent is not None:
+                await _remove_telegram_stream_preview(context.bot, chat_id, telegram_message_id)
+            if final_message_ids:
+                telegram_message_id = final_message_ids[0]
         if wants_audio and final:
             voice_path = await make_voice(final, chat_id=chat_id)
             try:
@@ -4127,6 +4226,7 @@ async def stream_answer_to_telegram(update, context, text):
             "request_id": request_id,
             "canonical_message_id": canonical_message_id,
             "telegram_message_id": telegram_message_id,
+            "final_message_ids": final_message_ids,
         })
         LOGGER.info("Telegram delivery request_id=%s canonical_message_id=%s telegram_message_id=%s",
                     request_id, canonical_message_id, telegram_message_id)
@@ -4157,6 +4257,10 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
                 data = r.json()
                 record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
                 choice = data["choices"][0]
+                if assistant_reasoning_contract_violated(choice["message"]):
+                    last = (502, "reasoning_contract")
+                    LOGGER.warning("Reasoning-disabled contract rejected provider response model=%s", model)
+                    break
                 if choice.get("finish_reason") == "length":
                     print(f"LLM truncation chat_id={chat_id} model={model}")
                 return sanitize_assistant_message(choice["message"])
@@ -4189,7 +4293,12 @@ def call_or(chat_id, messages,tools=None,tool_choice="auto"):
             if r.ok:
                 data = r.json()
                 record_usage(chat_id, api_key_for_chat(chat_id)[1], model, data)
-                return sanitize_assistant_message(data["choices"][0]["message"])
+                message = data["choices"][0]["message"]
+                if assistant_reasoning_contract_violated(message):
+                    last = (502, "reasoning_contract")
+                    LOGGER.warning("Reasoning-disabled contract rejected provider response model=%s", model)
+                    continue
+                return sanitize_assistant_message(message)
 
             last=(r.status_code,r.text)
 

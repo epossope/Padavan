@@ -31,6 +31,7 @@ class VisibleContentFilter:
         self.hidden_depth = 0
         self.tag_buffer = ""
         self.finished = False
+        self.reasoning_tags_seen = 0
 
     def feed(self, value: str) -> str:
         if self.finished or not isinstance(value, str) or not value:
@@ -43,6 +44,7 @@ class VisibleContentFilter:
                     tag, self.tag_buffer = self.tag_buffer, ""
                     match = _REASONING_TAG.match(tag)
                     if match:
+                        self.reasoning_tags_seen += 1
                         if match.group(1):
                             self.hidden_depth = max(0, self.hidden_depth - 1)
                         else:
@@ -86,6 +88,17 @@ def sanitize_assistant_message(message: dict) -> dict:
     return clean
 
 
+def assistant_reasoning_contract_violated(message: dict) -> bool:
+    """Detect only machine-readable reasoning; never guess from prose."""
+    source = message or {}
+    if any(source.get(field) for field in ("reasoning", "reasoning_details", "analysis", "thinking")):
+        return True
+    content_filter = VisibleContentFilter()
+    content_filter.feed(str(source.get("content") or ""))
+    content_filter.finish()
+    return content_filter.reasoning_tags_seen > 0
+
+
 class ToolPackResolver:
     """Cheap conservative routing: no extra LLM request and no lost common actions."""
     RULES = {
@@ -120,6 +133,7 @@ class StreamAccumulator:
     visible_filter: VisibleContentFilter = field(default_factory=VisibleContentFilter, repr=False)
     reasoning_chunks_dropped: int = 0
     visible_chars: int = 0
+    reasoning_contract_violated: bool = False
 
     def add(self, payload: dict) -> list[str]:
         if payload.get("usage"):
@@ -132,9 +146,13 @@ class StreamAccumulator:
         # fields.  They are intentionally never normalised into content.
         if any(delta.get(name) for name in ("reasoning", "reasoning_details", "analysis", "thinking")):
             self.reasoning_chunks_dropped += 1
+            self.reasoning_contract_violated = True
         content = delta.get("content")
         if isinstance(content, str) and content:
+            tags_before = self.visible_filter.reasoning_tags_seen
             visible = self.visible_filter.feed(content)
+            if self.visible_filter.reasoning_tags_seen > tags_before:
+                self.reasoning_contract_violated = True
             if visible:
                 self.content.append(visible)
                 emitted.append(visible)

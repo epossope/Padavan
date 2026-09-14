@@ -1,0 +1,10 @@
+{
+  "legacy_without_reasoning_control": [
+    {"choices": [{"delta": {"content": "The user is asking a simple question. I should reason before answering. "}}]},
+    {"choices": [{"delta": {"content": "Готовый ответ."}, "finish_reason": "stop"}]}
+  ],
+  "reasoning_disabled": [
+    {"choices": [{"delta": {"role": "assistant", "content": "Готовый "}}]},
+    {"choices": [{"delta": {"content": "ответ."}, "finish_reason": "stop"}], "usage": {"completion_tokens": 4}}
+  ]
+}

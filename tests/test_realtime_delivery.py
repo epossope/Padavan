@@ -11,6 +11,11 @@ import bot
 
 
 class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        with bot.TELEGRAM_FINAL_CHUNK_LOCK:
+            bot.TELEGRAM_FINAL_CHUNK_KEYS.clear()
+            bot.TELEGRAM_FINAL_CHUNK_ORDER.clear()
+
     def test_new_canonical_user_is_visible_before_and_after_usage(self):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
@@ -207,20 +212,24 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         request.assert_not_called()
 
     def test_reasoning_never_reaches_shared_stream_or_canonical_history(self):
-        response = Mock(ok=True, status_code=200)
-        response.iter_lines.return_value = [
+        violating = Mock(ok=True, status_code=200)
+        violating.iter_lines.return_value = [
             b'data: {"choices":[{"delta":{"reasoning":"private","content":"<thi"}}]}',
             b'data: {"choices":[{"delta":{"content":"nk>Need answer</think>Visible "}}]}',
             b'data: {"choices":[{"delta":{"content":"answer."},"finish_reason":"stop"}]}',
             b'data: [DONE]',
         ]
-        router = SimpleNamespace(resolve=lambda *_: {"primary": "test-model", "fallback": ""})
+        compliant = Mock(ok=True, status_code=200)
+        compliant.iter_lines.return_value = [
+            b'data: {"choices":[{"delta":{"content":"Visible "}}]}',
+            b'data: {"choices":[{"delta":{"content":"answer."},"finish_reason":"stop"}]}',
+            b'data: [DONE]',
+        ]
         with patch.object(bot, "direct_live_request", return_value=None), \
              patch.object(bot, "conversation_context", return_value=[]), \
              patch.object(bot, "system_prompt", return_value="system"), \
-             patch.object(bot, "model_router", return_value=router), \
-             patch.object(bot, "runtime_config_values", return_value={"strong_model": "", "model_catalog": []}), \
-             patch.object(bot, "request_chat_stream", return_value=response), \
+             patch.object(bot, "chat_model_candidates", return_value=["test-model", "safe-model"]), \
+             patch.object(bot, "request_chat_stream", side_effect=[violating, compliant]), \
              patch.object(bot, "add_message") as add:
             events = list(bot.stream_agent_response(42, "test"))
         deltas = "".join(event["text"] for event in events if event["type"] == "delta")
@@ -323,19 +332,22 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
                                  effective_message=SimpleNamespace(reply_voice=AsyncMock()))
-        response = Mock(ok=True, status_code=200)
-        response.iter_lines.return_value = [
+        violating = Mock(ok=True, status_code=200)
+        violating.iter_lines.return_value = [
             b'data: {"choices":[{"delta":{"reasoning":"private","content":"<thi"}}]}',
             b'data: {"choices":[{"delta":{"content":"nk>internal</think>Visible"}}]}',
             b'data: [DONE]',
         ]
-        router = SimpleNamespace(resolve=lambda *_: {"primary": "test-model", "fallback": ""})
+        compliant = Mock(ok=True, status_code=200)
+        compliant.iter_lines.return_value = [
+            b'data: {"choices":[{"delta":{"content":"Visible"},"finish_reason":"stop"}]}',
+            b'data: [DONE]',
+        ]
         with patch.object(bot, "direct_live_request", return_value=None), \
              patch.object(bot, "conversation_context", return_value=[]), \
              patch.object(bot, "system_prompt", return_value="system"), \
-             patch.object(bot, "model_router", return_value=router), \
-             patch.object(bot, "runtime_config_values", return_value={"strong_model": "", "model_catalog": []}), \
-             patch.object(bot, "request_chat_stream", return_value=response), \
+             patch.object(bot, "chat_model_candidates", return_value=["test-model", "safe-model"]), \
+             patch.object(bot, "request_chat_stream", side_effect=[violating, compliant]), \
              patch.object(bot, "record_usage"), patch.object(bot, "add_message", side_effect=[1, 2]), \
              patch.object(bot, "get_mode", return_value="text"):
             await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "AAA")
@@ -344,6 +356,86 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Visible", delivered)
         self.assertNotIn("internal", delivered)
         self.assertNotIn("think", delivered.casefold())
+
+    async def test_long_canonical_answer_is_delivered_as_every_telegram_chunk(self):
+        final = "A" * 10000
+        ids = iter(range(100, 120))
+        telegram = SimpleNamespace(
+            send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
+            edit_message_text=AsyncMock(return_value=True), delete_message=AsyncMock(return_value=True),
+            send_message_draft=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
+                                 effective_message=SimpleNamespace(reply_voice=AsyncMock()))
+        events = iter([
+            {"type": "delta", "text": final[:40]},
+            {"type": "delta", "text": final[40:]},
+            {"type": "done", "text": final, "canonical_message_id": 501},
+        ])
+        throttle = Mock(); throttle.should_send.return_value = True
+        with patch.object(bot, "stream_agent_response", return_value=events), \
+             patch.object(bot, "get_mode", return_value="text"), \
+             patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
+             patch.object(bot, "reply_emoji_prefix", return_value=""):
+            self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
+            expected = bot._telegram_final_chunks(42, final)
+        delivered = [call.kwargs["text"] for call in telegram.send_message.await_args_list[1:]]
+        self.assertEqual(delivered, expected)
+        self.assertGreaterEqual(len(delivered), 3)
+        telegram.delete_message.assert_awaited_once_with(chat_id=42, message_id=100)
+
+    async def test_canonical_chunk_correlation_guard_prevents_duplicate_final_send(self):
+        telegram = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=700)))
+        with patch.object(bot, "reply_emoji_prefix", return_value=""):
+            expected = bot._telegram_final_chunks(42, "canonical final")
+            first = await bot._deliver_telegram_final(
+                telegram, chat_id=42, final="canonical final", request_id="request-a",
+                canonical_message_id=900,
+            )
+            second = await bot._deliver_telegram_final(
+                telegram, chat_id=42, final="canonical final", request_id="request-b",
+                canonical_message_id=900,
+            )
+        self.assertEqual(first, [700])
+        self.assertEqual(second, [])
+        self.assertEqual(telegram.send_message.await_count, len(expected))
+
+    async def test_edit_failures_still_deliver_complete_immutable_final(self):
+        failures = [
+            ("timeout", lambda: [bot.TimedOut("slow"), bot.TimedOut("slow")]),
+            ("retry-after", lambda: [bot.RetryAfter(0.01), bot.RetryAfter(0.01)]),
+            ("bad-request", lambda: [bot.BadRequest("invalid edit")]),
+        ]
+        for offset, (name, errors) in enumerate(failures):
+            with self.subTest(name=name):
+                with bot.TELEGRAM_FINAL_CHUNK_LOCK:
+                    bot.TELEGRAM_FINAL_CHUNK_KEYS.clear(); bot.TELEGRAM_FINAL_CHUNK_ORDER.clear()
+                final = (name + "-final-") * 700
+                ids = iter(range(200 + offset * 20, 220 + offset * 20))
+                telegram = SimpleNamespace(
+                    send_message=AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(message_id=next(ids))),
+                    edit_message_text=AsyncMock(side_effect=errors()),
+                    delete_message=AsyncMock(return_value=True), send_message_draft=AsyncMock(),
+                )
+                update = SimpleNamespace(effective_chat=SimpleNamespace(id=42),
+                                         effective_message=SimpleNamespace(reply_voice=AsyncMock()))
+                events = iter([
+                    {"type": "delta", "text": final[:30]},
+                    {"type": "delta", "text": final[30:80]},
+                    {"type": "done", "text": final, "canonical_message_id": 600 + offset},
+                ])
+                throttle = Mock(); throttle.should_send.return_value = True
+                with patch.object(bot, "stream_agent_response", return_value=events), \
+                     patch.object(bot, "get_mode", return_value="text"), \
+                     patch.object(bot, "AdaptiveDraftThrottle", return_value=throttle), \
+                     patch.object(bot, "reply_emoji_prefix", return_value=""):
+                    self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
+                    expected = bot._telegram_final_chunks(42, final)
+                delivered = [call.kwargs["text"] for call in telegram.send_message.await_args_list[1:]]
+                self.assertEqual(delivered, expected)
+                telegram.delete_message.assert_awaited_once()
+                self.assertEqual(bot.TELEGRAM_DELIVERY_CORRELATIONS[-1]["final_message_ids"],
+                                 list(range(201 + offset * 20, 201 + offset * 20 + len(expected))))
 
     async def test_output_modes_keep_text_voice_and_combined_contracts(self):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
