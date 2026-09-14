@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from artifact_service import ArtifactService
-from streaming_runtime import SpeechTextPolicy, ToolPackResolver
+from streaming_runtime import SpeechTextPolicy, SpeechTextStream, ToolPackResolver
 
 
 class ArtifactServiceTests(unittest.TestCase):
@@ -94,6 +94,18 @@ class SpeechTextPolicyTests(unittest.TestCase):
     def test_artifact_gets_natural_completion(self):
         speech = self.policy.build("Готово.", [{"filename": "parser.py"}])
         self.assertIn("прикреплён", speech)
+
+    def test_streaming_policy_handles_split_fences_without_client_logic(self):
+        stream = SpeechTextStream(self.policy)
+        spoken = []
+        for chunk in ("Кратко. ``", "`python\nsecret_call()\n`", "`` После кода всё готово."):
+            spoken.extend(stream.feed(chunk))
+        spoken.append(stream.flush())
+        result = " ".join(spoken)
+        self.assertIn("Кратко", result)
+        self.assertIn("После кода", result)
+        self.assertIn("Код доступен", result)
+        self.assertNotIn("secret_call", result)
 
 
 class RoutingContractTests(unittest.TestCase):

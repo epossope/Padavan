@@ -76,7 +76,7 @@ from model_router import ModelRouter
 from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
-                               SentenceChunker, SpeechTextPolicy,
+                               SentenceChunker, SpeechTextPolicy, SpeechTextStream,
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
@@ -3871,6 +3871,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         canonical_message_id = add_message(chat_id, "assistant", live)
         yield runtime_state_event("STREAMING")
         yield {"type": "delta", "text": live}
+        yield {"type": "speech_delta", "text": SpeechTextPolicy().build(live)}
         yield {"type": "done", "text": live, "canonical_message_id": canonical_message_id,
                "canonical_user_message_id": canonical_user_message_id}
         return
@@ -3884,6 +3885,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     writes = []
     artifacts = []
     answer_parts = []
+    speech_stream = SpeechTextStream()
     total_visible_chars = 0
     total_reasoning_dropped = 0
     first_visible_marked = False
@@ -3931,6 +3933,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                             record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
                             yield runtime_state_event("STREAMING")
                         yield {"type": "delta", "text": delta}
+                        for speech_delta in speech_stream.feed(delta):
+                            yield {"type": "speech_delta", "text": speech_delta}
                 if contract_violated:
                     record_runtime_metric("reasoning_chunks_dropped", max(1, accumulator.reasoning_chunks_dropped))
                     record_usage(chat_id, response_key_source(response, chat_id), model,
@@ -3947,6 +3951,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
                         yield runtime_state_event("STREAMING")
                     yield {"type": "delta", "text": tail}
+                    for speech_delta in speech_stream.feed(tail):
+                        yield {"type": "speech_delta", "text": speech_delta}
                 message = accumulator.message()
                 total_visible_chars += accumulator.visible_chars
                 total_reasoning_dropped += accumulator.reasoning_chunks_dropped
@@ -3984,6 +3990,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
             record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
             record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
+            yield {"type": "speech_delta", "text": speech_stream.flush(artifacts)}
             yield {"type": "done", "text": answer, "artifacts": artifacts, "canonical_message_id": canonical_message_id,
                    "canonical_user_message_id": canonical_user_message_id,
                    "elapsed_ms": round((time.perf_counter() - started) * 1000)}
@@ -4022,6 +4029,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
     record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
     record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
     record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
+    yield {"type": "speech_delta", "text": speech_stream.flush(artifacts)}
     yield {"type": "done", "text": answer, "artifacts": artifacts, "canonical_message_id": canonical_message_id,
            "canonical_user_message_id": canonical_user_message_id}
 

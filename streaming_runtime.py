@@ -282,10 +282,15 @@ class SpeechTextPolicy:
             return False
         return isinstance(parsed, (dict, list))
 
-    def build(self, value: str, artifacts=None) -> str:
+    @staticmethod
+    def _is_xml_dump(value: str) -> bool:
+        stripped = value.strip()
+        return len(stripped) >= 120 and stripped.startswith("<") and stripped.endswith(">") and len(re.findall(r"</?[A-Za-z][^>]*>", stripped)) >= 4
+
+    def build(self, value: str, artifacts=None, *, fallback=True) -> str:
         text = str(value or "")
         artifact_list = list(artifacts or [])
-        if self._is_data_dump(text):
+        if self._is_data_dump(text) or self._is_xml_dump(text):
             text = "Данные подготовлены и доступны в сообщении."
         removed_code = bool(self._fenced.search(text))
         text = self._fenced.sub("\n", text)
@@ -326,7 +331,74 @@ class SpeechTextPolicy:
             spoken = prefix + " ".join(dict.fromkeys(notes))
         spoken = re.sub(r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF]", " ", spoken)
         spoken = spoken.replace("\ufe0e", "").replace("\ufe0f", "").replace("\u200d", "")
-        return re.sub(r"\s+", " ", spoken).strip() or "Готово. Подробности доступны в сообщении."
+        spoken = re.sub(r"\s+", " ", spoken).strip()
+        return spoken or ("Готово. Подробности доступны в сообщении." if fallback else "")
+
+
+class SpeechTextStream:
+    """Incremental adapter for the canonical SpeechTextPolicy.
+
+    It buffers only until a safe sentence/line boundary, so the Mini App keeps
+    early playback without reimplementing speech filtering in JavaScript.
+    """
+
+    _boundary = re.compile(r"(?:\r?\n|[.!?…](?:\s+|$))")
+
+    def __init__(self, policy=None):
+        self.policy = policy or SpeechTextPolicy()
+        self.buffer = ""
+        self.marker = ""
+        self.fenced = False
+        self.removed_code = False
+        self.emitted = False
+
+    def _outside_fences(self, value: str) -> str:
+        source = self.marker + str(value or "")
+        self.marker = ""
+        output = []
+        index = 0
+        while index < len(source):
+            if source.startswith("```", index):
+                self.fenced = not self.fenced
+                self.removed_code = True
+                index += 3
+                continue
+            if source[index] == "`" and index > len(source) - 3:
+                self.marker = source[index:]
+                break
+            if not self.fenced:
+                output.append(source[index])
+            index += 1
+        return "".join(output)
+
+    def feed(self, value: str) -> list[str]:
+        self.buffer += self._outside_fences(value)
+        # A top-level JSON/XML payload must be seen whole before it can be
+        # replaced safely; never leak its early keys into TTS.
+        if not self.emitted and self.buffer.lstrip().startswith(("{", "[", "<")):
+            return []
+        output = []
+        while match := self._boundary.search(self.buffer):
+            segment, self.buffer = self.buffer[:match.end()], self.buffer[match.end():]
+            spoken = self.policy.build(segment, fallback=False)
+            if spoken:
+                output.append(spoken)
+                self.emitted = True
+        return output
+
+    def flush(self, artifacts=None) -> str:
+        if self.marker and not self.fenced:
+            self.buffer += self.marker
+        self.marker = ""
+        spoken = self.policy.build(self.buffer, fallback=False)
+        notes = []
+        artifact_list = list(artifacts or [])
+        if artifact_list:
+            notes.append("Файл подготовлен и прикреплён к сообщению." if len(artifact_list) == 1 else "Файлы подготовлены и прикреплены к сообщению.")
+        if self.removed_code:
+            notes.append("Код доступен в сообщении.")
+        result = " ".join(part for part in (spoken, *dict.fromkeys(notes)) if part).strip()
+        return result or "Готово. Подробности доступны в сообщении."
 
 
 class AdaptiveDraftThrottle:
