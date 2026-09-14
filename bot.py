@@ -165,7 +165,16 @@ TZ_NAME = os.getenv("TIMEZONE", "Europe/Amsterdam").strip()
 
 DEFAULT_CITY = os.getenv("DEFAULT_CITY", "Санкт-Петербург").strip()
 
-DEFAULT_MODE = os.getenv("VOICE_REPLY_MODE", "auto").strip().lower()
+VOICE_REPLY_MODES = {"text", "voice", "voice_and_text"}
+
+
+def canonical_voice_reply_mode(value, default="text"):
+    """Read-normalize the retired ``auto`` value without rewriting user data."""
+    clean = str(value or "").strip().lower()
+    return clean if clean in VOICE_REPLY_MODES else default
+
+
+DEFAULT_MODE = canonical_voice_reply_mode(os.getenv("VOICE_REPLY_MODE", "text"))
 
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "20"))
 
@@ -932,7 +941,7 @@ def _runtime_env_defaults():
         "tts_default_speed": (_env_float("TTS_DEFAULT_SPEED", 1.0, .8, 1.25), "ENV" if _env_is_set("TTS_DEFAULT_SPEED") else "DEFAULT"),
         "tts_default_pitch": (_env_float("TTS_DEFAULT_PITCH", 1.0, .5, 1.5), "ENV" if _env_is_set("TTS_DEFAULT_PITCH") else "DEFAULT"),
         "tts_default_volume": (_env_float("TTS_DEFAULT_VOLUME", 1.0, .2, 1.0), "ENV" if _env_is_set("TTS_DEFAULT_VOLUME") else "DEFAULT"),
-        "default_voice_reply_mode": (DEFAULT_MODE, "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
+        "default_voice_reply_mode": (canonical_voice_reply_mode(DEFAULT_MODE), "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
         "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
         "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
     }
@@ -963,6 +972,8 @@ def runtime_config_snapshot():
     for field, (value, source) in defaults.items():
         if field in record["overrides"]:
             value, source = record["overrides"][field], "ADMIN"
+        if field == "default_voice_reply_mode":
+            value = canonical_voice_reply_mode(value)
         fields[field] = {"value": value, "source": source}
     return {"fields": fields, "updated_at": record["updated_at"], "updated_by": record["updated_by"]}
 
@@ -1005,7 +1016,7 @@ def _normalise_runtime_config_value(field, value):
         raise ValueError("Invalid boolean")
     if field == "default_voice_reply_mode":
         clean = str(value or "").strip().lower()
-        if clean not in {"text", "voice", "voice_and_text", "auto"}:
+        if clean not in VOICE_REPLY_MODES:
             raise ValueError("Invalid voice reply mode")
         return clean
     if field in {"tts_default_speed", "tts_default_pitch", "tts_default_volume"}:
@@ -1561,7 +1572,7 @@ def init_db():
 
         c.executescript("""
 
-        CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER PRIMARY KEY,response_mode TEXT NOT NULL DEFAULT 'auto');
+        CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER PRIMARY KEY,response_mode TEXT NOT NULL DEFAULT 'text');
 
         CREATE TABLE IF NOT EXISTS user_settings(
             chat_id INTEGER PRIMARY KEY,
@@ -1793,11 +1804,16 @@ def get_mode(chat_id):
 
         r = c.execute("SELECT response_mode FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
 
-    return r["response_mode"] if r else runtime_config_values()["default_voice_reply_mode"]
+    configured_default = canonical_voice_reply_mode(runtime_config_values()["default_voice_reply_mode"])
+    return canonical_voice_reply_mode(r["response_mode"], configured_default) if r else configured_default
 
 
 
 def set_mode(chat_id, mode):
+
+    mode = str(mode or "").strip().lower()
+    if mode not in VOICE_REPLY_MODES:
+        raise ValueError("Invalid voice reply mode")
 
     with conn() as c:
 
@@ -1855,15 +1871,15 @@ def history(chat_id, n=18):
 
     with conn() as c:
 
-        rs = c.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+        rs = c.execute("SELECT id,role,content,created_at FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
 
                        (chat_id,n)).fetchall()
 
-    # A long OCR/vision response must not make the next ordinary message exceed
-    # a model's context window. The full original is safely kept in knowledge.
     return [{
+        "message_id": r["id"],
         "role": r["role"],
-        "content": (sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""))[:1400],
+        "content": sanitize_visible_content(r["content"]) if r["role"] == "assistant" else str(r["content"] or ""),
+        "created_at": r["created_at"],
     } for r in reversed(rs)]
 
 
@@ -3708,11 +3724,37 @@ def stream_progress_for_tool(name):
     """Only report an action after its corresponding tool was actually run."""
     if name in {"knowledge_search", "knowledge_get", "knowledge_files"}:
         return "Вспоминаю…"
+    if name in {"get_today_plan", "add_task", "update_task", "delete_task", "set_reminder", "update_reminder", "delete_reminder"}:
+        return "Проверяю задачи…"
+    if name in {"get_expenses", "add_expense", "add_income", "update_expense", "delete_expense", "update_last_expense"}:
+        return "Смотрю бюджет…"
     if name in {"get_weather", "internet_search"}:
         return "Проверяю информацию…"
     if name in WRITE_TOOLS:
         return "Сохраняю изменения…"
     return "Выполняю действие…"
+
+
+RUNTIME_STATES = {"IDLE", "REQUESTING", "MEMORY", "TOOL", "STREAMING", "SPEAKING", "ERROR"}
+
+
+def runtime_state_event(state, *, text="", tool=""):
+    """One channel-neutral, truthful visual runtime-state contract."""
+    state = str(state or "").upper()
+    if state not in RUNTIME_STATES:
+        raise ValueError("Unknown runtime state")
+    event = {"type": "state", "state": state}
+    if text:
+        event["text"] = text
+    if tool:
+        event["tool"] = tool
+    return event
+
+
+def runtime_state_for_tool(name):
+    label = stream_progress_for_tool(name)
+    state = "MEMORY" if name in {"knowledge_search", "knowledge_get", "knowledge_files"} else "TOOL"
+    return runtime_state_event(state, text=label, tool=name)
 
 
 def stream_agent_response(chat_id, text, cancel_event=None):
@@ -3723,13 +3765,15 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         yield {"type": "cancelled"}
         return
     # A truthful pre-stream state: no claim about a search or tool is made.
-    yield {"type": "progress", "text": "Думаю…"}
+    yield runtime_state_event("REQUESTING", text="Думаю…")
     live = direct_live_request(text)
     if live is not None:
-        add_message(chat_id, "user", text)
+        canonical_user_message_id = add_message(chat_id, "user", text)
         canonical_message_id = add_message(chat_id, "assistant", live)
+        yield runtime_state_event("STREAMING")
         yield {"type": "delta", "text": live}
-        yield {"type": "done", "text": live, "canonical_message_id": canonical_message_id}
+        yield {"type": "done", "text": live, "canonical_message_id": canonical_message_id,
+               "canonical_user_message_id": canonical_user_message_id}
         return
     context_started = time.perf_counter()
     messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
@@ -3783,6 +3827,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                         if not first_visible_marked:
                             first_visible_marked = True
                             record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
+                            yield runtime_state_event("STREAMING")
                         yield {"type": "delta", "text": delta}
                 if contract_violated:
                     record_runtime_metric("reasoning_chunks_dropped", max(1, accumulator.reasoning_chunks_dropped))
@@ -3796,6 +3841,7 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                     if not first_visible_marked:
                         first_visible_marked = True
                         record_runtime_metric("stream_first_visible_ms", (time.perf_counter() - started) * 1000)
+                        yield runtime_state_event("STREAMING")
                     yield {"type": "delta", "text": tail}
                 message = accumulator.message()
                 total_visible_chars += accumulator.visible_chars
@@ -3819,12 +3865,13 @@ def stream_agent_response(chat_id, text, cancel_event=None):
         calls = message.get("tool_calls") or []
         if not calls:
             answer = sanitize_visible_content(message.get("content") or "").strip() or write_confirmation(writes)
-            add_message(chat_id, "user", text)
+            canonical_user_message_id = add_message(chat_id, "user", text)
             canonical_message_id = add_message(chat_id, "assistant", answer)
             record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
             record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
             record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
             yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+                   "canonical_user_message_id": canonical_user_message_id,
                    "elapsed_ms": round((time.perf_counter() - started) * 1000)}
             return
         messages.append(message)
@@ -3843,17 +3890,18 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 writes.append(result)
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
-            yield {"type": "progress", "text": stream_progress_for_tool(name)}
+            yield runtime_state_for_tool(name)
             if cancel_event.is_set():
                 yield {"type": "cancelled"}
                 return
     answer = write_confirmation(writes) if writes else "Не удалось завершить действие."
-    add_message(chat_id, "user", text)
+    canonical_user_message_id = add_message(chat_id, "user", text)
     canonical_message_id = add_message(chat_id, "assistant", answer)
     record_runtime_metric("visible_stream_chars", total_visible_chars or len(answer))
     record_runtime_metric("reasoning_chunks_dropped", total_reasoning_dropped)
     record_runtime_metric("stream_complete_ms", (time.perf_counter() - started) * 1000)
-    yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id}
+    yield {"type": "done", "text": answer, "canonical_message_id": canonical_message_id,
+           "canonical_user_message_id": canonical_user_message_id}
 
 
 def mint_mistral_realtime_session():
@@ -3971,7 +4019,17 @@ async def stream_answer_to_telegram_draft(update, context, text):
             if isinstance(event, Exception):
                 raise event
             kind = event.get("type")
-            if kind == "delta":
+            if kind == "state" and draft_available:
+                label = str(event.get("text") or "").strip()
+                if label:
+                    try:
+                        await context.bot.send_message_draft(
+                            chat_id, draft_id, label,
+                            api_kwargs={"can_stop": True, "keep_on_stop": False},
+                        )
+                    except Exception:
+                        draft_available = False
+            elif kind == "delta":
                 accumulated += event.get("text", "")
                 if draft_available and throttle.should_send(accumulated):
                     try:
@@ -4134,6 +4192,15 @@ async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="te
     return None
 
 
+async def telegram_runtime_action(bot, chat_id, state):
+    """Map shared runtime states to an ephemeral Telegram chat action."""
+    action = "record_voice" if state == "SPEAKING" else "typing"
+    sender = getattr(bot, "send_chat_action", None)
+    if callable(sender):
+        with contextlib.suppress(Exception):
+            await sender(chat_id=chat_id, action=action)
+
+
 async def stream_answer_to_telegram(update, context, text):
     """Deliver one request as one persistent Telegram message edited in place."""
     chat_id = update.effective_chat.id
@@ -4158,7 +4225,7 @@ async def stream_answer_to_telegram(update, context, text):
     sent = None
     editing_available = True
     mode = get_mode(chat_id)
-    effective_mode = "voice_and_text" if wants_voice(text) else ("text" if mode == "auto" else mode)
+    effective_mode = "voice_and_text" if wants_voice(text) else mode
     wants_text = effective_mode in {"text", "voice_and_text"}
     wants_audio = effective_mode in {"voice", "voice_and_text"}
     try:
@@ -4169,7 +4236,9 @@ async def stream_answer_to_telegram(update, context, text):
             if isinstance(event, Exception):
                 raise event
             kind = event.get("type")
-            if kind == "delta":
+            if kind == "state":
+                await telegram_runtime_action(context.bot, chat_id, event.get("state"))
+            elif kind == "delta":
                 accumulated += event.get("text", "")
                 if not wants_text:
                     continue
@@ -4216,6 +4285,7 @@ async def stream_answer_to_telegram(update, context, text):
             if final_message_ids:
                 telegram_message_id = final_message_ids[0]
         if wants_audio and final:
+            await telegram_runtime_action(context.bot, chat_id, "SPEAKING")
             voice_path = await make_voice(final, chat_id=chat_id)
             try:
                 with voice_path.open("rb") as voice_file:
@@ -4652,15 +4722,35 @@ def set_voice_preferences(chat_id, voice=None, speed=1.0, pitch=1.0, volume=1.0)
     return {"ok": True, **get_voice_preferences(chat_id)}
 
 
+def server_tts_provider(runtime=None):
+    """Resolve the current server-capable route used by Telegram and /speech.
+
+    Browser speech synthesis is a Mini App client capability, never a Telegram
+    provider. Edge is the only server-capable implementation in this release.
+    """
+    runtime = runtime or runtime_config_values()
+    for candidate in (runtime.get("tts_provider"), runtime.get("tts_fallback_provider"), "edge"):
+        if str(candidate or "").lower() == "edge":
+            return "edge"
+    return "edge"
+
+
 async def make_voice(text, chat_id=None, preferences=None):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
 
     runtime = runtime_config_values()
+    if chat_id is None and preferences is None:
+        p.unlink(missing_ok=True)
+        raise RuntimeError("TTS_IDENTITY_REQUIRED")
+    provider = server_tts_provider(runtime)
     prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime["tts_male_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
     rate = f"{round((float(prefs['speed']) - 1) * 100):+d}%"
     pitch = f"{round((float(prefs['pitch']) - 1) * 50):+d}Hz"
     volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
+    if provider != "edge":
+        p.unlink(missing_ok=True)
+        raise RuntimeError("TTS_SERVER_PROVIDER_UNAVAILABLE")
     await edge_tts.Communicate(clean_tts(text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
 
     return p
@@ -4679,7 +4769,7 @@ async def send_answer(update,answer,context=None,voice_in=False,force_voice=Fals
 
     mode=get_mode(update.effective_chat.id)
 
-    eff="voice_and_text" if force_voice else (("voice_and_text" if voice_in else "text") if mode=="auto" else mode)
+    eff="voice_and_text" if force_voice else mode
 
     if eff in ("text","voice_and_text"):
         total_emoji_limit = reply_emoji_limit(len(str(answer or "")))
@@ -4701,7 +4791,7 @@ async def send_answer(update,answer,context=None,voice_in=False,force_voice=Fals
 
     if eff in ("voice","voice_and_text"):
 
-        p=await make_voice(answer)
+        p=await make_voice(answer, chat_id=update.effective_chat.id)
 
         try:
 

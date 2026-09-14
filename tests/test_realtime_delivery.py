@@ -441,7 +441,8 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_voice=AsyncMock())
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), effective_message=message)
 
-        async def voice_file(_text):
+        async def voice_file(_text, *, chat_id=None):
+            self.assertEqual(chat_id, 42)
             handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             handle.write(b"ID3")
             handle.close()
@@ -491,7 +492,11 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             bot.add_message(42, "assistant", "<think>Нужно ответить</think>Готово")
             stored = database.execute("SELECT content FROM messages").fetchone()["content"]
             self.assertEqual(stored, "Готово")
-            self.assertEqual(bot.history(42), [{"role": "assistant", "content": "Готово"}])
+            item = bot.history(42)[0]
+            self.assertEqual(item["message_id"], 1)
+            self.assertEqual(item["role"], "assistant")
+            self.assertEqual(item["content"], "Готово")
+            self.assertTrue(item["created_at"])
         database.close()
 
 

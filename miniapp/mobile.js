@@ -24,13 +24,12 @@
  document.addEventListener('pointerdown',e=>{const node=e.target.closest('.grid>[data-widget]');if(!node||busy||saving||e.button!==0||e.target.closest('.home-widget-hide'))return;pending={node,id:e.pointerId,x:e.clientX,y:e.clientY,widget:node.dataset.widget};if(window.homeEditing){beginDrag(node,pending);return}timer=setTimeout(()=>{if(!pending)return;pending=null;window.homeEditing=true;held=true;render();tg?.HapticFeedback?.impactOccurred('light');setTimeout(()=>held=false,350)},420)});
  document.addEventListener('pointermove',e=>{if(!pending)return;if(!drag){if(Math.hypot(e.clientX-pending.x,e.clientY-pending.y)>10){clearTimeout(timer);pending=null}return}e.preventDefault();drag.x=e.clientX;drag.y=e.clientY},{passive:false});
  document.addEventListener('pointerup',()=>finish());document.addEventListener('pointercancel',()=>finish(true));document.addEventListener('touchmove',e=>{if(drag)e.preventDefault()},{passive:false});document.addEventListener('contextmenu',e=>{if(e.target.closest('[data-widget]'))e.preventDefault()});
- function viewport(){const v=window.visualViewport;document.documentElement.style.setProperty('--visible-height',(v?.height||innerHeight)+'px');document.documentElement.style.setProperty('--keyboard-inset',Math.max(0,innerHeight-(v?.height||innerHeight)-(v?.offsetTop||0))+'px');window.NoemaChatScroll?.handleViewportResize?.()}
- window.visualViewport?.addEventListener('resize',viewport);window.visualViewport?.addEventListener('scroll',viewport);window.addEventListener('resize',viewport);viewport();
+ window.NoemaChatViewport?.bindBrowser?.();
 
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
- function edgeSwipeStartZone(){return Math.min(144,Math.max(72,innerWidth*.34))}
+ function edgeSwipeStartZone(){return Math.min(72,Math.max(48,innerWidth*.16))}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
  function blocksEdgeSwipe(target){return Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.bars,.trend,.distribution-body,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
  function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
@@ -44,7 +43,7 @@
   const current=Math.max(0,edgeSwipe?.rendered||0),distance=commit?innerWidth:0,remaining=Math.abs(distance-current);
   const projectedSpeed=Math.max(.55,Math.abs(velocity)*1.35),duration=Math.round(Math.min(commit?310:250,Math.max(commit?170:150,remaining/projectedSpeed)));
   shell.style.setProperty('--edge-swipe-duration',duration+'ms');shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',distance+'px');shell.style.setProperty('--edge-swipe-progress',commit?1:0);
-  let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);shell.classList.remove('edge-swipe-settling');if(commit){shell.classList.add('edge-swipe-reset');back();shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');void shell.offsetWidth;shell.classList.remove('edge-swipe-reset')}else{shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress')}shell.style.removeProperty('--edge-swipe-duration');edgeSwipeFinishing=false};
+  let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);shell.classList.remove('edge-swipe-settling');if(commit){shell.classList.add('edge-swipe-reset');window.NoemaBack?.();shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');void shell.offsetWidth;shell.classList.remove('edge-swipe-reset')}else{shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress')}shell.style.removeProperty('--edge-swipe-duration');edgeSwipeFinishing=false};
   const onEnd=event=>{if(event.target===shell&&event.propertyName==='transform')complete()};shell.addEventListener('transitionend',onEnd);edgeSwipeTimer=setTimeout(complete,duration+80)
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false,edgeSwipe.velocity);else if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0}edgeSwipe=null}

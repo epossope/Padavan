@@ -288,12 +288,16 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
     def test_boot_requests_fullscreen_with_expand_fallback_and_safe_area(self):
         root = Path(__file__).parent.parent / "miniapp"
         source = (root / "screens.js").read_text(encoding="utf-8")
+        app_source = (root / "app.js").read_text(encoding="utf-8")
         css = (root / "design-match.css").read_text(encoding="utf-8")
-        self.assertLess(source.index("tg.ready()"), source.index("tg.expand()"))
-        self.assertIn("typeof tg.requestFullscreen==='function'", source)
-        self.assertIn("tg.requestFullscreen()", source)
-        self.assertIn("tg.safeAreaInset", source)
-        self.assertIn("tg.contentSafeAreaInset", source)
+        self.assertLess(app_source.index("tg.ready()"), app_source.index("tg.expand()"))
+        self.assertIn("typeof tg.requestFullscreen==='function'", app_source)
+        self.assertIn("tg.requestFullscreen()", app_source)
+        self.assertIn("tg?.safeAreaInset", app_source)
+        self.assertIn("tg?.contentSafeAreaInset", app_source)
+        for event in ("safeAreaChanged", "contentSafeAreaChanged", "viewportChanged", "fullscreenChanged", "fullscreenFailed"):
+            self.assertIn(event, app_source)
+        self.assertIn("bindTelegram", source)
         self.assertIn("--app-safe-top", css)
         self.assertIn("--app-safe-bottom", css)
 
@@ -303,7 +307,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (root / "app.js").read_text(encoding="utf-8")
         screen_source = (root / "screens.js").read_text(encoding="utf-8")
         mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
-        self.assertEqual(index.count("?v=ui-1.7.0"), 11)
+        self.assertEqual(index.count("?v=ui-1.8.0"), 11)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", app_source)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", screen_source)
         self.assertNotIn("if(homeEditing", mobile_source)

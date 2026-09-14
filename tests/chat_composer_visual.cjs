@@ -38,7 +38,7 @@ async function setInput(page,value){
  await setInput(before,'Первая строка\nВторая строка\nТретья строка\nЧетвёртая строка\nПятая строка\nШестая строка');
  await before.screenshot({path:path.join(proofDir,'before-375-multiline.png')});
  await setInput(before,'');
- await before.locator('.chat-sphere-slot').screenshot({path:path.join(proofDir,'before-sphere-square.png')});
+ await before.locator('.chat-voice-orb').screenshot({path:path.join(proofDir,'before-sphere-square.png')});
  await before.close();
 
  const after=await openChat(browser);
@@ -48,18 +48,17 @@ async function setInput(page,value){
  await setInput(after,'Первая строка\nВторая строка\nТретья строка\nЧетвёртая строка\nПятая строка\nШестая строка');
  await after.screenshot({path:path.join(proofDir,'after-375-multiline.png')});
  await setInput(after,'');
- await after.locator('.chat-sphere-slot').screenshot({path:path.join(proofDir,'after-sphere-transparent.png')});
+ await after.locator('.chat-voice-orb').screenshot({path:path.join(proofDir,'after-sphere-transparent.png')});
  for(const state of ['idle','listening','thinking','responding']){
   await after.evaluate(value=>window.NoemaMembrane?.setState(value),state);
   await after.waitForTimeout(180);
-  await after.locator('.chat-sphere-slot').screenshot({path:path.join(proofDir,`after-sphere-${state}.png`)});
+  await after.locator('.chat-voice-orb').screenshot({path:path.join(proofDir,`after-sphere-${state}.png`)});
  }
 
  const contract=await after.evaluate(()=>{
   const composer=document.querySelector('.chat-composer');
   const input=document.querySelector('.chat-input-area');
   const textarea=document.querySelector('#chat-input');
-  const slot=document.querySelector('.chat-sphere-slot');
   const orb=document.querySelector('.chat-voice-orb');
   const canvas=orb.querySelector('canvas');
   const textareaStyle=getComputedStyle(textarea);
@@ -67,7 +66,7 @@ async function setInput(page,value){
    composerWidth:composer.getBoundingClientRect().width,
    contentWidth:document.querySelector('#content').getBoundingClientRect().width,
    inputWidth:input.getBoundingClientRect().width,
-   slotWidth:slot.getBoundingClientRect().width,
+   orbWidth:orb.getBoundingClientRect().width,
    grid:getComputedStyle(composer).gridTemplateColumns,
    textarea:{maxHeight:textareaStyle.maxHeight,overflowY:textareaStyle.overflowY,overflowWrap:textareaStyle.overflowWrap},
    orb:{background:getComputedStyle(orb).backgroundImage,filter:getComputedStyle(orb).filter},

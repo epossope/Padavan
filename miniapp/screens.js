@@ -122,6 +122,7 @@ go=function(next){if(next!==page)navHistory.push(page);if(next!=='home')window.h
 function syncSystemBackButton(){if(!tg?.BackButton)return;const modalOpen=[...document.querySelectorAll('dialog')].some(dialog=>dialog.open),canGoBack=page!=='home'||navHistory.length>0||modalOpen;canGoBack?tg.BackButton.show():tg.BackButton.hide()}
 window.NoemaSyncBackButton=syncSystemBackButton;
 function back(){if(document.querySelector('#archive-preview')?.open){document.querySelector('#archive-preview').close();syncSystemBackButton();return}if(document.querySelector('#layout-editor').open){document.querySelector('#layout-editor').close();syncSystemBackButton();return}if(document.querySelector('#editor').open){document.querySelector('#editor').close();syncSystemBackButton();return}page=navHistory.pop()||'home';search='';filter='all';taskFilter='all';noteFilter='all';peopleFilter='all';render()}
+window.NoemaBack=back;
 async function saveHomeWidgets(widgets){const previous=[...(data.settings.home_widgets||defaultWidgets)];data.settings.home_widgets=[...widgets];render();if(preview)return;try{await api('home_layout',{widgets})}catch(e){data.settings.home_widgets=previous;render();say(e.message)}}
 function openLayout(){layoutDraft=[...(data.settings.home_widgets||defaultWidgets)];drawLayout();showDialog(document.querySelector('#layout-editor'))}
 function drawLayout(){document.querySelector('#layout-items').innerHTML=layoutDraft.map((type,i)=>`<div class="layout-row" draggable="true" data-index="${i}"><select aria-label="Виджет ${i+1}" data-replace="${i}">${Object.entries(widgetNames).filter(([k])=>k===type||!layoutDraft.includes(k)).map(([k,v])=>`<option value="${k}" ${k===type?'selected':''}>${v}</option>`).join('')}</select><button data-move="${i}" data-step="-1" aria-label="Выше" ${i===0?'disabled':''}>↑</button><button data-move="${i}" data-step="1" aria-label="Ниже" ${i===layoutDraft.length-1?'disabled':''}>↓</button><button data-hide="${i}" aria-label="Скрыть ${widgetNames[type]}">×</button></div>`).join('')+`<div class="toolbar">${Object.entries(widgetNames).filter(([k])=>!layoutDraft.includes(k)).map(([k,v])=>`<button class="secondary" data-add-widget="${k}">+ ${v}</button>`).join('')}</div>`}
@@ -168,27 +169,10 @@ async function loadBudgetConversion(){
  finally{budgetConversionLoading=false;if(page==='budget')render()}
 }
 async function loadBudget(){if(preview){render();return}budgetLoading=true;if(page==='budget')render();try{const result=await api('budget',page==='budget'?budgetRange():{});if(page==='budget'){budgetData=result;budgetConversion=null;budgetConversionError=''}else monthBudget=result}catch(e){say(e.message)}finally{budgetLoading=false;if(['home','budget'].includes(page))render()}}
-function applyTelegramSafeArea(){
- if(!tg)return;
- const safe=tg.safeAreaInset||{},contentSafe=tg.contentSafeAreaInset||{},root=document.documentElement;
- for(const side of ['top','right','bottom','left']){
-  const values=[safe[side],contentSafe[side]].map(Number).filter(Number.isFinite);
-  if(values.length)root.style.setProperty(`--app-safe-${side}`,`${Math.max(0,...values)}px`)
- }
-}
 function prepareTelegramViewport(){
- if(!tg)return;
- tg.ready();
- tg.expand();
- applyTelegramSafeArea();
- tg.onEvent?.('safeAreaChanged',applyTelegramSafeArea);
- tg.onEvent?.('contentSafeAreaChanged',applyTelegramSafeArea);
- tg.onEvent?.('viewportChanged',()=>window.NoemaChatScroll?.handleViewportResize?.());
- try{
-  if(typeof tg.requestFullscreen==='function'&&(!tg.isVersionAtLeast||tg.isVersionAtLeast('8.0')))tg.requestFullscreen()
- }catch{}
+ window.NoemaChatViewport?.bindTelegram?.(tg);
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshStateOnResume()});
 window.addEventListener('focus',refreshStateOnResume);
-async function init(){prepareTelegramViewport();try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.BackButton.onClick(back);document.querySelectorAll('dialog').forEach(dialog=>dialog.addEventListener('close',syncSystemBackButton));const launchPage=new URLSearchParams(location.search).get('screen');if(['settings','chat','tasks','archive','people','budget','reminders'].includes(launchPage)){page=launchPage;navHistory=['home']}render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}}catch(e){say(e.message)}finally{document.querySelector('#splash').classList.add('hidden')}}
+async function init(){prepareTelegramViewport();try{await designReady;tg?.setHeaderColor('#0A0A0A');tg?.setBackgroundColor('#0A0A0A');tg?.BackButton.onClick(back);document.querySelectorAll('dialog').forEach(dialog=>dialog.addEventListener('close',syncSystemBackButton));const launchPage=new URLSearchParams(location.search).get('screen');if(['settings','chat','tasks','archive','people','budget','reminders'].includes(launchPage)){page=launchPage;navHistory=['home']}render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{await load();loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}if(page==='chat')await window.NoemaChatScroll?.whenSettled?.()}catch(e){say(e.message)}finally{document.querySelector('#splash').classList.add('hidden')}}
 init();

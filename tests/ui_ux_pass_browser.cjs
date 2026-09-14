@@ -87,12 +87,12 @@ async function open(browser,width=390){
 
  await page.evaluate(()=>{page='tasks';navHistory=['home'];render()});
  await page.evaluate(()=>{
-  const target=document.elementFromPoint(58,360);
+  const target=document.elementFromPoint(40,360);
   const fire=(type,x,y)=>target.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:'touch',isPrimary:true,pointerId:91,button:0,clientX:x,clientY:y}));
-  fire('pointerdown',58,360);fire('pointermove',118,362);fire('pointermove',205,364);fire('pointerup',205,364);
+  fire('pointerdown',40,360);fire('pointermove',118,362);fire('pointermove',205,364);fire('pointerup',205,364);
  });
  await page.waitForTimeout(420);
- check(await page.evaluate(()=>page==='home'),'wide edge swipe did not navigate back');
+ check(await page.evaluate(()=>page==='home'),'edge swipe did not invoke shared back action');
 
  const nativeContext=await browser.newContext({viewport:{width:390,height:844},deviceScaleFactor:1,hasTouch:true,isMobile:true});
  await nativeContext.route('**/telegram-web-app.js',route=>route.fulfill({contentType:'application/javascript',body:`

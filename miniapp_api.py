@@ -395,6 +395,8 @@ def register_miniapp(app, core):
         if callable(getattr(core, "runtime_config_values", None)):
             runtime = core.runtime_config_values()
             voice_runtime = {key: runtime[key] for key in ("tts_provider", "tts_fallback_provider", "tts_voice", "tts_male_voice", "tts_female_voice")}
+            resolver = getattr(core, "server_tts_provider", None)
+            voice_runtime["server_tts_provider"] = resolver(runtime) if callable(resolver) else "edge"
         effective_ai = None
         if callable(getattr(core, "effective_user_ai_config", None)):
             effective_ai = core.effective_user_ai_config(cid)
@@ -493,7 +495,7 @@ def register_miniapp(app, core):
             if locked is None:
                 raise web.HTTPBadRequest(text="Некорректные настройки голоса")
             preferences = {**(preferences or {}), **locked}
-        path = await core.make_voice(text, user["id"], preferences) if preferences is not None else await core.make_voice(text)
+        path = await core.make_voice(text, user["id"], preferences)
         try:
             body = await asyncio.to_thread(path.read_bytes)
             # These are server-configured route labels, never user data or secrets.
@@ -501,7 +503,8 @@ def register_miniapp(app, core):
             # the underlying provider configuration.
             runtime = core.runtime_config_values() if callable(getattr(core, "runtime_config_values", None)) else {}
             voice_name = "".join(char for char in str((preferences or {}).get("voice") or runtime.get("tts_voice") or getattr(core, "VOICE", "edge") or "edge") if char.isprintable() and char not in "\r\n")[:120] or "edge"
-            engine = str(runtime.get("tts_provider") or "edge").lower()
+            resolver = getattr(core, "server_tts_provider", None)
+            engine = resolver(runtime) if callable(resolver) else "edge"
             return web.Response(body=body, content_type="audio/mpeg", headers={
                 "Cache-Control": "no-store",
                 "X-Noema-TTS-Engine": engine,
@@ -620,17 +623,21 @@ def register_miniapp(app, core):
         try:
             await response.write((json.dumps({"type": "job", "job_id": job_id}) + "\n").encode("utf-8"))
             next_watchdog_at = time.monotonic() + 8
+            visible_started = False
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=max(.1, next_watchdog_at - time.monotonic()))
                 except asyncio.TimeoutError:
-                    # No unsupported claim about search/tool activity before
-                    # the core emits a corresponding truthful progress event.
-                    await response.write(json.dumps({"type": "progress", "text": "Думаю…"}, ensure_ascii=False).encode("utf-8") + b"\n")
+                    # A watchdog repeats only the current truthful phase. Once
+                    # visible output starts it must never restore “Думаю…”.
+                    heartbeat = {"type": "state", "state": "STREAMING"} if visible_started else {"type": "state", "state": "REQUESTING", "text": "Думаю…"}
+                    await response.write(json.dumps(heartbeat, ensure_ascii=False).encode("utf-8") + b"\n")
                     next_watchdog_at = time.monotonic() + 8
                     continue
                 if event is None:
                     break
+                if event.get("type") == "delta" and event.get("text"):
+                    visible_started = True
                 await response.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                 if event.get("type") == "done":
                     # Numeric aggregate only: the final text itself is never

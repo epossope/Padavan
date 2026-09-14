@@ -3,6 +3,10 @@
 
 /* 1. Shared system */
 :root{
+  --app-safe-top:env(safe-area-inset-top,0px);
+  --app-safe-right:env(safe-area-inset-right,0px);
+  --app-safe-bottom:env(safe-area-inset-bottom,0px);
+  --app-safe-left:env(safe-area-inset-left,0px);
   --glass-edge:rgba(244,244,242,.15);
   --glass-edge-strong:rgba(244,244,242,.34);
   --glass-highlight:inset 0 1px 0 rgba(255,255,255,.055),inset 1px 0 0 rgba(255,255,255,.018),0 18px 48px rgba(0,0,0,.2);
