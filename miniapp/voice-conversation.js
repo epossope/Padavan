@@ -1,3 +1,4 @@
+window.NoemaBoot?.assetReady?.('voice-conversation.js','__NOEMA_APP_BUILD_ID__');
 /* Local wake/VAD + Voxtral realtime STT, with batch STT fallback.
  * Voice robustness: Silero is primary when it loads; conservative RMS gating
  * keeps the conversation safe on browsers where its WASM cannot load. */

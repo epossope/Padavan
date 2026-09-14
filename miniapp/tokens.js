@@ -1,1 +1,2 @@
-window.designReady=fetch('/app/assets/EAGENT_DESIGN_TOKENS.json').then(r=>{if(!r.ok)throw Error('Design tokens unavailable');return r.json()}).then(tokens=>{for(const [name,value] of Object.entries(tokens))document.documentElement.style.setProperty('--'+name,value)});
+window.NoemaBoot?.assetReady?.('tokens.js','__NOEMA_APP_BUILD_ID__');
+window.designReady=fetch('/app/assets/EAGENT_DESIGN_TOKENS.json?v='+encodeURIComponent(window.NoemaBoot?.APP_BUILD_ID||'__NOEMA_APP_BUILD_ID__')).then(r=>{if(!r.ok)throw Error('Design tokens unavailable');return r.json()}).then(tokens=>{for(const [name,value] of Object.entries(tokens))document.documentElement.style.setProperty('--'+name,value)});

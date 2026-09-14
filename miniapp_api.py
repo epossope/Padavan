@@ -13,6 +13,15 @@ from pathlib import Path
 from aiohttp import web
 
 
+APP_BUILD_ID = "ui-1.10.0"
+BOOT_TELEMETRY_STAGES = {
+    "boot_started", "js_ready", "telegram_ready", "initdata_present",
+    "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
+    "bootstrap_ok", "bootstrap_failed", "render_ready", "boot_timeout",
+    "window_error", "unhandledrejection",
+}
+
+
 def register_miniapp(app, core):
     root = Path(__file__).parent / "miniapp"
     locks = {}
@@ -184,7 +193,37 @@ def register_miniapp(app, core):
                 "currency_totals": totals, "mixed_currencies": len(totals) > 1, **summary}
 
     async def index(request):
-        return web.FileResponse(root / "index.html", headers={"Cache-Control": "no-cache"})
+        html = (root / "index.html").read_text(encoding="utf-8").replace("__NOEMA_APP_BUILD_ID__", APP_BUILD_ID)
+        return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+    async def asset(request):
+        requested = (root / request.match_info.get("filename", "")).resolve()
+        if root.resolve() not in requested.parents or not requested.is_file():
+            raise web.HTTPNotFound()
+        current_build = request.query.get("v") == APP_BUILD_ID
+        headers = {"Cache-Control": "public, max-age=31536000, immutable" if current_build else "no-cache"}
+        if requested.suffix == ".js":
+            source = requested.read_text(encoding="utf-8").replace("__NOEMA_APP_BUILD_ID__", APP_BUILD_ID)
+            return web.Response(text=source, content_type="application/javascript", headers=headers)
+        return web.FileResponse(requested, headers=headers)
+
+    async def boot_telemetry(request):
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            raise web.HTTPBadRequest(text="Некорректная telemetry")
+        stage = str(payload.get("stage") or "") if isinstance(payload, dict) else ""
+        if stage not in BOOT_TELEMETRY_STAGES:
+            raise web.HTTPBadRequest(text="Некорректная telemetry")
+        safe = {key: str(payload.get(key) or "")[:80] for key in ("app_version", "platform", "telegram_version", "code")}
+        if any(any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for char in value)
+               for value in safe.values()):
+            raise web.HTTPBadRequest(text="Некорректная telemetry")
+        logger = getattr(core, "LOGGER", None)
+        if logger:
+            logger.info("miniapp_boot stage=%s app_version=%s platform=%s telegram_version=%s code=%s",
+                        stage, safe["app_version"], safe["platform"], safe["telegram_version"], safe["code"])
+        return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def api(request):
         started = time.perf_counter()
@@ -683,5 +722,6 @@ def register_miniapp(app, core):
     app.router.add_post("/api/v1/miniapp/voice/realtime-token", realtime_token)
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
-    app.router.add_static("/app/assets/", root, show_index=False)
+    app.router.add_post("/api/v1/miniapp/boot-telemetry", boot_telemetry)
+    app.router.add_get("/app/assets/{filename:.*}", asset)
     app.router.add_post("/api/v1/miniapp", api)

@@ -1,3 +1,4 @@
+window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
 /* Long-press sortable grid: floating card follows the pointer; neighbours FLIP. */
 (()=>{
  let pending=null,drag=null,timer=null,frame=null,saving=false,editExitClickUntil=0;

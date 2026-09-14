@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from miniapp_api import register_miniapp
+from miniapp_api import APP_BUILD_ID, register_miniapp
 
 
 class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -67,7 +67,35 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_preview_is_public_but_has_no_user_data(self):
         response = await self.client.get('/app')
         self.assertEqual(response.status, 200)
-        self.assertIn('Noema', await response.text())
+        html = await response.text()
+        self.assertIn('Noema', html)
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
+        self.assertNotIn('__NOEMA_APP_BUILD_ID__', html)
+        self.assertIn(f'?v={APP_BUILD_ID}', html)
+
+    async def test_versioned_assets_are_canonical_and_cacheable(self):
+        current = await self.client.get(f'/app/assets/app.js?v={APP_BUILD_ID}')
+        self.assertEqual(current.status, 200)
+        self.assertEqual(current.headers.get('Cache-Control'), 'public, max-age=31536000, immutable')
+        self.assertIn(APP_BUILD_ID, await current.text())
+
+        stale = await self.client.get('/app/assets/app.js?v=ui-legacy')
+        self.assertEqual(stale.status, 200)
+        self.assertEqual(stale.headers.get('Cache-Control'), 'no-cache')
+
+    async def test_boot_telemetry_is_allowlisted_and_non_sensitive(self):
+        response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
+            'stage': 'bootstrap_failed', 'app_version': APP_BUILD_ID,
+            'platform': 'ios', 'telegram_version': '8.0', 'code': 'API_TIMEOUT',
+        })
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
+        self.core.LOGGER.info.assert_called()
+
+        invalid = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
+            'stage': 'not_a_boot_stage', 'init_data': 'secret',
+        })
+        self.assertEqual(invalid.status, 400)
 
     async def test_vosk_wake_model_is_served_at_runtime_asset_path(self):
         response = await self.client.get('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')
@@ -290,7 +318,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         source = (root / "screens.js").read_text(encoding="utf-8")
         app_source = (root / "app.js").read_text(encoding="utf-8")
         css = (root / "design-match.css").read_text(encoding="utf-8")
-        self.assertLess(app_source.index("tg.ready()"), app_source.index("tg.expand()"))
+        self.assertLess(app_source.index("tg.ready?.()"), app_source.index("tg.expand?.()"))
         self.assertIn("typeof tg.requestFullscreen==='function'", app_source)
         self.assertIn("tg.requestFullscreen()", app_source)
         self.assertIn("tg?.safeAreaInset", app_source)
@@ -307,7 +335,17 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         app_source = (root / "app.js").read_text(encoding="utf-8")
         screen_source = (root / "screens.js").read_text(encoding="utf-8")
         mobile_source = (root / "mobile.js").read_text(encoding="utf-8")
-        self.assertEqual(index.count("?v=ui-1.9.0"), 11)
+        self.assertEqual(index.count("?v=__NOEMA_APP_BUILD_ID__"), 11)
+        self.assertIn("const APP_BUILD_ID='__NOEMA_APP_BUILD_ID__'", index)
+        self.assertIn("BOOT_TIMEOUT_MS=10000", index)
+        self.assertIn("controlledReload", index)
+        self.assertIn("boot-recovery", index)
+        self.assertIn("window.addEventListener('unhandledrejection'", index)
+        self.assertIn("window.addEventListener('error'", index)
+        self.assertIn("AbortController", app_source)
+        self.assertIn("SESSION_EXPIRED", app_source)
+        self.assertIn("waitForTelegram", screen_source)
+        self.assertIn("loadBudget();api('weather')", screen_source)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", app_source)
         self.assertIn("window.homeEditing=Boolean(window.homeEditing)", screen_source)
         self.assertNotIn("if(homeEditing", mobile_source)

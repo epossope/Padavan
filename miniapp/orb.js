@@ -1,3 +1,4 @@
+window.NoemaBoot?.assetReady?.('orb.js','__NOEMA_APP_BUILD_ID__');
 /* A shaded, deformable translucent membrane, rather than a wireframe sphere. */
 (() => {
   const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
