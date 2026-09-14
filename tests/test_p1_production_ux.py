@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -49,7 +50,7 @@ class P1ProductionUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [(42, "get_today_plan", {})])
         tool_index = next(i for i, event in enumerate(events) if event.get("type") == "tool")
         state_index = next(i for i, event in enumerate(events) if event.get("state") == "TOOL")
-        self.assertGreater(state_index, tool_index)
+        self.assertLess(state_index, tool_index)
         self.assertEqual(events[state_index]["text"], "Проверяю задачи…")
         self.assertEqual(events[-1]["canonical_user_message_id"], 71)
         self.assertEqual(events[-1]["canonical_message_id"], 72)
@@ -115,7 +116,7 @@ class P1ProductionUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.server_tts_provider(runtime), "edge")
         database.close()
 
-    async def test_telegram_maps_shared_states_to_ephemeral_chat_actions(self):
+    async def test_telegram_maps_shared_states_to_ephemeral_chat_actions_and_status_card(self):
         telegram = SimpleNamespace(
             send_chat_action=AsyncMock(),
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=91)),
@@ -138,6 +139,25 @@ class P1ProductionUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.stream_answer_to_telegram(update, SimpleNamespace(bot=telegram), "test"))
         self.assertGreaterEqual(telegram.send_chat_action.await_count, 3)
         self.assertTrue(all(call.kwargs["action"] == "typing" for call in telegram.send_chat_action.await_args_list))
+
+
+    def test_user_voice_preferences_store_only_gender_and_use_admin_tuning(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.execute("CREATE TABLE app_settings(setting_key TEXT PRIMARY KEY,setting_value TEXT,updated_at TEXT,updated_by INTEGER)")
+        runtime = {
+            "tts_provider": "edge", "tts_fallback_provider": "browser",
+            "tts_male_voice": "male-admin", "tts_female_voice": "female-admin",
+            "tts_default_speed": 1.12, "tts_default_pitch": .9, "tts_default_volume": .8,
+        }
+        with patch.object(bot, "conn", return_value=database), patch.object(bot, "runtime_config_values", return_value=runtime):
+            result = bot.set_voice_preferences(42, "female", speed=.8, pitch=1.5, volume=.2)
+            self.assertTrue(result["ok"])
+            stored = json.loads(database.execute("SELECT setting_value FROM app_settings WHERE setting_key='voice_preferences:42'").fetchone()[0])
+            self.assertEqual(stored, {"gender": "female"})
+            prefs = bot.get_voice_preferences(42)
+            self.assertEqual((prefs["voice"], prefs["speed"], prefs["pitch"], prefs["volume"]), ("female-admin", 1.12, .9, .8))
+        database.close()
 
     async def test_three_voice_modes_have_same_channel_semantics(self):
         app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")

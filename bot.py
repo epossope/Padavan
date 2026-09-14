@@ -87,7 +87,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "0.3"
+BUILD_ID = "0.4-device-fix"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
@@ -151,7 +151,7 @@ TTS_FALLBACK_PROVIDER = os.getenv("TTS_FALLBACK_PROVIDER", "browser").strip().lo
 TELEGRAM_DRAFT_STREAMING_ENABLED = os.getenv("TELEGRAM_DRAFT_STREAMING_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 TELEGRAM_DRAFT_MIN_INTERVAL = max(0.3, float(os.getenv("TELEGRAM_DRAFT_MIN_INTERVAL", "0.4")))
 TELEGRAM_DRAFT_MAX_INTERVAL = max(TELEGRAM_DRAFT_MIN_INTERVAL, float(os.getenv("TELEGRAM_DRAFT_MAX_INTERVAL", "0.5")))
-TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "24")))
+TELEGRAM_DRAFT_MIN_CHARS = max(8, int(os.getenv("TELEGRAM_DRAFT_MIN_CHARS", "12")))
 TELEGRAM_SEND_RETRIES = min(2, max(0, int(os.getenv("TELEGRAM_SEND_RETRIES", "1"))))
 TELEGRAM_CONNECT_TIMEOUT = max(2.0, float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "5")))
 TELEGRAM_READ_TIMEOUT = max(5.0, float(os.getenv("TELEGRAM_READ_TIMEOUT", "15")))
@@ -3881,6 +3881,11 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 return
             name = call.get("function", {}).get("name", "")
             raw = call.get("function", {}).get("arguments", "{}")
+            # The tool call has already been selected by the model, so this is
+            # the truthful point to expose the in-progress state.  Previously
+            # the label was emitted only after execute_tool() returned, which
+            # made Telegram/Mini App appear idle during the slow part.
+            yield runtime_state_for_tool(name)
             try:
                 args = json.loads(raw) if isinstance(raw, str) else raw
                 result = execute_tool(chat_id, name, args or {})
@@ -3890,7 +3895,6 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 writes.append(result)
             messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": json.dumps(result, ensure_ascii=False)})
             yield {"type": "tool", "name": name, "ok": bool(result.get("ok"))}
-            yield runtime_state_for_tool(name)
             if cancel_event.is_set():
                 yield {"type": "cancelled"}
                 return
@@ -4193,12 +4197,55 @@ async def telegram_edit_with_retry(bot, *, chat_id, message_id, text, source="te
 
 
 async def telegram_runtime_action(bot, chat_id, state):
-    """Map shared runtime states to an ephemeral Telegram chat action."""
+    """Map shared runtime states to Telegram's ephemeral native indicator."""
     action = "record_voice" if state == "SPEAKING" else "typing"
     sender = getattr(bot, "send_chat_action", None)
     if callable(sender):
         with contextlib.suppress(Exception):
             await sender(chat_id=chat_id, action=action)
+
+
+def telegram_runtime_label(event):
+    """One human-readable temporary status card for private Telegram chats."""
+    state = str((event or {}).get("state") or "").upper()
+    explicit = str((event or {}).get("text") or "").strip()
+    if state == "REQUESTING":
+        return "🧠 Думаю…"
+    if state == "MEMORY":
+        return "🧠 " + (explicit or "Вспоминаю…")
+    if state == "TOOL":
+        return "🔎 " + (explicit or "Получаю данные…")
+    if state == "STREAMING":
+        return "✍️ Готовлю ответ…"
+    if state == "SPEAKING":
+        return "🎙 Озвучиваю…"
+    if state == "ERROR":
+        return explicit or "Не удалось выполнить запрос."
+    return explicit
+
+
+async def _telegram_progress_update(bot, chat_id, current_message_id, event):
+    """Create or edit exactly one temporary progress card; never persist it."""
+    label = telegram_runtime_label(event)
+    if not label:
+        return current_message_id
+    if current_message_id:
+        if not callable(getattr(bot, "edit_message_text", None)):
+            return current_message_id
+        edited = await telegram_edit_with_retry(
+            bot, chat_id=chat_id, message_id=current_message_id, text=label,
+            source="telegram_runtime_status",
+        )
+        # Never create a second status card if an edit failed; a stale
+        # temporary label is preferable to leaving duplicate service messages.
+        return current_message_id
+    try:
+        sent = await telegram_send_with_retry(
+            bot, source="telegram_runtime_status", chat_id=chat_id, text=label,
+        )
+        return getattr(sent, "message_id", current_message_id)
+    except (BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError):
+        return current_message_id
 
 
 async def stream_answer_to_telegram(update, context, text):
@@ -4223,6 +4270,7 @@ async def stream_answer_to_telegram(update, context, text):
     canonical_message_id = None
     telegram_message_id = None
     sent = None
+    progress_message_id = None
     editing_available = True
     mode = get_mode(chat_id)
     effective_mode = "voice_and_text" if wants_voice(text) else mode
@@ -4238,6 +4286,13 @@ async def stream_answer_to_telegram(update, context, text):
             kind = event.get("type")
             if kind == "state":
                 await telegram_runtime_action(context.bot, chat_id, event.get("state"))
+                # Telegram's native "typing…" indicator does not communicate
+                # Noema's actual stage, so keep one temporary status card until
+                # the streamed preview becomes visible.
+                if sent is None:
+                    progress_message_id = await _telegram_progress_update(
+                        context.bot, chat_id, progress_message_id, event
+                    )
             elif kind == "delta":
                 accumulated += event.get("text", "")
                 if not wants_text:
@@ -4256,6 +4311,9 @@ async def stream_answer_to_telegram(update, context, text):
                     )
                     telegram_message_id = getattr(sent, "message_id", None)
                     throttle.should_send(accumulated, force=True)
+                    if progress_message_id:
+                        await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
+                        progress_message_id = None
                 elif sent is not None and editing_available and throttle.should_send(accumulated):
                     editing_available = bool(await telegram_edit_with_retry(
                         context.bot, chat_id=chat_id, message_id=telegram_message_id,
@@ -4282,6 +4340,9 @@ async def stream_answer_to_telegram(update, context, text):
             )
             if sent is not None:
                 await _remove_telegram_stream_preview(context.bot, chat_id, telegram_message_id)
+            if progress_message_id:
+                await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
+                progress_message_id = None
             if final_message_ids:
                 telegram_message_id = final_message_ids[0]
         if wants_audio and final:
@@ -4302,6 +4363,9 @@ async def stream_answer_to_telegram(update, context, text):
                     request_id, canonical_message_id, telegram_message_id)
         return True
     finally:
+        if progress_message_id:
+            with contextlib.suppress(Exception):
+                await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
         cancelled.set()
         unregister_active_draft(chat_id, request_id)
 
@@ -4686,38 +4750,30 @@ def get_voice_preferences(chat_id):
         saved = {}
     gender = _voice_gender(saved.get("gender") or saved.get("voice"), runtime) or "male"
     voice = runtime["tts_female_voice"] if gender == "female" else runtime["tts_male_voice"]
-    defaults = {"speed": float(runtime["tts_default_speed"]), "pitch": float(runtime["tts_default_pitch"]), "volume": float(runtime["tts_default_volume"])}
-    try:
-        speed = min(1.25, max(.8, float(saved.get("speed", defaults["speed"]))))
-        pitch = min(1.5, max(.5, float(saved.get("pitch", defaults["pitch"]))))
-        volume = min(1.0, max(.2, float(saved.get("volume", defaults["volume"]))))
-    except (TypeError, ValueError):
-        speed, pitch, volume = defaults["speed"], defaults["pitch"], defaults["volume"]
+    # All acoustic parameters are global admin settings.  Legacy per-user
+    # speed/pitch/volume values may remain in storage, but are deliberately
+    # ignored so an admin change applies to everyone immediately.
+    speed = min(1.25, max(.8, float(runtime["tts_default_speed"])))
+    pitch = min(1.5, max(.5, float(runtime["tts_default_pitch"])))
+    volume = min(1.0, max(.2, float(runtime["tts_default_volume"])))
     engine = str(runtime["tts_provider"] or "edge").lower()
     return {"gender": gender, "voice": voice, "speed": speed, "pitch": pitch, "volume": volume, "engine": engine,
-            "supports_pitch": engine in {"edge", "browser"}, "supports_volume": engine in {"edge", "browser"}}
+            "supports_pitch": False, "supports_volume": False}
 
 
 def normalize_voice_preferences(voice, speed=1.0, pitch=1.0, volume=1.0):
+    """Normal users store only male/female; tuning belongs to the admin."""
     runtime = runtime_config_values()
     gender = _voice_gender(voice, runtime)
-    if gender is None:
-        return None
-    try:
-        speed, pitch, volume = float(speed), float(pitch), float(volume)
-    except (TypeError, ValueError):
-        return None
-    if not .8 <= speed <= 1.25 or not .5 <= pitch <= 1.5 or not .2 <= volume <= 1.0:
-        return None
-    return {"gender": gender, "speed": round(speed, 2), "pitch": round(pitch, 2), "volume": round(volume, 2)}
+    return {"gender": gender} if gender is not None else None
 
 
 def set_voice_preferences(chat_id, voice=None, speed=1.0, pitch=1.0, volume=1.0):
     value = normalize_voice_preferences(voice, speed, pitch, volume)
     if value is None:
         return {"ok": False, "error": "invalid_voice_preferences"}
-    # Persist only semantic gender and supported user controls.  The concrete
-    # id is selected live from the admin's male/female configuration.
+    # Persist only semantic gender.  Concrete voice, speed, pitch and volume
+    # are resolved live from the administrator's global configuration.
     set_app_setting(f"voice_preferences:{int(chat_id)}", json.dumps(value, ensure_ascii=False), updated_by=chat_id)
     return {"ok": True, **get_voice_preferences(chat_id)}
 
@@ -5474,18 +5530,6 @@ async def callback(update,context):
         text, markup = voice_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
 
-    if q.data.startswith("voice:speed:"):
-        if q.data == "voice:speed:noop":
-            return
-        direction = q.data.rsplit(":", 1)[-1]
-        if direction not in {"down", "up"}:
-            return
-        prefs = get_voice_preferences(q.message.chat_id)
-        speed = min(1.25, max(.8, round(prefs["speed"] + (-.1 if direction == "down" else .1), 2)))
-        set_voice_preferences(q.message.chat_id, prefs["gender"], speed, prefs["pitch"], prefs["volume"])
-        text, markup = voice_settings_page(q.message.chat_id)
-        return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
-
     if q.data.startswith("voice:gender:"):
         gender = q.data.rsplit(":", 1)[-1]
         if gender not in {"male", "female"}:
@@ -6190,22 +6234,16 @@ def mode_keyboard(chat_id):
 
 def voice_settings_page(chat_id):
     prefs = get_voice_preferences(chat_id)
-    speed = float(prefs["speed"])
     rows = [[
         InlineKeyboardButton(("● " if prefs["gender"] == "male" else "○ ") + "Мужской", callback_data="voice:gender:male"),
         InlineKeyboardButton(("● " if prefs["gender"] == "female" else "○ ") + "Женский", callback_data="voice:gender:female"),
-    ], [
-        InlineKeyboardButton("−", callback_data="voice:speed:down" if speed > .8 else "voice:speed:noop"),
-        InlineKeyboardButton(f"{speed:.2f}×", callback_data="voice:speed:noop"),
-        InlineKeyboardButton("+", callback_data="voice:speed:up" if speed < 1.25 else "voice:speed:noop"),
     ]]
     if QUICK_ACTIONS_BASE_URL:
-        rows.append([InlineKeyboardButton("Открыть расширенные настройки", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
+        rows.append([InlineKeyboardButton("Открыть настройки Noema", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
     rows.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
     text = ("<b>🎙 Голос</b>\n"
-            f"Выбор: <b>{'Мужской' if prefs['gender'] == 'male' else 'Женский'}</b> · <code>{html.escape(str(prefs['voice']))}</code>\n"
-            f"Скорость: <b>{speed:.2f}×</b>\n\n"
-            "Идентификатор голоса задаёт администратор; тон и громкость доступны в Mini App.")
+            f"Выбор: <b>{'Мужской' if prefs['gender'] == 'male' else 'Женский'}</b>\n\n"
+            "Конкретный голос, скорость, высоту и громкость задаёт администратор Noema.")
     return text, live_markup(InlineKeyboardMarkup(rows))
 
 

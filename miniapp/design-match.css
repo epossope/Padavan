@@ -1200,3 +1200,33 @@ dialog[tabindex="-1"]:focus{outline:none}
   .chat-screen .chat-composer{--chat-sphere-size:84px;min-height:56px}
   .chat-screen .chat-composer>.chat-voice-orb{right:-4px;bottom:-15px}
 }
+
+
+/* Device QA fixes — one dock geometry on every non-chat screen. */
+#dock{grid-template-columns:minmax(0,1.3fr) 116px minmax(0,.7fr)}
+#dock .orb-button{width:116px;height:116px}
+#dock .focus-pill{
+  width:100%;max-width:152px;min-height:70px;padding:11px 13px;overflow:visible;
+  isolation:isolate;background:rgba(8,9,9,.70);
+  -webkit-backdrop-filter:blur(20px) brightness(.34) saturate(.72);
+  backdrop-filter:blur(20px) brightness(.34) saturate(.72);
+}
+#dock .focus-pill:before{
+  inset:-3px -5px -4px -5px;border-color:rgba(244,244,242,.2);
+  border-radius:28% 72% 61% 39%/47% 33% 67% 53%;
+  background:radial-gradient(circle at 76% 35%,rgba(255,255,255,.08),transparent 34%),linear-gradient(138deg,rgba(18,19,19,.82),rgba(4,5,5,.76));
+  box-shadow:inset -4px 1px 9px rgba(255,255,255,.15),inset 0 0 24px rgba(0,0,0,.5),0 10px 28px rgba(0,0,0,.4);
+  -webkit-backdrop-filter:blur(20px) brightness(.30);backdrop-filter:blur(20px) brightness(.30);
+}
+#dock .focus-pill span{color:rgba(247,247,244,.95);font-size:12.5px;line-height:1.34;text-shadow:0 1px 8px rgba(0,0,0,.95)}
+@media(max-width:430px){
+  #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 112px minmax(0,.7fr)}
+  #dock .orb-button{width:112px;height:112px}
+  #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:142px;min-height:68px;padding:10px 12px}
+}
+@media(max-width:370px){
+  #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 106px minmax(0,.7fr)}
+  #dock .orb-button{width:106px;height:106px}
+  #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:124px;min-height:64px;padding:9px 10px}
+  #dock .focus-pill span{font-size:11px}
+}

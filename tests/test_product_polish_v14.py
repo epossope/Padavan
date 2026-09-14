@@ -60,28 +60,45 @@ class ProductPolishV14Tests(unittest.TestCase):
         self.assertEqual("Привет 😊 ✅. Цена 500 ₽.", visible)
 
     def test_voice_preferences_are_per_user_and_validated(self):
+        bot.set_admin_runtime_config(1, "tts_default_speed", .93)
+        bot.set_admin_runtime_config(1, "tts_default_pitch", .88)
+        bot.set_admin_runtime_config(1, "tts_default_volume", .79)
         self.assertTrue(bot.set_voice_preferences(74, "ru-RU-SvetlanaNeural", .8, .9, .7)["ok"])
         prefs = bot.get_voice_preferences(74)
-        self.assertEqual(.8, prefs["speed"])
-        self.assertEqual("ru-RU-SvetlanaNeural", prefs["voice"])
+        self.assertEqual("female", prefs["gender"])
+        self.assertEqual((.93, .88, .79), tuple(prefs[key] for key in ("speed", "pitch", "volume")))
+        self.assertEqual('{"gender": "female"}', bot.app_setting("voice_preferences:74"))
         self.assertFalse(bot.set_voice_preferences(74, "bad voice <x>", 1, 1, 1)["ok"])
-        self.assertEqual(1.0, bot.get_voice_preferences(75)["speed"])
+        other_user = bot.get_voice_preferences(75)
+        self.assertEqual("male", other_user["gender"])
+        self.assertEqual((.93, .88, .79), tuple(other_user[key] for key in ("speed", "pitch", "volume")))
 
-    def test_admin_voice_defaults_apply_live_until_user_overrides_them(self):
+    def test_admin_voice_defaults_remain_authoritative_for_users(self):
         bot.set_admin_runtime_config(1, "tts_default_speed", .8)
         bot.set_admin_runtime_config(1, "tts_default_pitch", .75)
         bot.set_admin_runtime_config(1, "tts_default_volume", .65)
         self.assertEqual((.8, .75, .65), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
         bot.set_voice_preferences(76, "ru-RU-DmitryNeural", 1.2, 1.1, .9)
-        self.assertEqual((1.2, 1.1, .9), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
+        self.assertEqual("male", bot.get_voice_preferences(76)["gender"])
+        self.assertEqual((.8, .75, .65), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
+        bot.set_admin_runtime_config(1, "tts_default_speed", .95)
+        bot.set_admin_runtime_config(1, "tts_default_pitch", 1.25)
+        bot.set_admin_runtime_config(1, "tts_default_volume", .8)
+        self.assertEqual((.95, 1.25, .8), tuple(bot.get_voice_preferences(76)[key] for key in ("speed", "pitch", "volume")))
 
     def test_telegram_voice_settings_are_compact_and_open_miniapp(self):
         with patch.object(bot, "QUICK_ACTIONS_BASE_URL", "https://noema.example"):
             text, markup = bot.voice_settings_page(77)
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row if button.callback_data]
+        labels = [button.text for row in markup.inline_keyboard for button in row]
         webapps = [button.web_app.url for row in markup.inline_keyboard for button in row if button.web_app]
-        self.assertIn("Скорость", text)
-        self.assertIn("voice:speed:up", callbacks)
+        voice_callbacks = {callback for callback in callbacks if callback.startswith("voice:")}
+        self.assertEqual({"voice:gender:male", "voice:gender:female"}, voice_callbacks)
+        self.assertEqual({"voice:gender:male", "voice:gender:female", "settings:back"}, set(callbacks))
+        self.assertTrue(any("Мужской" in label for label in labels))
+        self.assertTrue(any("Женский" in label for label in labels))
+        self.assertFalse(any("Dmitry" in label or "Svetlana" in label for label in labels))
+        self.assertIn("Конкретный голос, скорость, высоту и громкость задаёт администратор Noema.", text)
         self.assertEqual(["https://noema.example/app?screen=settings"], webapps)
         settings_callbacks = [button.callback_data for row in bot.settings_keyboard(77).inline_keyboard for button in row if button.callback_data]
         self.assertIn("settings:voice", settings_callbacks)

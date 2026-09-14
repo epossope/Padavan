@@ -29,7 +29,7 @@
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
- function edgeSwipeStartZone(){return Math.min(72,Math.max(48,innerWidth*.16))}
+ function edgeSwipeStartZone(){return innerWidth*.5}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
  function blocksEdgeSwipe(target){return Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.bars,.trend,.distribution-body,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
  function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}

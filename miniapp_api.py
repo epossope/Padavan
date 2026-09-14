@@ -295,7 +295,7 @@ def register_miniapp(app, core):
                 # ``gender`` is the only user-selectable voice identity.  It
                 # resolves to the current admin male/female slot at request
                 # time, so an admin voice change applies live to all users.
-                result = await asyncio.to_thread(core.set_voice_preferences, cid, args.get("gender", args.get("voice")), args.get("speed", 1), args.get("pitch", 1), args.get("volume", 1))
+                result = await asyncio.to_thread(core.set_voice_preferences, cid, args.get("gender", args.get("voice")))
                 if not result.get("ok"):
                     raise ValueError("Некорректные настройки голоса")
             elif action == "person_avatar_remove":
@@ -402,7 +402,7 @@ def register_miniapp(app, core):
             effective_ai = core.effective_user_ai_config(cid)
         voice_preferences = core.get_voice_preferences(cid) if callable(getattr(core, "get_voice_preferences", None)) else {
             "voice": voice_runtime.get("tts_voice", "edge"), "speed": 1.0, "pitch": 1.0, "volume": 1.0,
-            "engine": voice_runtime.get("tts_provider", "edge"), "supports_pitch": True, "supports_volume": True,
+            "engine": voice_runtime.get("tts_provider", "edge"), "supports_pitch": False, "supports_volume": False,
         }
         return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
                 "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
