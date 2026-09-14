@@ -123,9 +123,8 @@ def env_first(*names, default=""):
 
 DEFAULT_FAST_MODEL = "qwen/qwen3.5-flash-02-23"
 DEFAULT_STRONG_MODEL = "deepseek/deepseek-v3.2"
-LEGACY_FALLBACK_MODELS = [x.strip() for x in os.getenv("FALLBACK_MODELS", "").split(",") if x.strip()]
-FAST_MODEL = env_first("FAST_MODEL", "MODEL", default=DEFAULT_FAST_MODEL)
-STRONG_MODEL = env_first("STRONG_MODEL", default=(LEGACY_FALLBACK_MODELS[0] if LEGACY_FALLBACK_MODELS else DEFAULT_STRONG_MODEL))
+FAST_MODEL = env_first("FAST_MODEL", default=DEFAULT_FAST_MODEL)
+STRONG_MODEL = env_first("STRONG_MODEL", default=DEFAULT_STRONG_MODEL)
 FAST_MODEL_PROVIDERS = csv_env("FAST_MODEL_PROVIDERS")
 STRONG_MODEL_PROVIDERS = csv_env("STRONG_MODEL_PROVIDERS")
 FAST_MODEL_ALLOW_PROVIDER_FALLBACK = bool_env("FAST_MODEL_ALLOW_PROVIDER_FALLBACK", False)
@@ -244,10 +243,13 @@ TELEMETRY_BENCHMARK_STARTED_AT = None
 
 LOGGER = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = list(csv_env("MODEL_CATALOG") or csv_env("AVAILABLE_MODELS") or (
-    "google/gemini-2.5-flash", "google/gemini-2.5-pro",
-    "anthropic/claude-sonnet-4", "openai/gpt-4.1",
-))
+MODEL_CATALOG = list(dict.fromkeys((*(
+    csv_env("MODEL_CATALOG") or (
+        DEFAULT_FAST_MODEL, DEFAULT_STRONG_MODEL,
+        "google/gemini-2.5-flash", "google/gemini-2.5-pro",
+        "anthropic/claude-sonnet-4", "openai/gpt-4.1",
+    )
+), FAST_MODEL, STRONG_MODEL)))
 
 
 
@@ -891,14 +893,13 @@ def set_app_setting(key, value, updated_by=None):
 
 RUNTIME_CONFIG_KEY = "admin_runtime_config_v1"
 RUNTIME_CONFIG_FIELDS = (
-    "global_model_mode", "global_force_model",
     "global_vision_mode", "global_force_vision_model",
     "fast_model", "fast_model_providers", "fast_model_allow_provider_fallback",
     "strong_model", "strong_model_providers", "strong_model_allow_provider_fallback",
     "vision_model", "vision_fallback_models", "batch_stt_model",
     "tts_provider", "tts_fallback_provider", "tts_voice", "tts_male_voice", "tts_female_voice",
     "tts_default_speed", "tts_default_pitch", "tts_default_volume", "default_voice_reply_mode",
-    "realtime_model", "model_catalog",
+    "realtime_model",
 )
 _MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,200}$")
 _PROVIDER_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/+\-]{1,120}$")
@@ -918,14 +919,12 @@ def _env_float(name, default, minimum, maximum):
 def _runtime_env_defaults():
     """Safe startup values and their provenance; no secrets are represented here."""
     return {
-        "global_model_mode": (os.getenv("GLOBAL_MODEL_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_MODEL_MODE") else "DEFAULT"),
-        "global_force_model": (os.getenv("GLOBAL_FORCE_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_MODEL") else "DEFAULT"),
         "global_vision_mode": (os.getenv("GLOBAL_VISION_MODE", "auto").strip().lower(), "ENV" if _env_is_set("GLOBAL_VISION_MODE") else "DEFAULT"),
         "global_force_vision_model": (os.getenv("GLOBAL_FORCE_VISION_MODEL", "").strip(), "ENV" if _env_is_set("GLOBAL_FORCE_VISION_MODEL") else "DEFAULT"),
-        "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL", "MODEL") else "DEFAULT"),
+        "fast_model": (FAST_MODEL, "ENV" if _env_is_set("FAST_MODEL") else "DEFAULT"),
         "fast_model_providers": (list(FAST_MODEL_PROVIDERS), "ENV" if _env_is_set("FAST_MODEL_PROVIDERS") else "DEFAULT"),
         "fast_model_allow_provider_fallback": (FAST_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("FAST_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
-        "strong_model": (STRONG_MODEL, "ENV" if _env_is_set("STRONG_MODEL", "FALLBACK_MODELS") else "DEFAULT"),
+        "strong_model": (STRONG_MODEL, "ENV" if _env_is_set("STRONG_MODEL") else "DEFAULT"),
         "strong_model_providers": (list(STRONG_MODEL_PROVIDERS), "ENV" if _env_is_set("STRONG_MODEL_PROVIDERS") else "DEFAULT"),
         "strong_model_allow_provider_fallback": (STRONG_MODEL_ALLOW_PROVIDER_FALLBACK, "ENV" if _env_is_set("STRONG_MODEL_ALLOW_PROVIDER_FALLBACK") else "DEFAULT"),
         "vision_model": (VISION_MODEL, "ENV" if _env_is_set("VISION_MODEL") else "DEFAULT"),
@@ -945,7 +944,8 @@ def _runtime_env_defaults():
         "tts_default_volume": (_env_float("TTS_DEFAULT_VOLUME", 1.0, .2, 1.0), "ENV" if _env_is_set("TTS_DEFAULT_VOLUME") else "DEFAULT"),
         "default_voice_reply_mode": (canonical_voice_reply_mode(DEFAULT_MODE), "ENV" if _env_is_set("VOICE_REPLY_MODE") else "DEFAULT"),
         "realtime_model": (MISTRAL_REALTIME_MODEL, "ENV" if _env_is_set("MISTRAL_REALTIME_MODEL") else "DEFAULT"),
-        "model_catalog": (list(AVAILABLE_MODELS), "ENV" if _env_is_set("MODEL_CATALOG", "AVAILABLE_MODELS") else "DEFAULT"),
+        # Read-only membership: admins select ``fast_model`` from this catalogue.
+        "model_catalog": (list(MODEL_CATALOG), "ENV" if _env_is_set("MODEL_CATALOG") else "DEFAULT"),
     }
 
 
@@ -991,18 +991,20 @@ def _normalise_runtime_config_value(field, value):
         clean = str(value or "").strip()
         if not clean or not _MODEL_VALUE_RE.fullmatch(clean):
             raise ValueError("Invalid model or voice value")
+        if field == "fast_model" and clean not in MODEL_CATALOG:
+            raise ValueError("Model is not in MODEL_CATALOG")
         return clean
-    if field in {"global_force_model", "global_force_vision_model"}:
+    if field == "global_force_vision_model":
         clean = str(value or "").strip()
         if clean and not _MODEL_VALUE_RE.fullmatch(clean):
             raise ValueError("Invalid forced model value")
         return clean
-    if field in {"global_model_mode", "global_vision_mode"}:
+    if field == "global_vision_mode":
         clean = str(value or "").strip().lower()
         if clean not in {"auto", "force"}:
             raise ValueError("Invalid global model mode")
         return clean
-    if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models", "model_catalog"}:
+    if field in {"fast_model_providers", "strong_model_providers", "vision_fallback_models"}:
         raw = value if isinstance(value, list) else str(value or "").split(",")
         clean = [str(item).strip() for item in raw if str(item).strip()]
         if len(clean) > 30 or any(not _PROVIDER_VALUE_RE.fullmatch(item) for item in clean):
@@ -1780,24 +1782,6 @@ def provider_preferences_for(model):
                 "allow_fallbacks": allow_fallbacks, "require_parameters": True,
             }
     return None
-
-
-def available_models_for(chat_id):
-    """Default catalogue plus the chat owner's persistent custom choices."""
-    with conn() as c:
-        rows = c.execute("SELECT model, enabled FROM chat_models WHERE chat_id=?", (chat_id,)).fetchall()
-    overrides = {r["model"]: bool(r["enabled"]) for r in rows}
-    models = [model for model in runtime_config_values()["model_catalog"] if overrides.get(model, True)]
-    models += [model for model, enabled in overrides.items() if enabled and model not in models]
-    return models
-
-
-def set_chat_model(chat_id, model, enabled=True):
-    with conn() as c:
-        c.execute("INSERT INTO chat_models(chat_id,model,enabled,created_at) VALUES(?,?,?,?) "
-                  "ON CONFLICT(chat_id,model) DO UPDATE SET enabled=excluded.enabled",
-                  (chat_id, model, 1 if enabled else 0, datetime.now(timezone.utc).isoformat()))
-
 
 
 def get_mode(chat_id):
@@ -5613,7 +5597,7 @@ async def callback(update,context):
         return
 
     if q.data.startswith("model:global:set:"):
-        model = q.data.split(":", 2)[2]
+        model = q.data.removeprefix("model:global:set:")
         if model not in runtime_config_values()["model_catalog"]:
             return await q.edit_message_text("Модель недоступна.")
         set_admin_runtime_config(q.message.chat_id, "fast_model", model)

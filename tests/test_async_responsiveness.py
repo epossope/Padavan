@@ -42,6 +42,24 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_text.assert_awaited_once()
         self.assertIn("Личный выбор модели отключён", query.edit_message_text.await_args.args[0])
 
+    async def test_admin_model_callback_saves_exact_canonical_model(self):
+        model = "qwen/qwen3.5-flash-02-23"
+        query = SimpleNamespace(
+            answer=AsyncMock(), data=f"model:global:set:{model}", edit_message_text=AsyncMock(),
+            message=SimpleNamespace(chat_id=42, message_id=7),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=None)
+        context = SimpleNamespace(user_data={})
+        runtime = {"model_catalog": [model, "deepseek/deepseek-v3.2"]}
+        with patch.object(bot, "ADMIN_CHAT_IDS", {42}), \
+             patch.object(bot, "adopt_active_ui", new=AsyncMock()), \
+             patch.object(bot, "register_bot_user"), \
+             patch.object(bot, "runtime_config_values", return_value=runtime), \
+             patch.object(bot, "set_admin_runtime_config") as save:
+            await bot.callback(update, context)
+        save.assert_called_once_with(42, "fast_model", model)
+        self.assertNotIn("недоступна", query.edit_message_text.await_args.args[0].casefold())
+
     async def test_telegram_send_has_one_bounded_retry(self):
         telegram = SimpleNamespace(send_message=AsyncMock(side_effect=[TimedOut("slow"), SimpleNamespace(message_id=9)]))
         with patch.object(bot, "TELEGRAM_SEND_RETRIES", 1), patch.object(bot.secrets, "randbelow", return_value=0), patch.object(bot.asyncio, "sleep", new=AsyncMock()) as sleep:

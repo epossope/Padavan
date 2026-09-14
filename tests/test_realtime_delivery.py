@@ -65,9 +65,9 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             bot._normalise_runtime_config_value("fast_model", "bad model value")
         with self.assertRaises(ValueError):
             bot._normalise_runtime_config_value("tts_provider", "unknown-provider")
-        self.assertEqual(bot._normalise_runtime_config_value("model_catalog", "one/model, two/model"), ["one/model", "two/model"])
-        self.assertEqual(bot._normalise_runtime_config_value("global_model_mode", "FORCE"), "force")
-        self.assertEqual(bot._normalise_runtime_config_value("global_force_model", "vendor/model"), "vendor/model")
+        self.assertEqual(bot._normalise_runtime_config_value("fast_model", bot.MODEL_CATALOG[0]), bot.MODEL_CATALOG[0])
+        with self.assertRaisesRegex(ValueError, "MODEL_CATALOG"):
+            bot._normalise_runtime_config_value("fast_model", "vendor/not-canonical")
 
     def test_global_primary_routes_real_multiuser_outbound_requests_without_user_overrides(self):
         database = sqlite3.connect(":memory:", check_same_thread=False)

@@ -25,12 +25,13 @@ class ModelStreamConsolidationTests(unittest.TestCase):
                 "INSERT INTO user_settings(chat_id,primary_model,fallback_model) VALUES(?,?,?)",
                 [(101, "legacy/a", "legacy/fallback"), (102, "legacy/b", "")],
             )
-        bot.set_admin_runtime_config(1, "fast_model", "admin/global-a")
+        first, second = bot.MODEL_CATALOG[:2]
+        bot.set_admin_runtime_config(1, "fast_model", first)
         self.assertEqual([bot.resolved_chat_models(cid)["primary"] for cid in (100, 101, 102)],
-                         ["admin/global-a"] * 3)
-        bot.set_admin_runtime_config(1, "fast_model", "admin/global-b")
+                         [first] * 3)
+        bot.set_admin_runtime_config(1, "fast_model", second)
         self.assertEqual([bot.resolved_chat_models(cid)["primary"] for cid in (100, 101, 102)],
-                         ["admin/global-b"] * 3)
+                         [second] * 3)
         self.assertEqual(bot.effective_user_ai_config(101)["personal"]["model_override"], "")
 
     def test_provider_reasoning_and_split_tags_never_enter_visible_accumulator(self):
