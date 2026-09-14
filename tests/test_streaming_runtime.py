@@ -54,6 +54,14 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertEqual(chunker.feed("рая фраза!"), [])
         self.assertEqual(chunker.flush(), ["Вторая фраза!"])
 
+    def test_first_long_sentence_prefetches_only_at_word_boundary(self):
+        chunker = SentenceChunker(first_chars=28)
+        chunks = chunker.feed("Это достаточно длинная первая фраза которая ещё продолжается")
+        self.assertEqual(chunks, ["Это достаточно длинная первая фраза которая ещё"])
+        self.assertEqual(chunker.flush(), ["продолжается"])
+        unbroken = SentenceChunker(first_chars=28)
+        self.assertEqual(unbroken.feed("а" * 80), [])
+
     def test_tool_policy_keeps_memory_and_relevant_pack(self):
         names = ToolPackResolver().select_names("Запиши расход 350 рублей на кофе")
         self.assertIn("knowledge_search", names)

@@ -159,6 +159,24 @@ class P1ProductionUxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((prefs["voice"], prefs["speed"], prefs["pitch"], prefs["volume"]), ("female-admin", 1.12, .9, .8))
         database.close()
 
+    def test_telegram_admin_voice_page_exposes_all_global_controls(self):
+        runtime = {
+            "tts_provider": "edge", "tts_male_voice": "male-admin", "tts_female_voice": "female-admin",
+            "tts_default_speed": .85, "tts_default_pitch": .95, "tts_default_volume": .8,
+        }
+        prefs = {"gender": "male"}
+        with patch.object(bot, "ADMIN_CHAT_IDS", {42}), \
+             patch.object(bot, "runtime_config_values", return_value=runtime), \
+             patch.object(bot, "get_voice_preferences", return_value=prefs):
+            text, markup = bot.voice_settings_page(42)
+        self.assertIn("Мужской голос", text)
+        self.assertIn("Женский голос", text)
+        self.assertIn("Скорость", text)
+        self.assertIn("Тон", text)
+        self.assertIn("Громкость", text)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("voice:admin:edit:tts_default_speed", callbacks)
+
     async def test_three_voice_modes_have_same_channel_semantics(self):
         app_source = (Path(__file__).parent.parent / "miniapp" / "app.js").read_text(encoding="utf-8")
         self.assertIn("speak=mode==='voice'||mode==='voice_and_text'", app_source)

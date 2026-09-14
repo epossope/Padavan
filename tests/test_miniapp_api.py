@@ -320,7 +320,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ТЕКУЩАЯ ГЛОБАЛЬНАЯ МОДЕЛЬ", app_source)
         self.assertIn("effective.effective_model", app_source)
         self.assertIn("Аварийная модель", app_source)
-        self.assertEqual(app_source.count("runtimeSection('"), 6)
+        self.assertEqual(app_source.count("runtimeSection('"), 5)
 
     async def test_production_tts_metrics_are_numeric_allowlisted(self):
         response = await self.client.post('/api/v1/miniapp', json={

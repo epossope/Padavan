@@ -202,9 +202,18 @@ def iter_sse_json(lines):
 
 
 class SentenceChunker:
-    def __init__(self, max_chars=260):
+    def __init__(self, max_chars=220, first_chars=28):
         self.buffer = ""
         self.max_chars = max_chars
+        self.first_chars = first_chars
+        self.emitted = False
+
+    def _take(self, end):
+        value = self.buffer[:end].strip()
+        self.buffer = self.buffer[end:].lstrip()
+        if value:
+            self.emitted = True
+        return value
 
     def feed(self, text: str) -> list[str]:
         self.buffer += text
@@ -212,13 +221,21 @@ class SentenceChunker:
         while True:
             match = re.search(r"(?<=[.!?…])\s+", self.buffer)
             if match:
-                output.append(self.buffer[:match.end()].strip())
-                self.buffer = self.buffer[match.end():]
+                output.append(self._take(match.end()))
+            elif not self.emitted and len(self.buffer) >= self.first_chars:
+                # Start the first synthesis before a long sentence finishes,
+                # but never cut an in-flight word. Markdown is cleaned by the
+                # speech adapter before this chunk reaches a TTS provider.
+                cap = min(len(self.buffer), 72)
+                split = max(self.buffer.rfind(mark, 0, cap + 1) for mark in (" ", ", ", "; ", ": "))
+                if split < max(1, self.first_chars - 8):
+                    break
+                output.append(self._take(split + 1))
             elif len(self.buffer) >= self.max_chars:
                 split = self.buffer.rfind(" ", 0, self.max_chars)
-                split = split if split > self.max_chars // 2 else self.max_chars
-                output.append(self.buffer[:split].strip())
-                self.buffer = self.buffer[split:].lstrip()
+                if split <= self.max_chars // 2:
+                    break
+                output.append(self._take(split + 1))
             else:
                 break
         return [x for x in output if x]

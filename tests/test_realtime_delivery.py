@@ -633,6 +633,37 @@ class RealtimeDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.reply_text.await_count, text_count, mode)
             self.assertEqual(message.reply_voice.await_count, voice_count, mode)
 
+    async def test_telegram_speech_prefetch_delivers_before_stream_completion_and_in_order(self):
+        played = []
+        first_played = asyncio.Event()
+
+        async def synthesize(text, *, chat_id=None, preferences=None):
+            if text == "first":
+                await asyncio.sleep(.01)
+            handle = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            handle.write(text.encode()); handle.close()
+            return Path(handle.name)
+
+        async def deliver(*, voice):
+            played.append(voice.read().decode())
+            first_played.set()
+
+        telegram = SimpleNamespace(send_chat_action=AsyncMock())
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_voice=AsyncMock(side_effect=deliver)))
+        preferences = {"voice": "voice", "speed": 1, "pitch": 1, "volume": 1}
+        with patch.object(bot, "get_voice_preferences", return_value=preferences), \
+             patch.object(bot, "make_voice", new=AsyncMock(side_effect=synthesize)):
+            queue = bot.TelegramSpeechQueue(update, telegram, 42)
+            queue.enqueue("first")
+            queue.enqueue("second")
+            await asyncio.wait_for(first_played.wait(), 1)
+            self.assertEqual(played[0], "first")
+            self.assertFalse(queue.worker.done())
+            await queue.finish()
+        self.assertEqual(played, ["first", "second"])
+        for metric in ("tts_prepare_start_ms", "tts_first_audio_ready_ms", "tts_playback_start_ms"):
+            self.assertIn(metric, bot.RUNTIME_METRICS)
+
     def test_effective_model_is_global_and_legacy_user_override_is_ignored(self):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row

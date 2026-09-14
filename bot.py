@@ -75,6 +75,7 @@ from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from telegram_renderer import TelegramRenderer
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
+                               SentenceChunker,
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
@@ -208,6 +209,7 @@ LATENCY_METRICS = (
     "stt_first_partial_ms", "stt_final_ms", "context_build_ms",
     "memory_retrieval_ms", "tool_execution_ms", "llm_ttft_ms",
     "llm_total_ms", "tts_queue_wait_ms", "tts_prepare_ms", "tts_first_start_ms",
+    "tts_prepare_start_ms", "tts_first_audio_ready_ms", "tts_playback_start_ms",
     "tts_first_chunk_ms", "tts_voice_name", "tts_engine_name",
     "tts_enqueue_ms", "tts_synthesis_start_ms", "tts_synthesis_done_ms",
     "tts_play_start_ms", "tts_play_end_ms", "tts_playback_gap_ms", "tts_total_ms",
@@ -4262,6 +4264,85 @@ def _telegram_live_stream_trace(request_id, chat_id, event_type, **fields):
     ))
 
 
+class TelegramSpeechQueue:
+    """Prepare streamed speech concurrently and deliver chunks in source order."""
+
+    def __init__(self, update, telegram_bot, chat_id, started_at=None):
+        self.update = update
+        self.telegram_bot = telegram_bot
+        self.chat_id = chat_id
+        self.started_at = started_at or time.perf_counter()
+        self.preferences = get_voice_preferences(chat_id)
+        self.queue = asyncio.Queue()
+        self.tasks = []
+        self.paths = set()
+        self.semaphore = asyncio.Semaphore(2)
+        self.prepare_marked = False
+        self.ready_marked = False
+        self.playback_marked = False
+        self.worker = asyncio.create_task(self._run())
+
+    def elapsed_ms(self):
+        return (time.perf_counter() - self.started_at) * 1000
+
+    def enqueue(self, raw_text):
+        text = clean_tts(raw_text)
+        if len(text) < 2:
+            return False
+        task = asyncio.create_task(self._prepare(text))
+        self.tasks.append(task)
+        self.queue.put_nowait(task)
+        return True
+
+    async def _prepare(self, text):
+        async with self.semaphore:
+            if not self.prepare_marked:
+                self.prepare_marked = True
+                record_runtime_metric("tts_prepare_start_ms", self.elapsed_ms(), channel="telegram")
+            path = await make_voice(text, chat_id=self.chat_id, preferences=self.preferences)
+            self.paths.add(path)
+            if not self.ready_marked:
+                self.ready_marked = True
+                record_runtime_metric("tts_first_audio_ready_ms", self.elapsed_ms(), channel="telegram")
+            return path
+
+    async def _run(self):
+        while True:
+            task = await self.queue.get()
+            if task is None:
+                return
+            path = None
+            try:
+                path = await task
+                await telegram_runtime_action(self.telegram_bot, self.chat_id, "SPEAKING")
+                if not self.playback_marked:
+                    self.playback_marked = True
+                    record_runtime_metric("tts_playback_start_ms", self.elapsed_ms(), channel="telegram")
+                with path.open("rb") as voice_file:
+                    await self.update.effective_message.reply_voice(voice=voice_file)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.warning("Telegram streamed TTS chunk failed chat_id_hash=%s error=%s",
+                               _telegram_stream_chat_id_hash(self.chat_id), type(exc).__name__)
+            finally:
+                if path is not None:
+                    self.paths.discard(path)
+                    path.unlink(missing_ok=True)
+
+    async def finish(self):
+        self.queue.put_nowait(None)
+        await self.worker
+
+    async def cancel(self):
+        for task in self.tasks:
+            task.cancel()
+        self.worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.worker
+        for path in tuple(self.paths):
+            path.unlink(missing_ok=True)
+        self.paths.clear()
 async def stream_answer_to_telegram(update, context, text):
     """Deliver one request as one persistent Telegram message edited in place."""
     chat_id = update.effective_chat.id
@@ -4294,6 +4375,10 @@ async def stream_answer_to_telegram(update, context, text):
     effective_mode = "voice_and_text" if wants_voice(text) else mode
     wants_text = effective_mode in {"text", "voice_and_text"}
     wants_audio = effective_mode in {"voice", "voice_and_text"}
+    response_started = time.perf_counter()
+    speech = TelegramSpeechQueue(update, context.bot, chat_id, response_started) if wants_audio else None
+    speech_chunker = SentenceChunker() if wants_audio else None
+    speech_chunks = 0
     _telegram_live_stream_trace(
         request_id, chat_id, "start", visible_chars=0, preview_created=False,
         preview_message_id_exists=False, edit_attempt=False, edit_success=False,
@@ -4325,7 +4410,11 @@ async def stream_answer_to_telegram(update, context, text):
                         context.bot, chat_id, progress_message_id, event
                     )
             elif kind == "delta":
-                accumulated += event.get("text", "")
+                delta = event.get("text", "")
+                accumulated += delta
+                if speech is not None:
+                    for chunk in speech_chunker.feed(delta):
+                        speech_chunks += int(speech.enqueue(chunk))
                 visible_chars = len(sanitize_visible_content(accumulated).strip())
                 _telegram_live_stream_trace(
                     request_id, chat_id, "delta", visible_chars=visible_chars,
@@ -4423,6 +4512,11 @@ async def stream_answer_to_telegram(update, context, text):
             )
             return False
         final = sanitize_visible_content(final or accumulated).strip()
+        if speech is not None:
+            for chunk in speech_chunker.flush():
+                speech_chunks += int(speech.enqueue(chunk))
+            if not speech_chunks and final:
+                speech_chunks += int(speech.enqueue(final))
         record_runtime_metric("telegram_visible_chars", len(final))
         final_message_ids = []
         final_promotion_path = "not_applicable"
@@ -4499,14 +4593,8 @@ async def stream_answer_to_telegram(update, context, text):
                 )
             if final_message_ids:
                 telegram_message_id = final_message_ids[0]
-        if wants_audio and final:
-            await telegram_runtime_action(context.bot, chat_id, "SPEAKING")
-            voice_path = await make_voice(final, chat_id=chat_id)
-            try:
-                with voice_path.open("rb") as voice_file:
-                    await update.effective_message.reply_voice(voice=voice_file)
-            finally:
-                voice_path.unlink(missing_ok=True)
+        if speech is not None:
+            await speech.finish()
         TELEGRAM_DELIVERY_CORRELATIONS.append({
             "request_id": request_id,
             "canonical_message_id": canonical_message_id,
@@ -4523,6 +4611,8 @@ async def stream_answer_to_telegram(update, context, text):
         )
         return True
     finally:
+        if speech is not None and not speech.worker.done():
+            await speech.cancel()
         if progress_message_id:
             with contextlib.suppress(Exception):
                 await _remove_telegram_stream_preview(context.bot, chat_id, progress_message_id)
@@ -4954,22 +5044,22 @@ def server_tts_provider(runtime=None):
 async def make_voice(text, chat_id=None, preferences=None):
 
     fd,n=tempfile.mkstemp(suffix=".mp3"); os.close(fd); p=Path(n)
-
-    runtime = runtime_config_values()
-    if chat_id is None and preferences is None:
+    try:
+        runtime = runtime_config_values()
+        if chat_id is None and preferences is None:
+            raise RuntimeError("TTS_IDENTITY_REQUIRED")
+        provider = server_tts_provider(runtime)
+        prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime["tts_male_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
+        rate = f"{round((float(prefs['speed']) - 1) * 100):+d}%"
+        pitch = f"{round((float(prefs['pitch']) - 1) * 50):+d}Hz"
+        volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
+        if provider != "edge":
+            raise RuntimeError("TTS_SERVER_PROVIDER_UNAVAILABLE")
+        await edge_tts.Communicate(clean_tts(text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
+        return p
+    except BaseException:
         p.unlink(missing_ok=True)
-        raise RuntimeError("TTS_IDENTITY_REQUIRED")
-    provider = server_tts_provider(runtime)
-    prefs = preferences or (get_voice_preferences(chat_id) if chat_id is not None else {"voice": runtime["tts_male_voice"], "speed": 1.0, "pitch": 1.0, "volume": 1.0})
-    rate = f"{round((float(prefs['speed']) - 1) * 100):+d}%"
-    pitch = f"{round((float(prefs['pitch']) - 1) * 50):+d}Hz"
-    volume = f"{round((float(prefs['volume']) - 1) * 100):+d}%"
-    if provider != "edge":
-        p.unlink(missing_ok=True)
-        raise RuntimeError("TTS_SERVER_PROVIDER_UNAVAILABLE")
-    await edge_tts.Communicate(clean_tts(text) or "Готово.", prefs["voice"], rate=rate, pitch=pitch, volume=volume).save(str(p))
-
-    return p
+        raise
 
 
 
@@ -5569,7 +5659,7 @@ async def callback(update,context):
 
     # Model and key management is a platform setting now. Older inline
     # messages may still contain these buttons, so protect those too.
-    admin_only = ("settings:model", "settings:vision", "settings:keys", "model:", "vision:", "keys:")
+    admin_only = ("settings:model", "settings:vision", "settings:keys", "model:", "vision:", "keys:", "voice:admin:")
     if q.data.startswith(admin_only) and q.message.chat_id not in ADMIN_CHAT_IDS:
         return await q.edit_message_text("Модели и ключи уже настроены Noema.", reply_markup=settings_keyboard(q.message.chat_id))
 
@@ -5698,6 +5788,18 @@ async def callback(update,context):
         set_voice_preferences(q.message.chat_id, gender, prefs["speed"], prefs["pitch"], prefs["volume"])
         text, markup = voice_settings_page(q.message.chat_id)
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+
+    if q.data.startswith("voice:admin:edit:"):
+        field = q.data.removeprefix("voice:admin:edit:")
+        if field not in VOICE_ADMIN_FIELDS:
+            return
+        context.user_data["awaiting_voice_admin_field"] = field
+        label, example = VOICE_ADMIN_FIELDS[field]
+        return await q.edit_message_text(
+            f"<b>{html.escape(label)}</b>\n\nОтправьте новое значение. Пример: <code>{html.escape(example)}</code>.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("‹ Голос", callback_data="settings:voice")
+            ]]))
 
     if q.data in ("menu:mode", "settings:mode"):
         await q.edit_message_text("🔊 Режим ответа", reply_markup=mode_keyboard(q.message.chat_id))
@@ -6392,18 +6494,46 @@ def mode_keyboard(chat_id):
     return live_markup(InlineKeyboardMarkup(rows))
 
 
+VOICE_ADMIN_FIELDS = {
+    "tts_male_voice": ("Мужской голос", "ru-RU-DmitryNeural"),
+    "tts_female_voice": ("Женский голос", "ru-RU-SvetlanaNeural"),
+    "tts_default_speed": ("Скорость", "0.85"),
+    "tts_default_pitch": ("Тон", "1.00"),
+    "tts_default_volume": ("Громкость", "1.00"),
+}
+
+
 def voice_settings_page(chat_id):
     prefs = get_voice_preferences(chat_id)
+    runtime = runtime_config_values()
     rows = [[
         InlineKeyboardButton(("● " if prefs["gender"] == "male" else "○ ") + "Мужской", callback_data="voice:gender:male"),
         InlineKeyboardButton(("● " if prefs["gender"] == "female" else "○ ") + "Женский", callback_data="voice:gender:female"),
     ]]
+    if chat_id in ADMIN_CHAT_IDS:
+        rows.extend([
+            [InlineKeyboardButton("Мужской голос", callback_data="voice:admin:edit:tts_male_voice"),
+             InlineKeyboardButton("Женский голос", callback_data="voice:admin:edit:tts_female_voice")],
+            [InlineKeyboardButton("Скорость", callback_data="voice:admin:edit:tts_default_speed"),
+             InlineKeyboardButton("Тон", callback_data="voice:admin:edit:tts_default_pitch"),
+             InlineKeyboardButton("Громкость", callback_data="voice:admin:edit:tts_default_volume")],
+        ])
     if QUICK_ACTIONS_BASE_URL:
         rows.append([InlineKeyboardButton("Открыть настройки Noema", web_app=WebAppInfo(url=f"{QUICK_ACTIONS_BASE_URL}/app?screen=settings"))])
     rows.append([InlineKeyboardButton("‹ Настройки", callback_data="settings:back")])
+    admin = ""
+    if chat_id in ADMIN_CHAT_IDS:
+        admin = ("\n\n<b>Глобальные настройки · admin</b>\n"
+                 f"Мужской голос: <code>{html.escape(str(runtime['tts_male_voice']))}</code>\n"
+                 f"Женский голос: <code>{html.escape(str(runtime['tts_female_voice']))}</code>\n"
+                 f"Скорость: <code>{float(runtime['tts_default_speed']):.2f}</code> · "
+                 f"Тон: <code>{float(runtime['tts_default_pitch']):.2f}</code> · "
+                 f"Громкость: <code>{float(runtime['tts_default_volume']):.2f}</code>\n"
+                 "Изменения применяются ко всем новым озвучиваниям сразу.")
     text = ("<b>🎙 Голос</b>\n"
-            f"Выбор: <b>{'Мужской' if prefs['gender'] == 'male' else 'Женский'}</b>\n\n"
-            "Конкретный голос, скорость, высоту и громкость задаёт администратор Noema.")
+             f"Выбор: <b>{'Мужской' if prefs['gender'] == 'male' else 'Женский'}</b>\n\n"
+             "Конкретный голос, скорость, высоту и громкость задаёт администратор Noema."
+             + admin)
     return text, live_markup(InlineKeyboardMarkup(rows))
 
 
@@ -6556,6 +6686,23 @@ async def text_handler(update,context):
         """
         with contextlib.suppress(Exception):
             await update.effective_message.delete()
+
+    voice_admin_field = context.user_data.pop("awaiting_voice_admin_field", "")
+    if voice_admin_field:
+        if cid not in ADMIN_CHAT_IDS or voice_admin_field not in VOICE_ADMIN_FIELDS:
+            return await update.effective_message.reply_text("Нет доступа к глобальным настройкам голоса.")
+        try:
+            set_admin_runtime_config(cid, voice_admin_field, t)
+        except ValueError:
+            context.user_data["awaiting_voice_admin_field"] = voice_admin_field
+            label, example = VOICE_ADMIN_FIELDS[voice_admin_field]
+            return await update.effective_message.reply_text(
+                f"Некорректное значение для «{label}». Пример: <code>{html.escape(example)}</code>.",
+                parse_mode="HTML")
+        with contextlib.suppress(Exception):
+            await update.effective_message.delete()
+        text, markup = voice_settings_page(cid)
+        return await refresh_active_ui(update, context, text, markup)
 
     emoji_slot = context.user_data.pop("awaiting_interface_emoji", "")
     if emoji_slot:
@@ -6823,17 +6970,20 @@ async def voice_handler(update,context):
 
     fd,n=tempfile.mkstemp(suffix=".ogg"); os.close(fd); p=Path(n)
 
-    activity = await begin_activity(update.effective_message, ["🎙 Расшифровываю голос…", "🧠 Думаю…", "✍️ Готовлю ответ…"])
+    activity = await begin_activity(update.effective_message, ["🎙 Расшифровываю голос…"])
     try:
         f=await context.bot.get_file(update.effective_message.voice.file_id); await f.download_to_drive(custom_path=str(p))
         txt=await asyncio.to_thread(transcribe, update.effective_chat.id, p)
-        a=await asyncio.to_thread(ask,update.effective_chat.id,txt)
-        await send_answer(update, a, context=context, voice_in=True, force_voice=wants_voice(txt))
-        await drain_media_outbox(update, context)
+        await end_activity(*activity)
+        activity = None
+        completed = await stream_answer_to_telegram(update, context, txt)
+        if completed:
+            await drain_media_outbox(update, context)
     except Exception as e:
         await safe_error(update,e)
     finally:
-        await end_activity(*activity)
+        if activity is not None:
+            await end_activity(*activity)
         p.unlink(missing_ok=True)
 
 
