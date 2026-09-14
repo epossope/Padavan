@@ -13,7 +13,7 @@ TOOL_PACKS = {
     "finance": {"add_expense", "add_income", "update_last_expense", "get_expenses", "delete_expense"},
     "people": {"person_upsert", "person_interaction", "get_people", "delete_person", "delete_interaction"},
     "web": {"internet_search", "get_weather"},
-    "files": {"knowledge_files", "send_stored_image", "get_files"},
+    "files": {"knowledge_files", "send_stored_image", "get_files", "artifact_create"},
     "preferences": {"set_timezone", "set_briefing_preferences", "save_behavior_rule", "update_behavior_rule", "delete_behavior_rule"},
 }
 
@@ -106,7 +106,10 @@ class ToolPackResolver:
         "finance": ("руб", "расход", "доход", "бюджет", "купил", "потрат"),
         "people": ("контакт", "человек", "день рождения", "познаком", "созвон"),
         "web": ("интернет", "найди", "проверь", "погода", "новост", "сайт"),
-        "files": ("файл", "фото", "скрин", "документ", "отправ"),
+        "files": ("файл", "фото", "скрин", "документ", "отправ", "таблиц", "html", "json",
+                  "скрипт", "docx", "pdf", "сайт", "архив", "zip", "csv", "xml", "лендинг",
+                  "готовый код", "большой код", "исходник", "программ", "file", "document",
+                  "table", "script", "website", "archive", "source code"),
         "preferences": ("настрой", "правило", "часовой пояс", "брифинг"),
     }
 
@@ -244,6 +247,86 @@ class SentenceChunker:
         tail = self.buffer.strip()
         self.buffer = ""
         return [tail] if tail else []
+
+
+class SpeechTextPolicy:
+    """Build a speech-friendly view without mutating the visible answer.
+
+    This is deterministic on purpose: code and artifact responses must not add
+    another model call merely to become safe to read aloud.
+    """
+
+    _fenced = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+    _inline_code = re.compile(r"`([^`\n]{18,}|[^`\n]*[{};=<>/\\][^`\n]*)`")
+    _url = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+    _path = re.compile(r"(?<!\w)(?:[A-Za-z]:[\\/]|/)(?:[^\s/\\]+[\\/]){2,}[^\s]*")
+    _identifier_line = re.compile(r"^\s*(?:[A-Za-z_][\w.-]{12,}|[A-Fa-f0-9]{24,})(?:\s*[,;]\s*|\s+)+(?:[A-Za-z_][\w.-]{8,}|[A-Fa-f0-9]{16,})")
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        stripped = line.strip()
+        if stripped.count("|") >= 2:
+            return True
+        if re.fullmatch(r"[:+\-|\s]{5,}", stripped or ""):
+            return True
+        return False
+
+    @staticmethod
+    def _is_data_dump(value: str) -> bool:
+        stripped = value.strip()
+        if len(stripped) < 120 or stripped[:1] not in "[{":
+            return False
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(parsed, (dict, list))
+
+    def build(self, value: str, artifacts=None) -> str:
+        text = str(value or "")
+        artifact_list = list(artifacts or [])
+        if self._is_data_dump(text):
+            text = "Данные подготовлены и доступны в сообщении."
+        removed_code = bool(self._fenced.search(text))
+        text = self._fenced.sub("\n", text)
+        text = self._inline_code.sub(" ", text)
+        lines = []
+        removed_table = False
+        url_count = 0
+        for line in text.splitlines():
+            if self._is_table_line(line):
+                removed_table = True
+                continue
+            if self._identifier_line.match(line):
+                continue
+            found_urls = len(self._url.findall(line))
+            url_count += found_urls
+            line = self._url.sub("", line)
+            line = self._path.sub("", line)
+            line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+            line = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line)
+            line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+            line = re.sub(r"[*_~`<>]+", " ", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                lines.append(line)
+        spoken = " ".join(lines)
+        notes = []
+        if artifact_list:
+            count = len(artifact_list)
+            notes.append("Файл подготовлен и прикреплён к сообщению." if count == 1 else "Файлы подготовлены и прикреплены к сообщению.")
+        if removed_code:
+            notes.append("Код доступен в сообщении.")
+        if removed_table:
+            notes.append("Таблица доступна в сообщении.")
+        if url_count >= 2:
+            notes.append("Ссылки доступны в сообщении.")
+        if notes and (not spoken or len(spoken) < 40 or artifact_list):
+            prefix = spoken.rstrip(". ") + ". " if spoken else "Готово. "
+            spoken = prefix + " ".join(dict.fromkeys(notes))
+        spoken = re.sub(r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF]", " ", spoken)
+        spoken = spoken.replace("\ufe0e", "").replace("\ufe0f", "").replace("\u200d", "")
+        return re.sub(r"\s+", " ", spoken).strip() or "Готово. Подробности доступны в сообщении."
 
 
 class AdaptiveDraftThrottle:
