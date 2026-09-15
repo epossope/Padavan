@@ -412,8 +412,8 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-webkit-clip-path:var(--focus-cloud-shape)", css)
         self.assertIn("#dock .focus-pill:before{\n  inset:0", css)
         self.assertIn("backdrop-filter:blur(20px) brightness(.30) saturate(.72)", css)
-        self.assertIn('#shell[data-page="home"] #dock .focus-pill', css)
-        self.assertIn('#shell[data-page="home"] #dock .keyboard-button{transform:translateY(42px)}', css)
+        self.assertIn('/* Canonical dock contract:', css)
+        self.assertIn('#dock .keyboard-button{transform:translateY(42px)}', css)
 
     def test_ui_assets_are_versioned_and_home_editing_survives_mixed_cache(self):
         root = Path(__file__).parent.parent / "miniapp"

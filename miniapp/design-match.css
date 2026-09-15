@@ -1103,19 +1103,8 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 #shell[data-page="home"] .home-grid .widget-line small{font-size:8.5px}
 #shell[data-page="home"] .home-grid .amount{font-size:24px}
 #shell[data-page="home"] .widget-time{font-size:24px!important}
-#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 116px minmax(0,.8fr)}
-#shell[data-page="home"] .focus-pill{width:100%;max-width:142px;min-height:62px;padding:9px 11px}
-#shell[data-page="home"] .focus-pill small{font-size:8.5px}
-#shell[data-page="home"] .focus-pill span{font-size:11px;line-height:1.3}
-@media(max-width:430px){
-  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 112px minmax(0,.8fr)}
-  #shell[data-page="home"] .focus-pill{max-width:132px;min-height:60px}
-}
 @media(max-width:370px){
   #shell[data-page="home"] .home-grid>[data-widget]{height:148px;min-height:148px}
-  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.2fr) 106px minmax(0,.8fr)}
-  #shell[data-page="home"] .focus-pill{max-width:118px;min-height:58px;padding:8px 9px}
-  #shell[data-page="home"] .focus-pill span{font-size:10.5px}
 }
 
 /* Unified UI/UX pass: native-safe chrome, continuous chat and lighter dock. */
@@ -1133,21 +1122,6 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 }
 #dock .keyboard-button:hover,#dock .keyboard-button:active{background:rgba(255,255,255,.025)!important;color:rgba(248,248,246,.94)}
 #dock .keyboard-button svg{width:18px;height:18px;stroke-width:1.05}
-#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 116px minmax(0,.7fr)}
-#shell[data-page="home"] .focus-pill{
-  width:100%;max-width:152px;min-height:70px;padding:11px 13px;overflow:visible;
-}
-#shell[data-page="home"] .focus-pill:before{
-  inset:-3px -5px -4px -5px;border-color:rgba(244,244,242,.2);
-  border-radius:28% 72% 61% 39%/47% 33% 67% 53%;
-  background:radial-gradient(circle at 76% 35%,rgba(255,255,255,.085),transparent 34%),linear-gradient(138deg,rgba(28,29,29,.88),rgba(7,8,8,.68));
-  box-shadow:inset -4px 1px 9px rgba(255,255,255,.17),inset 0 0 22px rgba(0,0,0,.34),0 10px 28px rgba(0,0,0,.36);
-  -webkit-backdrop-filter:blur(17px) brightness(.55);backdrop-filter:blur(17px) brightness(.55);
-}
-#shell[data-page="home"] .focus-pill span{
-  color:rgba(247,247,244,.94);font-size:12.5px;font-weight:350;line-height:1.34;text-shadow:0 1px 8px rgba(0,0,0,.9);
-}
-
 .chat-screen .chat-inner{overflow-anchor:none;contain:layout style}
 .chat-screen .chat-composer{
   --chat-sphere-size:94px;--chat-sphere-cut:calc(var(--chat-sphere-size) * .68);
@@ -1187,16 +1161,9 @@ dialog{background:rgba(7,8,8,.96);box-shadow:0 30px 90px rgba(0,0,0,.6);backdrop
 dialog[tabindex="-1"]:focus{outline:none}
 .voice-base-note{display:block;margin:-2px 0 4px;font-size:9px;line-height:1.35;color:rgba(214,214,211,.48)}
 
-@media(max-width:430px){
-  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 112px minmax(0,.7fr)}
-  #shell[data-page="home"] .focus-pill{max-width:142px;min-height:68px}
-}
 @media(max-width:370px){
   #shell,#shell.subpage,#shell[data-page="home"]{padding-top:calc(var(--app-safe-top,env(safe-area-inset-top)) + 6px)}
   #shell.subpage header h1{font-size:18px}
-  #shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 106px minmax(0,.7fr)}
-  #shell[data-page="home"] .focus-pill{max-width:124px;min-height:64px;padding:9px 10px}
-  #shell[data-page="home"] .focus-pill span{font-size:11px}
   .chat-screen .chat-composer{--chat-sphere-size:84px;min-height:56px}
   .chat-screen .chat-composer>.chat-voice-orb{right:-4px;bottom:-15px}
 }
@@ -1235,24 +1202,22 @@ dialog[tabindex="-1"]:focus{outline:none}
   -webkit-backdrop-filter:blur(20px) brightness(.30) saturate(.72);backdrop-filter:blur(20px) brightness(.30) saturate(.72);
   box-shadow:inset -4px 1px 9px rgba(255,255,255,.15),inset 0 0 24px rgba(0,0,0,.5);
 }
-/* Home dock: a slightly fuller cloud balances the sphere; the chat glyph rests on its baseline. */
-#shell[data-page="home"] #dock .focus-pill{
+/* Canonical dock contract: cloud, sphere and chat glyph share one visual baseline. */
+#dock .focus-pill{
   max-width:170px;min-height:78px;padding:12px 14px;
   --focus-cloud-shape:polygon(3% 55%,6% 36%,16% 22%,31% 14%,43% 7%,57% 11%,69% 17%,83% 23%,95% 39%,98% 55%,92% 69%,80% 82%,64% 89%,48% 94%,34% 90%,20% 85%,9% 73%);
 }
-#shell[data-page="home"] #dock .keyboard-button{transform:translateY(42px)}
+#dock .keyboard-button{transform:translateY(42px)}
 @media(max-width:430px){
-  #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 112px minmax(0,.7fr)}
+  #dock{grid-template-columns:minmax(0,1.3fr) 112px minmax(0,.7fr)}
   #dock .orb-button{width:112px;height:112px}
-  #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:142px;min-height:68px;padding:10px 12px}
-  #shell[data-page="home"] #dock .focus-pill{max-width:154px;min-height:72px;padding:11px 13px}
-  #shell[data-page="home"] #dock .keyboard-button{transform:translateY(37px)}
+  #dock .focus-pill{max-width:154px;min-height:72px;padding:11px 13px}
+  #dock .keyboard-button{transform:translateY(37px)}
 }
 @media(max-width:370px){
-  #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 106px minmax(0,.7fr)}
+  #dock{grid-template-columns:minmax(0,1.3fr) 106px minmax(0,.7fr)}
   #dock .orb-button{width:106px;height:106px}
-  #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:124px;min-height:64px;padding:9px 10px}
+  #dock .focus-pill{max-width:134px;min-height:68px;padding:10px 11px}
   #dock .focus-pill span{font-size:11px}
-  #shell[data-page="home"] #dock .focus-pill{max-width:134px;min-height:68px;padding:10px 11px}
-  #shell[data-page="home"] #dock .keyboard-button{transform:translateY(34px)}
+  #dock .keyboard-button{transform:translateY(34px)}
 }
