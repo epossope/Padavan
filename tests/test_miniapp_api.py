@@ -382,6 +382,14 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--app-safe-top", css)
         self.assertIn("--app-safe-bottom", css)
 
+    def test_focus_day_glass_is_clipped_to_its_cloud_silhouette(self):
+        css = (Path(__file__).parent.parent / "miniapp" / "design-match.css").read_text(encoding="utf-8")
+        self.assertIn("--focus-cloud-shape:polygon", css)
+        self.assertIn("#dock .focus-pill{\n  --focus-cloud-shape", css)
+        self.assertIn("-webkit-clip-path:var(--focus-cloud-shape)", css)
+        self.assertIn("#dock .focus-pill:before{\n  inset:0", css)
+        self.assertIn("backdrop-filter:blur(20px) brightness(.30) saturate(.72)", css)
+
     def test_ui_assets_are_versioned_and_home_editing_survives_mixed_cache(self):
         root = Path(__file__).parent.parent / "miniapp"
         index = (root / "index.html").read_text(encoding="utf-8")
