@@ -222,7 +222,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_boot_telemetry_is_allowlisted_and_non_sensitive(self):
         response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
-            'build_id': APP_BUILD_ID, 'last_boot_stage': 'STATE_REQUEST',
+            'build_id': APP_BUILD_ID, 'last_boot_stage': 'SCREENS_INIT_START',
             'platform': 'ios', 'telegram_version': '8.0', 'elapsed_ms': 10000,
             'error_code': 'API_TIMEOUT',
         })
@@ -230,7 +230,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
         self.core.LOGGER.warning.assert_called_once_with(
             'miniapp_boot_failed build=%s platform=%s stage=%s error=%s elapsed_ms=%s',
-            APP_BUILD_ID, 'ios', 'STATE_REQUEST', 'API_TIMEOUT', 10000,
+            APP_BUILD_ID, 'ios', 'SCREENS_INIT_START', 'API_TIMEOUT', 10000,
         )
 
         invalid = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
@@ -241,6 +241,26 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status, 400)
         self.assertEqual(self.core.LOGGER.warning.call_count, 1)
         self.assertNotIn("secret", repr(self.core.LOGGER.warning.call_args))
+
+    async def test_positive_boot_trace_is_allowlisted_and_non_sensitive(self):
+        response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
+            'build_id': APP_BUILD_ID, 'stage': 'STATE_RECEIVED',
+            'platform': 'ios', 'elapsed_ms': 321,
+        })
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
+        self.core.LOGGER.warning.assert_called_once_with(
+            'miniapp_trace stage=%s build=%s platform=%s elapsed_ms=%s',
+            'STATE_RECEIVED', APP_BUILD_ID, 'ios', 321,
+        )
+
+        invalid = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
+            'build_id': APP_BUILD_ID, 'stage': 'APP_READY', 'platform': 'ios',
+            'elapsed_ms': 400, 'init_data': 'signed-secret',
+        })
+        self.assertEqual(invalid.status, 400)
+        self.assertEqual(self.core.LOGGER.warning.call_count, 1)
+        self.assertNotIn('signed-secret', repr(self.core.LOGGER.warning.call_args))
 
     async def test_vosk_wake_model_is_served_at_runtime_asset_path(self):
         response = await self.client.get('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')

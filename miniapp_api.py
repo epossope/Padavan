@@ -37,8 +37,17 @@ def miniapp_build_id(root: Path) -> str:
 
 
 APP_BUILD_ID = miniapp_build_id(Path(__file__).parent / "miniapp")
-BOOT_FAILURE_STAGES = {"HTML", "ASSETS", "TG_DATA", "STATE_REQUEST", "STATE_OK", "SCREENS_INIT", "APP_READY"}
+BOOT_FAILURE_STAGES = {
+    "HTML", "ASSETS", "TG_DATA", "STATE_REQUEST", "STATE_OK", "SCREENS_INIT", "APP_READY",
+    "CLIENT_STARTED", "ASSETS_READY", "TG_DATA_READY", "STATE_RECEIVED",
+    "SCREENS_INIT_START", "SCREENS_INIT_OK", "ROOT_RENDERED",
+}
 BOOT_FAILURE_FIELDS = {"build_id", "last_boot_stage", "platform", "telegram_version", "elapsed_ms", "error_code"}
+BOOT_TRACE_STAGES = {
+    "CLIENT_STARTED", "ASSETS_READY", "TG_DATA_READY", "STATE_RECEIVED",
+    "SCREENS_INIT_START", "SCREENS_INIT_OK", "ROOT_RENDERED", "APP_READY",
+}
+BOOT_TRACE_FIELDS = {"build_id", "stage", "platform", "elapsed_ms"}
 BOOT_FAILURE_VALUE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
@@ -253,7 +262,25 @@ def register_miniapp(app, core):
             payload = await request.json()
         except (json.JSONDecodeError, TypeError):
             raise web.HTTPBadRequest(text="Некорректная telemetry")
-        if not isinstance(payload, dict) or set(payload) != BOOT_FAILURE_FIELDS:
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="Некорректная telemetry")
+        if set(payload) == BOOT_TRACE_FIELDS:
+            build_id = payload.get("build_id")
+            stage = payload.get("stage")
+            platform = payload.get("platform")
+            elapsed_ms = payload.get("elapsed_ms")
+            if (not isinstance(build_id, str) or not BOOT_FAILURE_VALUE_RE.fullmatch(build_id)
+                    or stage not in BOOT_TRACE_STAGES
+                    or platform not in {"ios", "android", "desktop", "unknown"}
+                    or isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int)
+                    or not 0 <= elapsed_ms <= 120_000):
+                raise web.HTTPBadRequest(text="Некорректная telemetry")
+            logger = getattr(core, "LOGGER", None)
+            if logger:
+                logger.warning("miniapp_trace stage=%s build=%s platform=%s elapsed_ms=%s",
+                               stage, build_id, platform, elapsed_ms)
+            return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+        if set(payload) != BOOT_FAILURE_FIELDS:
             raise web.HTTPBadRequest(text="Некорректная telemetry")
         build_id = payload.get("build_id")
         stage = payload.get("last_boot_stage")
