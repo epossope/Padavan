@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from miniapp_api import APP_BUILD_ID, MINIAPP_BUILD_ASSETS, miniapp_build_id, register_miniapp
@@ -110,15 +110,37 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f'?v={APP_BUILD_ID}', html)
 
     async def test_versioned_assets_are_canonical_and_cacheable(self):
+        unversioned = await self.client.get('/app/assets/app.js')
+        self.assertEqual(unversioned.status, 200)
+        self.assertEqual(unversioned.headers.get('Cache-Control'), 'no-cache')
+        self.assertEqual(unversioned.headers.get('X-Content-Type-Options'), 'nosniff')
+
         current = await self.client.get(f'/app/assets/app.js?v={APP_BUILD_ID}')
         self.assertEqual(current.status, 200)
         self.assertEqual(current.headers.get('Cache-Control'), 'public, max-age=31536000, immutable')
-        self.assertEqual(current.headers.get('X-Content-Type-Options'), 'nosniff')
         self.assertIn(APP_BUILD_ID, await current.text())
 
-        stale = await self.client.get('/app/assets/app.js?v=ui-legacy')
-        self.assertEqual(stale.status, 200)
-        self.assertEqual(stale.headers.get('Cache-Control'), 'no-cache')
+        for version in ('ui-legacy', 'arbitrary-version'):
+            stale = await self.client.get(f'/app/assets/app.js?v={version}')
+            self.assertEqual(stale.status, 200)
+            self.assertEqual(stale.headers.get('Cache-Control'), 'no-cache')
+
+        missing = await self.client.get(f'/app/assets/missing.js?v={APP_BUILD_ID}')
+        self.assertEqual(missing.status, 404)
+
+    async def test_html_declared_build_loads_every_required_asset_and_tolerates_rolling_deploy(self):
+        html = await (await self.client.get('/app')).text()
+        self.assertIn(f'?v={APP_BUILD_ID}', html)
+        for name in MINIAPP_BUILD_ASSETS[1:]:
+            response = await self.client.get(f'/app/assets/{name}?v={APP_BUILD_ID}')
+            self.assertEqual(response.status, 200, name)
+
+        # Deployment B HTML may hit a still-running deployment A worker. The
+        # filename is authoritative; an unfamiliar v only loses immutability.
+        with patch('miniapp_api.APP_BUILD_ID', 'ui-deployment-a'):
+            rolling = await self.client.get('/app/assets/app.js?v=ui-deployment-b')
+        self.assertEqual(rolling.status, 200)
+        self.assertEqual(rolling.headers.get('Cache-Control'), 'no-cache')
 
     def test_content_addressed_build_changes_with_any_production_asset(self):
         root = Path(__file__).parent.parent / "miniapp"
@@ -128,6 +150,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             for name in MINIAPP_BUILD_ASSETS:
                 (copied / name).write_bytes((root / name).read_bytes())
             build_a = miniapp_build_id(copied)
+            self.assertEqual(build_a, miniapp_build_id(copied))
             (copied / "app.js").write_bytes((copied / "app.js").read_bytes() + b"\n/* deploy B */\n")
             build_b = miniapp_build_id(copied)
         self.assertRegex(build_a, r"^ui-[0-9a-f]{12}$")
