@@ -115,6 +115,16 @@ class RoutingContractTests(unittest.TestCase):
         self.assertIn("artifact_create", resolver.select_names("создай HTML сайт"))
         self.assertNotIn("artifact_create", resolver.select_names("покажи маленький пример Python функции"))
 
+    def test_plain_text_and_literal_file_format_are_in_model_contract(self):
+        import bot
+
+        with patch.object(bot, "timezone_for", return_value=bot.ZoneInfo("Europe/Moscow")), \
+             patch.object(bot, "behavior_rules_for", return_value=[]):
+            persona = bot.system_prompt(42)
+        self.assertIn("чистый текст без Markdown-разметки", persona)
+        artifact_tool = next(tool for tool in bot.TOOLS if tool["function"]["name"] == "artifact_create")
+        self.assertIn("таблица/Excel — .xlsx", artifact_tool["function"]["description"])
+
     def test_qwen_and_deepseek_share_reasoning_off_contract(self):
         import bot
 

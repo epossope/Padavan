@@ -4,7 +4,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import bot
-from streaming_runtime import ToolPackResolver
+from streaming_runtime import (ToolPackResolver, artifact_request_extension,
+                               artifact_request_instruction, enforce_artifact_request)
 from telegram_renderer import TelegramRenderer
 
 
@@ -47,10 +48,22 @@ class V1DataConsistencyTests(unittest.TestCase):
         selected = {item["function"]["name"] for item in router.resolve(bot.TOOLS, "сделай таблицу моих трат")}
         self.assertTrue({"finance_list_transactions", "artifact_create"}.issubset(selected))
 
+    def test_explicit_artifact_format_is_enforced_server_side(self):
+        self.assertEqual(".xlsx", artifact_request_extension("сделай таблицу моих трат"))
+        self.assertEqual(".html", artifact_request_extension("создай HTML файл"))
+        self.assertEqual(".docx", artifact_request_extension("сделай Word документ"))
+        self.assertEqual("", artifact_request_extension("покажи таблицу прямо здесь"))
+        self.assertEqual(
+            "monthly_expenses.xlsx",
+            enforce_artifact_request({"filename": "monthly_expenses.docx"}, "сделай таблицу моих трат")["filename"],
+        )
+        self.assertIn("обязательно вызови artifact_create", artifact_request_instruction("создай HTML файл").lower())
+
     def test_telegram_renderer_preserves_content_without_raw_markdown(self):
-        source = "# Заголовок\n\n**Важный текст**\n\n### Раздел\n- пункт 1\n- пункт 2\n```py\nprint('ok')\n```"
+        source = "# Заголовок\n\n**Важный текст** и *курсив*\n\n### Раздел\n- пункт 1\n- пункт 2\n```py\nprint('ok')\n```"
         rendered = TelegramRenderer.render(source)
         self.assertNotIn("**", rendered)
+        self.assertNotIn("*курсив*", rendered)
         self.assertNotIn("###", rendered)
         self.assertNotIn("```", rendered)
         self.assertIn("Заголовок", rendered)
@@ -61,5 +74,5 @@ class V1DataConsistencyTests(unittest.TestCase):
         source = (Path(__file__).parents[1] / "miniapp" / "app.js").read_text(encoding="utf-8")
         self.assertIn("window.NoemaMiniAppRenderer", source)
         self.assertIn("renderAssistantContent(canonical)", source)
+        self.assertIn("message.role==='assistant'?renderAssistantContent(message.content):esc(message.content)", source)
         self.assertIn("rel=\"noopener noreferrer\"", source)
-

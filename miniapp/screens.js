@@ -170,11 +170,18 @@ async function loadBudgetConversion(){
  finally{budgetConversionLoading=false;if(page==='budget')render()}
 }
 async function loadBudget(){if(preview){render();return}budgetLoading=true;if(page==='budget')render();try{const result=await api('budget',page==='budget'?budgetRange():{});if(page==='budget'){budgetData=result;budgetConversion=null;budgetConversionError=''}else monthBudget=result}catch(e){say(e.message)}finally{budgetLoading=false;if(['home','budget'].includes(page))render()}}
-function prepareTelegramViewport(){
- window.NoemaChatViewport?.bindTelegram?.(tg);
-}
+function prepareTelegramViewport(){try{window.NoemaChatViewport?.bindTelegram?.(tg)}catch{}}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshStateOnResume()});
 window.addEventListener('focus',refreshStateOnResume);
 const abortable=(promise,signal)=>!signal?promise:Promise.race([promise,new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(bootError('BOOT_TIMEOUT')),{once:true}))]);
-async function init(signal){const boot=window.NoemaBoot,session=boot?await boot.waitForTelegram(signal):{telegram:window.Telegram?.WebApp||null,preview:!window.Telegram?.WebApp?.initData};tg=session.telegram;preview=session.preview;prepareTelegramViewport();void window.designReady;if(signal?.aborted)throw bootError('BOOT_TIMEOUT');tg?.setHeaderColor?.('#0A0A0A');tg?.setBackgroundColor?.('#0A0A0A');tg?.BackButton?.onClick?.(back);document.querySelectorAll('dialog').forEach(dialog=>dialog.addEventListener('close',syncSystemBackButton));const launchPage=new URLSearchParams(location.search).get('screen');if(['settings','chat','tasks','archive','people','budget','reminders'].includes(launchPage)){page=launchPage;navHistory=['home']}if(preview){render();say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.')}else{boot?.stage('STATE_REQUEST');await load({signal,timeoutMs:7500});boot?.stage('STATE_OK');loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}if(page==='chat')await abortable(window.NoemaChatScroll?.whenSettled?.()||Promise.resolve(),signal)}
+function configureTelegram(next){if(next)tg=next;prepareTelegramViewport();try{tg?.setHeaderColor?.('#0A0A0A')}catch{}try{tg?.setBackgroundColor?.('#0A0A0A')}catch{}try{tg?.BackButton?.onClick?.(back)}catch{}}
+let initialStateAttempt=0,initialStateRetryTimer=0;
+async function connectInitialState(boot,signal){
+ if(signal?.aborted)return;
+ const current=boot?.telegram?.();if(current&&current!==tg)configureTelegram(current);
+ boot?.stage('STATE_REQUEST');
+ try{await load({signal,timeoutMs:20000});boot?.stage('STATE_OK');boot?.stage('APP_READY');initialStateAttempt=0;clearTimeout(initialStateRetryTimer);say('');loadBudget();api('weather').then(result=>{weatherData=result;if(page==='home')render()}).catch(()=>{})}
+ catch(error){if(signal?.aborted)return;initialStateAttempt++;const code=String(error?.code||error?.name||'');say(code==='SESSION_EXPIRED'||code==='INITDATA_MISSING'?'Подключаюсь к Telegram…':'Данные временно недоступны — переподключаюсь…');const delay=Math.min(30000,1000*Math.pow(2,Math.min(initialStateAttempt-1,5)));clearTimeout(initialStateRetryTimer);initialStateRetryTimer=setTimeout(()=>connectInitialState(boot),delay)}
+}
+async function init(signal){const boot=window.NoemaBoot;let session;try{session=boot?await boot.waitForTelegram(signal):{telegram:window.Telegram?.WebApp||null,preview:!window.Telegram?.WebApp?.initData}}catch(error){session={telegram:boot?.telegram?.()||null,preview:false,startupError:error}}tg=session.telegram;preview=session.preview;configureTelegram();void window.designReady;if(signal?.aborted)throw bootError('BOOT_TIMEOUT');document.querySelectorAll('dialog').forEach(dialog=>dialog.addEventListener('close',syncSystemBackButton));const launchPage=new URLSearchParams(location.search).get('screen');if(['settings','chat','tasks','archive','people','budget','reminders'].includes(launchPage)){page=launchPage;navHistory=['home']}render();if(preview)say('Предпросмотр · данные и сохранение доступны при открытии через Telegram.');else{say(session.startupError?'Подключаюсь к Telegram…':'Загружаю данные…');void connectInitialState(boot,signal)}if(page==='chat')await abortable(window.NoemaChatScroll?.whenSettled?.()||Promise.resolve(),signal)}
 if(window.NoemaBoot)window.NoemaBoot.run(init);else init().then(()=>document.querySelector('#splash')?.classList.add('hidden')).catch(error=>say(error.message));

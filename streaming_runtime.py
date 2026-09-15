@@ -80,6 +80,80 @@ def sanitize_visible_content(value: str) -> str:
     return content_filter.feed(str(value or "")) + content_filter.finish()
 
 
+_ARTIFACT_ACTIONS = (
+    "дай файлом", "пришли файлом", "отправь файлом", "сделай файл", "создай файл",
+    "подготовь файл", "сделай документ", "создай документ", "сделай word",
+    "создай word", "сделай таблиц", "создай таблиц", "сделай excel", "создай excel",
+    "сделай html", "создай html", "собери сайт", "создай сайт", "сделай сайт",
+    "сделай json", "создай json", "создай скрипт", "сделай скрипт",
+)
+_ARTIFACT_VERBS = ("дай", "пришли", "отправь", "сделай", "создай", "подготовь", "собери", "сформируй")
+_ARTIFACT_NOUNS = ("файл", "документ", "word", "таблиц", "excel", "html", "json", "скрипт", "сайт", "лендинг", "архив", "zip", "csv", "xlsx", "docx")
+
+
+def is_artifact_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(phrase in lowered for phrase in _ARTIFACT_ACTIONS) or (
+        any(verb in lowered for verb in _ARTIFACT_VERBS) and
+        any(noun in lowered for noun in _ARTIFACT_NOUNS)
+    )
+
+
+def artifact_request_extension(text: str) -> str:
+    """Return the file extension explicitly implied by an artifact request."""
+    lowered = str(text or "").lower()
+    if not is_artifact_request(lowered):
+        return ""
+    # Explicit formats win over generic nouns such as "table" or "document".
+    formats = (
+        (".html", (".html", " html", "веб-страниц", "web page", "landing", "лендинг", "сайт")),
+        (".xlsx", (".xlsx", " xlsx", "excel", "электронн", "spreadsheet")),
+        (".csv", (".csv", " csv")),
+        (".docx", (".docx", " docx", "word")),
+        (".json", (".json", " json")),
+        (".zip", (".zip", " zip", "архив")),
+        (".py", (".py", " python")),
+        (".js", (".js", " javascript")),
+        (".ts", (".ts", " typescript")),
+        (".css", (".css", " css")),
+        (".md", (".md", " markdown")),
+        (".txt", (".txt", " txt")),
+    )
+    for extension, markers in formats:
+        if any(marker in lowered for marker in markers):
+            return extension
+    if "таблиц" in lowered:
+        return ".xlsx"
+    if "документ" in lowered:
+        return ".docx"
+    return ""
+
+
+def artifact_request_instruction(text: str) -> str:
+    """Build a deterministic per-request file-delivery contract for the model."""
+    extension = artifact_request_extension(text)
+    if not is_artifact_request(text):
+        return ""
+    format_rule = f" Имя файла обязано оканчиваться на {extension}." if extension else ""
+    return (
+        "Пользователь явно запросил готовый файл. Обязательно вызови artifact_create и не "
+        "заменяй файл обычным сообщением." + format_rule +
+        " Таблица означает XLSX, если пользователь явно не назвал другой формат."
+    )
+
+
+def enforce_artifact_request(args: dict, text: str) -> dict:
+    """Correct a model-selected artifact filename to the user's requested format."""
+    clean = dict(args or {})
+    extension = artifact_request_extension(text)
+    if not extension:
+        return clean
+    filename = str(clean.get("filename") or "artifact").strip()
+    stem = re.sub(r"\.[A-Za-z0-9]{1,10}$", "", filename).rstrip(" .") or "artifact"
+    clean["filename"] = stem + extension
+    return clean
+
+
 def sanitize_assistant_message(message: dict) -> dict:
     """Keep tool calls and final content, but discard provider-only reasoning."""
     clean = dict(message or {})
@@ -148,11 +222,11 @@ class ToolPackResolver:
         people_words = ("кого я знаю", "найди саш", "какие контакты", "кто работает со мной")
         if any(word in lowered for word in people_words):
             return {"type": "function", "function": {"name": "get_people"}}
-        artifact_words = ("дай файлом", "сделай файл", "сделай документ", "сделай word", "сделай таблиц", "сделай excel", "сделай html", "сделай json", "создай скрипт", "собери сайт")
+        asks_artifact = is_artifact_request(lowered)
         asks_finance = any(word in lowered for word in ("трат", "расход", "доход", "баланс", "бюджет", "операци"))
-        if asks_finance and any(word in lowered for word in artifact_words):
+        if asks_finance and asks_artifact:
             return {"type": "function", "function": {"name": "finance_list_transactions"}}
-        if any(word in lowered for word in artifact_words):
+        if asks_artifact:
             return {"type": "function", "function": {"name": "artifact_create"}}
         finance_words = ("сколько потрат", "сколько расходов", "какой баланс", "покажи доход", "сколько заработ")
         if any(word in lowered for word in finance_words):

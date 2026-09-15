@@ -77,6 +77,7 @@ from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
                                SentenceChunker, SpeechTextPolicy, SpeechTextStream,
+                               artifact_request_instruction, enforce_artifact_request,
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
@@ -660,7 +661,7 @@ TOOLS = [
 
     {"type":"function","function":{
         "name":"artifact_create",
-        "description":"Создать и прикрепить готовый безопасный файл. Обязательно используй при явном запросе дать файлом, создать документ, таблицу, HTML/JSON/скрипт или многофайловый проект. Маленький пример кода без просьбы о файле оставляй в чате. Для PDF передай имя .pdf: система честно создаст DOCX fallback. Для ZIP передавай только файлы текущего запроса.",
+        "description":"Создать и прикрепить готовый безопасный файл. Обязательно используй при явном запросе дать файлом, создать документ, таблицу, HTML/JSON/скрипт или многофайловый проект. Формат выбирай буквально: таблица/Excel — .xlsx (если не указан CSV), веб-страница/сайт — .html, Word/документ — .docx. Не подменяй таблицу DOCX-файлом. Маленький пример кода без просьбы о файле оставляй в чате. Для PDF передай имя .pdf: система честно создаст DOCX fallback. Для ZIP передавай только файлы текущего запроса.",
         "parameters":{"type":"object","properties":{
             "filename":{"type":"string"},
             "content":{"description":"Полное содержимое одиночного файла или текст документа","type":"string"},
@@ -3924,6 +3925,8 @@ def system_prompt(chat_id):
 
         "Ты умеешь создавать и передавать готовые файлы через artifact_create. Когда пользователь явно просит файл, документ, Word, таблицу, Excel, HTML, JSON, скрипт, сайт или набор файлов — обязательно вызови artifact_create; не говори, что ты текстовая модель и что не можешь прикреплять файлы. Для таблицы финансов сначала запроси точные операции через finance_list_transactions, затем создай XLSX или CSV на их основе. Для нескольких файлов используй ZIP. PDF в этой версии создаётся как честно обозначенный DOCX fallback. После tool дай короткое нейтральное резюме и не дублируй огромный код или данные в чат, если пользователь явно не просил показать их и здесь, и файлом. Маленький пример кода без просьбы о файле оставляй inline. "
 
+        "В обычных ответах используй чистый текст без Markdown-разметки: не печатай звёздочки для жирного или курсива, решётки заголовков, обратные кавычки и Markdown-таблицы. Структуру передавай короткими абзацами и обычной нумерацией. Разметка допустима только внутри содержимого создаваемого файла, если она нужна формату файла. "
+
         "Никогда не заявляй, что что-то сохранено, если tool не вернул ok=true. "
 
         "Не раскрывай внутренние модели, OpenRouter или провайдера. "
@@ -4043,7 +4046,11 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                "canonical_user_message_id": canonical_user_message_id}
         return
     context_started = time.perf_counter()
-    messages = [{"role": "system", "content": system_prompt(chat_id)}] + conversation_context(chat_id) + [{"role": "user", "content": text}]
+    messages = [{"role": "system", "content": system_prompt(chat_id)}]
+    artifact_instruction = artifact_request_instruction(text)
+    if artifact_instruction:
+        messages.append({"role": "system", "content": artifact_instruction})
+    messages += conversation_context(chat_id) + [{"role": "user", "content": text}]
     tool_router = ToolPackResolver()
     tools = tool_router.resolve(TOOLS, text)
     initial_tool_choice = tool_router.required_tool_choice(text)
@@ -4067,6 +4074,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
                 return
             request_started = time.perf_counter()
             tool_choice = initial_tool_choice if round_index == 0 else "auto"
+            if round_index > 0 and artifact_instruction and not artifacts:
+                tool_choice = {"type": "function", "function": {"name": "artifact_create"}}
             if round_index == 0 and asks_external_web(text) and tool_choice == "auto":
                 tool_choice = "required"
             response = request_chat_stream(chat_id, model, messages, tools, tool_choice)
@@ -4181,6 +4190,8 @@ def stream_agent_response(chat_id, text, cancel_event=None):
             yield runtime_state_for_tool(name)
             try:
                 args = json.loads(raw) if isinstance(raw, str) else raw
+                if name == "artifact_create":
+                    args = enforce_artifact_request(args or {}, text)
                 result = execute_tool(chat_id, name, args or {})
             except Exception as exc:
                 result = {"ok": False, "tool": name, "error": str(exc)}
@@ -4962,6 +4973,9 @@ def ask(chat_id,text):
 
     context_started = time.perf_counter()
     msgs=[{"role":"system","content":system_prompt(chat_id)}]
+    artifact_instruction = artifact_request_instruction(text)
+    if artifact_instruction:
+        msgs.append({"role":"system","content":artifact_instruction})
 
     ctx=_LAST_RETRIEVAL.get(chat_id)
     if ctx and ctx.get("item"):
@@ -4981,14 +4995,20 @@ def ask(chat_id,text):
     writes=[]
     artifacts=[]
     answer_parts=[]
-    selected_tools=ToolPackResolver().resolve(TOOLS, text)
+    tool_router = ToolPackResolver()
+    selected_tools=tool_router.resolve(TOOLS, text)
+    initial_tool_choice = tool_router.required_tool_choice(text) if artifact_instruction else "auto"
 
     for round_index in range(5):
 
         # `required` made every ordinary conversation take at least two model
         # round trips. `auto` still exposes all tools, but allows a direct
         # answer when no database action is needed.
-        tc="required" if round_index == 0 and asks_external_web(text) else "auto"
+        tc=initial_tool_choice if round_index == 0 else "auto"
+        if round_index > 0 and artifact_instruction and not artifacts:
+            tc={"type":"function","function":{"name":"artifact_create"}}
+        if round_index == 0 and asks_external_web(text) and tc == "auto":
+            tc="required"
 
         msg=call_or(chat_id,msgs,selected_tools,tc)
 
@@ -5026,6 +5046,8 @@ def ask(chat_id,text):
             try:
 
                 args=json.loads(raw) if isinstance(raw,str) else raw
+                if name == "artifact_create":
+                    args = enforce_artifact_request(args or {}, text)
 
                 result=execute_tool(chat_id,name,args or {})
 

@@ -23,6 +23,8 @@ class TelegramRenderer:
         escaped = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", escaped)
         escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
         escaped = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+        escaped = re.sub(r"~~([^~\n]+)~~", r"\1", escaped)
         escaped = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "<b>", escaped)
         # Close heading tags line-by-line. This intentionally supports headings
         # without exposing untrusted HTML.
