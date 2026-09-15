@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote as url_quote
 
 from aiohttp import web
 
@@ -255,6 +255,12 @@ def register_miniapp(app, core):
 
     async def api(request):
         started = time.perf_counter()
+        action = "unknown"
+
+        def log_failure(status, error):
+            core.LOGGER.warning("miniapp_api_failure method=%s route=%s action=%s status=%s error_class=%s",
+                                request.method, request.path, action, status, error)
+
         try:
             payload = await request.json()
             if not isinstance(payload, dict):
@@ -299,18 +305,18 @@ def register_miniapp(app, core):
                 result = await asyncio.to_thread(budget_for, cid, args)
             elif action == "exchange_rate":
                 base = str(args.get("base", "")).strip().upper()
-                quote = str(args.get("quote", "")).strip().upper()
-                if not (len(base) == len(quote) == 3 and base.isascii() and quote.isascii() and base.isalpha() and quote.isalpha()):
+                currency_quote = str(args.get("quote", "")).strip().upper()
+                if not (len(base) == len(currency_quote) == 3 and base.isascii() and currency_quote.isascii() and base.isalpha() and currency_quote.isalpha()):
                     raise ValueError("Некорректная валюта")
-                if base == quote:
-                    result = {"ok": True, "base": base, "quote": quote, "rate": 1.0}
+                if base == currency_quote:
+                    result = {"ok": True, "base": base, "quote": currency_quote, "rate": 1.0}
                 else:
-                    key = (base, quote)
+                    key = (base, currency_quote)
                     cached = exchange_cache.get(key)
                     if cached and time.monotonic() - cached[0] < 600:
                         result = cached[1]
                     else:
-                        result = await asyncio.to_thread(core.get_exchange_rate_live, base, quote)
+                        result = await asyncio.to_thread(core.get_exchange_rate_live, base, currency_quote)
                         if not isinstance(result, dict) or not result.get("ok") or not isinstance(result.get("rate"), (int, float)):
                             raise RuntimeError("Курс временно недоступен")
                         if len(exchange_cache) >= 64:
@@ -363,7 +369,7 @@ def register_miniapp(app, core):
                 except FileNotFoundError:
                     raise web.HTTPNotFound(text="Файл недоступен")
                 suffix = Path(item["filename"]).suffix.lower().lstrip(".") or "bin"
-                disposition = f"attachment; filename=artifact.{suffix}; filename*=UTF-8''{quote(item['filename'])}"
+                disposition = f"attachment; filename=artifact.{suffix}; filename*=UTF-8''{url_quote(item['filename'])}"
                 return web.FileResponse(item["local_path"], headers={
                     "Cache-Control": "no-store",
                     "Content-Disposition": disposition,
@@ -447,12 +453,14 @@ def register_miniapp(app, core):
                 {"ok": True, "data": result},
                 headers=headers,
             )
-        except web.HTTPException:
+        except web.HTTPException as error:
+            log_failure(error.status, type(error).__name__)
             raise
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError) as error:
+            log_failure(400, type(error).__name__)
             return web.json_response({"ok": False, "error": "Проверь введённые данные."}, status=400)
-        except Exception:
-            core.LOGGER.exception("Mini App request failed")
+        except Exception as error:
+            log_failure(503, type(error).__name__)
             return web.json_response({"ok": False, "error": "Не удалось выполнить запрос. Попробуй ещё раз."}, status=503)
 
     def state(cid, args):

@@ -64,6 +64,31 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         store.metadata.assert_called_once_with("a" * 32, 42, is_admin=False, include_path=True)
 
+    async def test_artifact_download_encodes_rfc5987_filename_without_local_quote_collision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "artifact.txt"
+            path.write_text("safe", encoding="utf-8")
+            self.core.artifact_store = Mock(return_value=SimpleNamespace(metadata=Mock(return_value={
+                "filename": "Отчёт (final version).txt", "local_path": str(path),
+            })))
+            response = await self.client.post('/api/v1/miniapp', json={
+                "init_data": "signed", "action": "artifact", "args": {"artifact_id": "a" * 32},
+            })
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), b"safe")
+            disposition = response.headers.get("Content-Disposition", "")
+            self.assertIn("filename=artifact.txt", disposition)
+            self.assertIn("filename*=UTF-8''%D0%9E%D1%82%D1%87%D1%91%D1%82%20%28final%20version%29.txt", disposition)
+
+    async def test_api_failure_log_contains_only_safe_request_classification(self):
+        response = await self.client.post('/api/v1/miniapp', json={
+            "init_data": "secret-not-logged", "action": "unknown_action", "args": {"text": "private"},
+        })
+        self.assertEqual(response.status, 401)
+        message, fields = self.core.LOGGER.warning.call_args.args[0], self.core.LOGGER.warning.call_args.args[1:]
+        self.assertIn("method=%s route=%s action=%s status=%s error_class=%s", message)
+        self.assertEqual(fields, ("POST", "/api/v1/miniapp", "unknown", 401, "HTTPUnauthorized"))
+
     async def test_signed_owner_used(self):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "mode", "args": {"mode": "text"}})
         self.assertEqual(response.status, 200)
