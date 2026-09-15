@@ -48,21 +48,32 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
   const onEnd=event=>{if(event.target===shell&&event.propertyName==='transform')complete()};shell.addEventListener('transitionend',onEnd);edgeSwipeTimer=setTimeout(complete,duration+80)
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false,edgeSwipe.velocity);else if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0}edgeSwipe=null}
+ function beginEdgeSwipe(id,x,y,target,source){
+  if(edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone()||blocksEdgeSwipe(target))return false;
+  edgeSwipe={x,y,id,source,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:performance.now(),startedAt:performance.now(),velocity:0,rendered:0};return true
+ }
+ function moveEdgeSwipe(id,x,y,event){
+  if(!edgeSwipe||id!==edgeSwipe.id)return false;
+  const now=performance.now(),instant=(x-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.dx=x-edgeSwipe.x;edgeSwipe.dy=y-edgeSwipe.y;edgeSwipe.velocity=edgeSwipe.velocity*.68+instant*.32;edgeSwipe.lastX=x;edgeSwipe.lastAt=now;
+  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=7)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.2&&edgeSwipe.dx>0?'x':'cancel';
+  if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return false}
+  if(edgeSwipe.axis==='x'){event.preventDefault();scheduleEdgeSwipe();return true}return false
+ }
+ function endEdgeSwipe(id){
+  if(!edgeSwipe||id!==edgeSwipe.id)return false;
+  const {dx,axis,velocity,startedAt}=edgeSwipe;
+  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=dx>=innerWidth*.23||(dx>30&&releaseVelocity>.34);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
+ }
  document.addEventListener('pointerdown',e=>{
-  if(edgeSwipeFinishing||document.body.classList.contains('sorting')||e.pointerType==='mouse'||!e.isPrimary||!canSwipeBack()||e.clientX>edgeSwipeStartZone()||blocksEdgeSwipe(e.target))return;
-  edgeSwipe={x:e.clientX,y:e.clientY,id:e.pointerId,axis:null,captured:false,dx:0,dy:0,lastX:e.clientX,lastAt:performance.now(),startedAt:performance.now(),velocity:0,rendered:0};
+  if(e.pointerType==='mouse'||e.isPrimary===false)return;beginEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e.target,'pointer');
  },{passive:true,capture:true});
  document.addEventListener('pointermove',e=>{
-  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
-  const now=performance.now(),instant=(e.clientX-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.dx=e.clientX-edgeSwipe.x;edgeSwipe.dy=e.clientY-edgeSwipe.y;edgeSwipe.velocity=edgeSwipe.velocity*.68+instant*.32;edgeSwipe.lastX=e.clientX;edgeSwipe.lastAt=now;
-  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=7)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.2&&edgeSwipe.dx>0?'x':'cancel';
-  if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return}
-  if(edgeSwipe.axis==='x'){e.preventDefault();if(!edgeSwipe.captured){e.target.setPointerCapture?.(e.pointerId);edgeSwipe.captured=true}scheduleEdgeSwipe()}
+  if(moveEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e)&&edgeSwipe&&!edgeSwipe.captured){e.target.setPointerCapture?.(e.pointerId);edgeSwipe.captured=true}
  },{passive:false,capture:true});
- document.addEventListener('pointerup',e=>{
-  if(!edgeSwipe||e.pointerId!==edgeSwipe.id)return;
-  const {dx,axis,velocity,startedAt}=edgeSwipe;
-  if(axis!=='x'){edgeSwipe=null;return}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=dx>=innerWidth*.23||(dx>30&&releaseVelocity>.34);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null
- },{passive:true,capture:true});
- document.addEventListener('pointercancel',cancelEdgeSwipe,{passive:true,capture:true});
+ document.addEventListener('pointerup',e=>endEdgeSwipe(`pointer:${e.pointerId}`),{passive:true,capture:true});
+ document.addEventListener('pointercancel',e=>{if(edgeSwipe?.id!==`pointer:${e.pointerId}`)return;if(edgeSwipe.axis==='x')endEdgeSwipe(edgeSwipe.id);else cancelEdgeSwipe()},{passive:true,capture:true});
+ document.addEventListener('touchstart',e=>{if(edgeSwipe||e.touches.length!==1)return;const touch=e.touches[0];beginEdgeSwipe(`touch:${touch.identifier}`,touch.clientX,touch.clientY,e.target,'touch')},{passive:true,capture:true});
+ document.addEventListener('touchmove',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.touches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)moveEdgeSwipe(edgeSwipe.id,touch.clientX,touch.clientY,e)},{passive:false,capture:true});
+ document.addEventListener('touchend',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.changedTouches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)endEdgeSwipe(edgeSwipe.id)},{passive:true,capture:true});
+ document.addEventListener('touchcancel',e=>{if(edgeSwipe?.source==='touch')cancelEdgeSwipe()},{passive:true,capture:true});
 })();
