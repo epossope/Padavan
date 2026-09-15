@@ -1235,14 +1235,24 @@ dialog[tabindex="-1"]:focus{outline:none}
   -webkit-backdrop-filter:blur(20px) brightness(.30) saturate(.72);backdrop-filter:blur(20px) brightness(.30) saturate(.72);
   box-shadow:inset -4px 1px 9px rgba(255,255,255,.15),inset 0 0 24px rgba(0,0,0,.5);
 }
+/* Home dock: a slightly fuller cloud balances the sphere; the chat glyph rests on its baseline. */
+#shell[data-page="home"] #dock .focus-pill{
+  max-width:170px;min-height:78px;padding:12px 14px;
+  --focus-cloud-shape:polygon(3% 55%,6% 36%,16% 22%,31% 14%,43% 7%,57% 11%,69% 17%,83% 23%,95% 39%,98% 55%,92% 69%,80% 82%,64% 89%,48% 94%,34% 90%,20% 85%,9% 73%);
+}
+#shell[data-page="home"] #dock .keyboard-button{transform:translateY(42px)}
 @media(max-width:430px){
   #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 112px minmax(0,.7fr)}
   #dock .orb-button{width:112px;height:112px}
   #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:142px;min-height:68px;padding:10px 12px}
+  #shell[data-page="home"] #dock .focus-pill{max-width:154px;min-height:72px;padding:11px 13px}
+  #shell[data-page="home"] #dock .keyboard-button{transform:translateY(37px)}
 }
 @media(max-width:370px){
   #dock,#shell[data-page="home"] #dock{grid-template-columns:minmax(0,1.3fr) 106px minmax(0,.7fr)}
   #dock .orb-button{width:106px;height:106px}
   #dock .focus-pill,#shell[data-page="home"] .focus-pill{max-width:124px;min-height:64px;padding:9px 10px}
   #dock .focus-pill span{font-size:11px}
+  #shell[data-page="home"] #dock .focus-pill{max-width:134px;min-height:68px;padding:10px 11px}
+  #shell[data-page="home"] #dock .keyboard-button{transform:translateY(34px)}
 }
