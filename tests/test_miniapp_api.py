@@ -109,22 +109,6 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(invalid.status, 400)
 
-    async def test_boot_beacon_is_content_free_and_rate_limited(self):
-        payload = {"boot_id": "boot-safe-123", "build_id": APP_BUILD_ID, "stage": "P70_STATE_START",
-                   "platform": "ios", "telegram_version": "8.0", "engine": "wkwebview", "elapsed_ms": 1200}
-        response = await self.client.post('/api/v1/miniapp/boot-beacon', json=payload)
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
-        logged = self.core.LOGGER.info.call_count
-        for _ in range(40):
-            response = await self.client.post('/api/v1/miniapp/boot-beacon', json=payload)
-            self.assertEqual(response.status, 200)
-        self.assertEqual(self.core.LOGGER.info.call_count, logged + 39)
-        invalid = await self.client.post('/api/v1/miniapp/boot-beacon', json={**payload, "boot_id": "bad value"})
-        self.assertEqual(invalid.status, 400)
-        invalid_stage = await self.client.post('/api/v1/miniapp/boot-beacon', json={**payload, "stage": "arbitrary"})
-        self.assertEqual(invalid_stage.status, 400)
-
     async def test_vosk_wake_model_is_served_at_runtime_asset_path(self):
         response = await self.client.get('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')
         self.assertEqual(response.status, 200)
@@ -368,22 +352,16 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         # HTTP/MIME/parse failure cannot strand a static script tag forever.
         self.assertIn("var APP_BUILD_ID='__NOEMA_APP_BUILD_ID__'", index)
         self.assertIn("var ASSETS=['tokens.js','ui.js','orb.js','app.js','screens.js','mobile.js','voice-conversation.js']", index)
-        self.assertIn("script.onerror=function(){failedAsset=name;recovery('ASSET_FAILED')}", index)
+        self.assertIn("script.onerror=function(){recovery('ASSET_LOAD_FAILED')}", index)
         self.assertIn("script.src='/app/assets/'+name+'?v='+encodeURIComponent(APP_BUILD_ID)", index)
         self.assertEqual(index.count("?v=__NOEMA_APP_BUILD_ID__"), 4)
-        self.assertIn("BOOT_TIMEOUT_MS=14000", index)
+        self.assertIn("BOOT_TIMEOUT_MS=10000", index)
         self.assertIn("controlledReload", index)
         self.assertIn("boot-recovery", index)
         self.assertIn("window.addEventListener('unhandledrejection'", index)
         self.assertIn("window.addEventListener('error'", index)
-        self.assertIn("P40_SDK_FAILED", index)
+        self.assertIn("sdk_load_failed", index)
         self.assertIn("boot_id", index)
-        self.assertIn("NOEMA_HOME_READY", index)
-        self.assertIn("boot-beacon", index)
-        self.assertIn("if(finished)window.clearTimeout(timeout)", index)
-        self.assertIn("boot?.stage('P80_ROOT_MOUNTED')", screen_source)
-        self.assertIn("boot?.homeReady?.()", screen_source)
-        self.assertIn("try{tg.expand?.()}catch{}", app_source)
         self.assertIn("AbortController", app_source)
         self.assertIn("SESSION_EXPIRED", app_source)
         self.assertIn("waitForTelegram", screen_source)

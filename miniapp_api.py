@@ -3,7 +3,6 @@ import asyncio
 import contextlib
 import json
 import os
-import re
 import tempfile
 import threading
 import time
@@ -21,9 +20,6 @@ BOOT_TELEMETRY_STAGES = {
     "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
     "bootstrap_ok", "bootstrap_failed", "render_ready", "boot_timeout",
     "window_error", "unhandledrejection", "sdk_load_failed", "sdk_loaded",
-    "P00_HTML", "P10_PREBOOT", "P20_ASSETS", "P30_APP_JS", "P30_APP_STARTED",
-    "P40_TG_SDK", "P40_SDK_FAILED", "P50_INIT_DATA", "P60_AUTH_START", "P61_AUTH_OK",
-    "P70_STATE_START", "P71_STATE_OK", "P80_ROOT_MOUNTED", "P90_HOME_READY", "P98_RECOVERY", "P99_COMPLETE",
 }
 
 
@@ -58,7 +54,6 @@ def register_miniapp(app, core):
     jobs = {}
     job_locks = {}
     jobs_lock = threading.Lock()
-    boot_beacon_seen = {}
 
     def ensure_jobs_table():
         if not callable(getattr(core, "conn", None)):
@@ -235,41 +230,6 @@ def register_miniapp(app, core):
         if logger:
             logger.info("miniapp_boot stage=%s app_version=%s platform=%s telegram_version=%s code=%s boot_id=%s",
                         stage, safe["app_version"], safe["platform"], safe["telegram_version"], safe["code"], safe["boot_id"])
-        return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
-
-    async def boot_beacon(request):
-        """Unauthenticated, content-free launch diagnostics with a small per-boot cap."""
-        try:
-            payload = await request.json()
-        except (json.JSONDecodeError, TypeError):
-            raise web.HTTPBadRequest(text="Некорректный beacon")
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(text="Некорректный beacon")
-        allowed = ("boot_id", "build_id", "stage", "platform", "telegram_version", "engine", "elapsed_ms", "error_code", "asset")
-        safe = {key: payload.get(key, "") for key in allowed}
-        boot_id = str(safe["boot_id"] or "")[:80]
-        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,80}", boot_id):
-            raise web.HTTPBadRequest(text="Некорректный beacon")
-        if str(safe["stage"] or "") not in BOOT_TELEMETRY_STAGES:
-            raise web.HTTPBadRequest(text="Некорректный beacon")
-        count, first_at = boot_beacon_seen.get(boot_id, (0, time.monotonic()))
-        if time.monotonic() - first_at > 300:
-            count, first_at = 0, time.monotonic()
-        if count >= 40:
-            return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
-        boot_beacon_seen[boot_id] = (count + 1, first_at)
-        for key in ("build_id", "stage", "platform", "telegram_version", "engine", "error_code", "asset"):
-            safe[key] = str(safe[key] or "")[:80]
-            if not re.fullmatch(r"[A-Za-z0-9._:-]*", safe[key]):
-                raise web.HTTPBadRequest(text="Некорректный beacon")
-        try:
-            safe["elapsed_ms"] = max(0, min(int(safe["elapsed_ms"] or 0), 120000))
-        except (TypeError, ValueError):
-            raise web.HTTPBadRequest(text="Некорректный beacon")
-        logger = getattr(core, "LOGGER", None)
-        if logger:
-            logger.info("miniapp_boot_beacon boot_id=%s build_id=%s stage=%s platform=%s telegram_version=%s engine=%s elapsed_ms=%s error_code=%s asset=%s",
-                        boot_id, safe["build_id"], safe["stage"], safe["platform"], safe["telegram_version"], safe["engine"], safe["elapsed_ms"], safe["error_code"], safe["asset"])
         return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def api(request):
@@ -793,6 +753,5 @@ def register_miniapp(app, core):
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
     app.router.add_post("/api/v1/miniapp/boot-telemetry", boot_telemetry)
-    app.router.add_post("/api/v1/miniapp/boot-beacon", boot_beacon)
     app.router.add_get("/app/assets/{filename:.*}", asset)
     app.router.add_post("/api/v1/miniapp", api)
