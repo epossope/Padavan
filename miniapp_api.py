@@ -42,6 +42,18 @@ BOOT_FAILURE_FIELDS = {"build_id", "last_boot_stage", "platform", "telegram_vers
 BOOT_FAILURE_VALUE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
+def miniapp_platform_from_user_agent(user_agent: str) -> str:
+    """Return a coarse platform category without retaining the User-Agent."""
+    value = str(user_agent or "").lower()
+    if any(marker in value for marker in ("iphone", "ipad", "ipod")):
+        return "ios"
+    if "android" in value:
+        return "android"
+    if any(marker in value for marker in ("windows", "macintosh", "mac os x", "linux", "cros")):
+        return "desktop"
+    return "unknown"
+
+
 def register_miniapp(app, core):
     root = Path(__file__).parent / "miniapp"
     locks = {}
@@ -213,6 +225,10 @@ def register_miniapp(app, core):
                 "currency_totals": totals, "mixed_currencies": len(totals) > 1, **summary}
 
     async def index(request):
+        platform = miniapp_platform_from_user_agent(request.headers.get("User-Agent", ""))
+        # WARNING is intentional for this temporary trace: the application
+        # does not configure an INFO log level, so INFO is not reliably visible.
+        core.LOGGER.warning("miniapp_trace stage=HTML_REQUEST build=%s platform=%s", APP_BUILD_ID, platform)
         html = (root / "index.html").read_text(encoding="utf-8").replace("__NOEMA_APP_BUILD_ID__", APP_BUILD_ID)
         return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
@@ -261,6 +277,7 @@ def register_miniapp(app, core):
     async def api(request):
         started = time.perf_counter()
         action = "unknown"
+        is_state_request = False
 
         def log_failure(status, error):
             core.LOGGER.warning("miniapp_api_failure method=%s route=%s action=%s status=%s error_class=%s",
@@ -270,15 +287,24 @@ def register_miniapp(app, core):
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise ValueError("Некорректный запрос")
+            requested_action = payload.get("action", "state")
+            is_state_request = requested_action == "state"
+            if is_state_request:
+                platform = miniapp_platform_from_user_agent(request.headers.get("User-Agent", ""))
+                core.LOGGER.warning("miniapp_trace stage=STATE_REQUEST build=%s platform=%s",
+                                    APP_BUILD_ID, platform)
             user = core.valid_webapp_user(payload.get("init_data"))
             if not user or not isinstance(user.get("id"), int):
+                if is_state_request:
+                    core.LOGGER.warning("miniapp_trace stage=STATE_AUTH_FAIL build=%s error=%s",
+                                        APP_BUILD_ID, "INVALID_INIT_DATA")
                 raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
             cid = user["id"]
             # A Mini App can be a person's first Noema interaction. Register
             # the signed Telegram profile before any state/LLM work so admin
             # accounting never depends on a separate API-key row.
             await register_signed_user(user)
-            action = payload.get("action", "state")
+            action = requested_action
             args = payload.get("args", {})
             if not isinstance(args, dict):
                 raise ValueError("Некорректные параметры")
@@ -454,17 +480,28 @@ def register_miniapp(app, core):
                 state_bytes = len(json.dumps({"ok": True, "data": result}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 headers["X-Noema-State-Bytes"] = str(state_bytes)
                 core.LOGGER.info("miniapp_state bytes=%s duration_ms=%.1f", state_bytes, duration_ms)
+                core.LOGGER.warning("miniapp_trace stage=STATE_OK build=%s duration_ms=%s",
+                                    APP_BUILD_ID, round(duration_ms))
             return web.json_response(
                 {"ok": True, "data": result},
                 headers=headers,
             )
         except web.HTTPException as error:
+            if is_state_request and error.status != 401:
+                core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
+                                    APP_BUILD_ID, type(error).__name__)
             log_failure(error.status, type(error).__name__)
             raise
         except (ValueError, TypeError, KeyError) as error:
+            if is_state_request:
+                core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
+                                    APP_BUILD_ID, type(error).__name__)
             log_failure(400, type(error).__name__)
             return web.json_response({"ok": False, "error": "Проверь введённые данные."}, status=400)
         except Exception as error:
+            if is_state_request:
+                core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
+                                    APP_BUILD_ID, type(error).__name__)
             log_failure(503, type(error).__name__)
             return web.json_response({"ok": False, "error": "Не удалось выполнить запрос. Попробуй ещё раз."}, status=503)
 

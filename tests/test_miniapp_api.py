@@ -109,6 +109,69 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('__NOEMA_APP_BUILD_ID__', html)
         self.assertIn(f'?v={APP_BUILD_ID}', html)
 
+    async def test_app_entry_produces_safe_html_request_trace(self):
+        response = await self.client.get(
+            '/app?initData=private-query',
+            headers={'User-Agent': 'Private-UA-marker iPhone OS 18_0 secret-user-agent'},
+        )
+        self.assertEqual(response.status, 200)
+        self.core.LOGGER.warning.assert_called_once_with(
+            'miniapp_trace stage=HTML_REQUEST build=%s platform=%s', APP_BUILD_ID, 'ios',
+        )
+        logged = repr(self.core.LOGGER.warning.call_args_list)
+        self.assertNotIn('private-query', logged)
+        self.assertNotIn('secret-user-agent', logged)
+
+    async def test_state_request_and_success_produce_safe_server_traces(self):
+        with patch('miniapp_api.asyncio.to_thread', new=AsyncMock(side_effect=[None, {'ready': True}])):
+            response = await self.client.post(
+                '/api/v1/miniapp?hash=private-hash',
+                headers={'User-Agent': 'Mozilla/5.0 (iPhone; private-user-agent)'},
+                json={'init_data': 'signed', 'action': 'state', 'args': {}},
+            )
+        self.assertEqual(response.status, 200)
+        traces = [call.args for call in self.core.LOGGER.warning.call_args_list
+                  if call.args and str(call.args[0]).startswith('miniapp_trace')]
+        self.assertEqual(traces[0], (
+            'miniapp_trace stage=STATE_REQUEST build=%s platform=%s', APP_BUILD_ID, 'ios',
+        ))
+        self.assertEqual(traces[1][0], 'miniapp_trace stage=STATE_OK build=%s duration_ms=%s')
+        self.assertEqual(traces[1][1], APP_BUILD_ID)
+        self.assertIsInstance(traces[1][2], int)
+        logged = repr(self.core.LOGGER.warning.call_args_list)
+        self.assertNotIn('private-hash', logged)
+        self.assertNotIn('private-user-agent', logged)
+        self.assertNotIn('signed', logged)
+
+    async def test_bad_state_auth_produces_safe_auth_failure_trace(self):
+        response = await self.client.post('/api/v1/miniapp?auth_date=private-date', json={
+            'init_data': 'hash=private-hash&user=private-user', 'action': 'state',
+            'args': {'message': 'private-message'},
+        })
+        self.assertEqual(response.status, 401)
+        traces = [call.args for call in self.core.LOGGER.warning.call_args_list
+                  if call.args and str(call.args[0]).startswith('miniapp_trace')]
+        self.assertEqual(traces, [
+            ('miniapp_trace stage=STATE_REQUEST build=%s platform=%s', APP_BUILD_ID, 'unknown'),
+            ('miniapp_trace stage=STATE_AUTH_FAIL build=%s error=%s', APP_BUILD_ID, 'INVALID_INIT_DATA'),
+        ])
+        logged = repr(self.core.LOGGER.warning.call_args_list)
+        for sensitive in ('private-date', 'private-hash', 'private-user', 'private-message'):
+            self.assertNotIn(sensitive, logged)
+
+    async def test_state_exception_produces_safe_failure_class_trace(self):
+        with patch('miniapp_api.asyncio.to_thread', new=AsyncMock(side_effect=[None, RuntimeError('private-error')])):
+            response = await self.client.post('/api/v1/miniapp', json={
+                'init_data': 'signed', 'action': 'state', 'args': {},
+            })
+        self.assertEqual(response.status, 503)
+        traces = [call.args for call in self.core.LOGGER.warning.call_args_list
+                  if call.args and str(call.args[0]).startswith('miniapp_trace')]
+        self.assertEqual(traces[-1], (
+            'miniapp_trace stage=STATE_FAIL build=%s error_class=%s', APP_BUILD_ID, 'RuntimeError',
+        ))
+        self.assertNotIn('private-error', repr(self.core.LOGGER.warning.call_args_list))
+
     async def test_versioned_assets_are_canonical_and_cacheable(self):
         unversioned = await self.client.get('/app/assets/app.js')
         self.assertEqual(unversioned.status, 200)
