@@ -4988,7 +4988,7 @@ def ask(chat_id,text):
         # `required` made every ordinary conversation take at least two model
         # round trips. `auto` still exposes all tools, but allows a direct
         # answer when no database action is needed.
-        tc="required" if _ == 0 and asks_external_web(text) else "auto"
+        tc="required" if round_index == 0 and asks_external_web(text) else "auto"
 
         msg=call_or(chat_id,msgs,selected_tools,tc)
 

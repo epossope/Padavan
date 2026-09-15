@@ -113,5 +113,43 @@ class P0ProviderContractTests(unittest.TestCase):
         self.assertNotIn(private_content, repr(result))
 
 
+class AskLoopRegressionTests(unittest.TestCase):
+    def _ask_patches(self, call_or):
+        return (
+            patch.object(bot, "direct_live_request", return_value=None),
+            patch.object(bot, "record_user_request"),
+            patch.object(bot, "record_runtime_metric"),
+            patch.object(bot, "system_prompt", return_value="system"),
+            patch.object(bot, "conversation_context", return_value=[]),
+            patch.object(bot.ToolPackResolver, "resolve", return_value=[]),
+            patch.object(bot, "add_message", return_value=1),
+            patch.object(bot, "call_or", side_effect=call_or),
+        )
+
+    def test_ordinary_ask_uses_auto_without_name_error(self):
+        patches = self._ask_patches([{"content": "Готово"}])
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7] as call_or:
+            self.assertEqual(bot.ask(7, "Привет"), "Готово")
+        self.assertEqual(call_or.call_args.args[3], "auto")
+
+    def test_external_web_request_is_required_only_for_its_first_round(self):
+        calls = [
+            {"tool_calls": [{"id": "call-1", "function": {"name": "web_search", "arguments": "{}"}}]},
+            {"content": "Нашла информацию"},
+        ]
+        patches = self._ask_patches(calls)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7] as call_or, \
+             patch.object(bot, "execute_tool", return_value={"ok": True, "tool": "web_search"}):
+            self.assertEqual(bot.ask(7, "Найди информацию в интернете"), "Нашла информацию")
+        self.assertEqual([call.args[3] for call in call_or.call_args_list], ["required", "auto"])
+
+    def test_iphone_note_quick_action_routes_to_ask(self):
+        with patch.object(bot, "ask", return_value="Ответ") as ask:
+            ok, answer = bot.quick_action_result(7, "note", {"text": "Напомни купить хлеб"})
+        self.assertTrue(ok)
+        self.assertEqual(answer, "Ответ")
+        ask.assert_called_once_with(7, "Напомни купить хлеб")
+
+
 if __name__ == "__main__":
     unittest.main()

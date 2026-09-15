@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -36,12 +37,9 @@ def miniapp_build_id(root: Path) -> str:
 
 
 APP_BUILD_ID = miniapp_build_id(Path(__file__).parent / "miniapp")
-BOOT_TELEMETRY_STAGES = {
-    "boot_started", "js_ready", "telegram_ready", "initdata_present",
-    "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
-    "bootstrap_ok", "bootstrap_failed", "render_ready", "boot_timeout",
-    "window_error", "unhandledrejection", "sdk_load_failed", "sdk_loaded", "telegram_fallback",
-}
+BOOT_FAILURE_STAGES = {"HTML", "ASSETS", "TG_DATA", "STATE_REQUEST", "STATE_OK", "SCREENS_INIT", "APP_READY"}
+BOOT_FAILURE_FIELDS = {"build_id", "last_boot_stage", "platform", "telegram_version", "elapsed_ms", "error_code"}
+BOOT_FAILURE_VALUE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 
 
 def register_miniapp(app, core):
@@ -239,18 +237,25 @@ def register_miniapp(app, core):
             payload = await request.json()
         except (json.JSONDecodeError, TypeError):
             raise web.HTTPBadRequest(text="Некорректная telemetry")
-        stage = str(payload.get("stage") or "") if isinstance(payload, dict) else ""
-        if stage not in BOOT_TELEMETRY_STAGES:
+        if not isinstance(payload, dict) or set(payload) != BOOT_FAILURE_FIELDS:
             raise web.HTTPBadRequest(text="Некорректная telemetry")
-        safe = {key: str(payload.get(key) or "")[:80] for key in
-                ("app_version", "platform", "telegram_version", "code", "boot_id")}
-        if any(any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for char in value)
-               for value in safe.values()):
+        build_id = payload.get("build_id")
+        stage = payload.get("last_boot_stage")
+        platform = payload.get("platform")
+        telegram_version = payload.get("telegram_version")
+        error_code = payload.get("error_code")
+        elapsed_ms = payload.get("elapsed_ms")
+        if (not all(isinstance(value, str) and BOOT_FAILURE_VALUE_RE.fullmatch(value)
+                    for value in (build_id, telegram_version, error_code))
+                or stage not in BOOT_FAILURE_STAGES
+                or platform not in {"ios", "android", "desktop", "web", "unknown"}
+                or isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int)
+                or not 0 <= elapsed_ms <= 120_000):
             raise web.HTTPBadRequest(text="Некорректная telemetry")
         logger = getattr(core, "LOGGER", None)
         if logger:
-            logger.info("miniapp_boot stage=%s app_version=%s platform=%s telegram_version=%s code=%s boot_id=%s",
-                        stage, safe["app_version"], safe["platform"], safe["telegram_version"], safe["code"], safe["boot_id"])
+            logger.warning("miniapp_boot_failed build=%s platform=%s stage=%s error=%s elapsed_ms=%s",
+                           build_id, platform, stage, error_code, elapsed_ms)
         return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def api(request):

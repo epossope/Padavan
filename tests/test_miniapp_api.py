@@ -159,18 +159,25 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_boot_telemetry_is_allowlisted_and_non_sensitive(self):
         response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
-            'stage': 'bootstrap_failed', 'app_version': APP_BUILD_ID,
-            'platform': 'ios', 'telegram_version': '8.0', 'code': 'API_TIMEOUT',
-            'boot_id': 'boot-compat-1',
+            'build_id': APP_BUILD_ID, 'last_boot_stage': 'STATE_REQUEST',
+            'platform': 'ios', 'telegram_version': '8.0', 'elapsed_ms': 10000,
+            'error_code': 'API_TIMEOUT',
         })
         self.assertEqual(response.status, 200)
         self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
-        self.core.LOGGER.info.assert_called()
+        self.core.LOGGER.warning.assert_called_once_with(
+            'miniapp_boot_failed build=%s platform=%s stage=%s error=%s elapsed_ms=%s',
+            APP_BUILD_ID, 'ios', 'STATE_REQUEST', 'API_TIMEOUT', 10000,
+        )
 
         invalid = await self.client.post('/api/v1/miniapp/boot-telemetry', json={
-            'stage': 'not_a_boot_stage', 'init_data': 'secret',
+            'build_id': APP_BUILD_ID, 'last_boot_stage': 'TG_DATA', 'platform': 'ios',
+            'telegram_version': '8.0', 'elapsed_ms': 1, 'error_code': 'INITDATA_MISSING',
+            'init_data': 'secret',
         })
         self.assertEqual(invalid.status, 400)
+        self.assertEqual(self.core.LOGGER.warning.call_count, 1)
+        self.assertNotIn("secret", repr(self.core.LOGGER.warning.call_args))
 
     async def test_vosk_wake_model_is_served_at_runtime_asset_path(self):
         response = await self.client.get('/app/assets/models/vosk-model-small-ru-0.22.tar.gz')
@@ -433,8 +440,9 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("boot-recovery", index)
         self.assertIn("window.addEventListener('unhandledrejection'", index)
         self.assertIn("window.addEventListener('error'", index)
-        self.assertIn("sdk_load_failed", index)
-        self.assertIn("boot_id", index)
+        self.assertIn("lastBootStage='HTML'", index)
+        self.assertIn("reportFailure", index)
+        self.assertIn("last_boot_stage", index)
         self.assertIn("AbortController", app_source)
         self.assertIn("SESSION_EXPIRED", app_source)
         self.assertIn("waitForTelegram", screen_source)
