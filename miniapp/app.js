@@ -90,7 +90,7 @@ async function api(action,args={},options={}){
   const abort=()=>{timedOut=true;controller?.abort?.()};
   options.signal?.addEventListener?.('abort',abort,{once:true});
   const timeout=timeoutMs?setTimeout(abort,timeoutMs):0;
-  try{const initData=tg?.initData;if(!initData)throw bootError('INITDATA_MISSING');const request={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:initData,action,args})};if(controller)request.signal=controller.signal;const pending=fetch('/api/v1/miniapp',request);const response=controller?await pending:await(timeoutMs?Promise.race([pending,new Promise((_,reject)=>setTimeout(()=>reject(bootError('API_TIMEOUT')),timeoutMs))]):pending);
+  try{const initData=tg?.initData||window.NoemaBoot?.initData?.();if(!initData)throw bootError('INITDATA_MISSING');const request={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({init_data:initData,action,args})};if(controller)request.signal=controller.signal;const pending=fetch('/api/v1/miniapp',request);const response=controller?await pending:await(timeoutMs?Promise.race([pending,new Promise((_,reject)=>setTimeout(()=>reject(bootError('API_TIMEOUT')),timeoutMs))]):pending);
    if(response.status===401||response.status===403)throw bootError('SESSION_EXPIRED');
    const result=await response.json();if(!response.ok||!result.ok)throw Error(result.error||'Нет соединения с Noema.');return result.data}
   catch(error){if(timedOut||controller?.signal?.aborted)throw bootError(timeoutMs?'API_TIMEOUT':'REQUEST_ABORTED');throw error}

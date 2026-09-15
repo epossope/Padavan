@@ -1,13 +1,14 @@
 import asyncio
 import json
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from miniapp_api import APP_BUILD_ID, register_miniapp
+from miniapp_api import APP_BUILD_ID, MINIAPP_BUILD_ASSETS, miniapp_build_id, register_miniapp
 
 
 class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +94,20 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         stale = await self.client.get('/app/assets/app.js?v=ui-legacy')
         self.assertEqual(stale.status, 200)
         self.assertEqual(stale.headers.get('Cache-Control'), 'no-cache')
+
+    def test_content_addressed_build_changes_with_any_production_asset(self):
+        root = Path(__file__).parent.parent / "miniapp"
+        with tempfile.TemporaryDirectory() as temporary:
+            copied = Path(temporary) / "miniapp"
+            copied.mkdir()
+            for name in MINIAPP_BUILD_ASSETS:
+                (copied / name).write_bytes((root / name).read_bytes())
+            build_a = miniapp_build_id(copied)
+            (copied / "app.js").write_bytes((copied / "app.js").read_bytes() + b"\n/* deploy B */\n")
+            build_b = miniapp_build_id(copied)
+        self.assertRegex(build_a, r"^ui-[0-9a-f]{12}$")
+        self.assertNotEqual(build_a, build_b)
+        self.assertNotEqual(APP_BUILD_ID, "ui-1.12.0")
 
     async def test_boot_telemetry_is_allowlisted_and_non_sensitive(self):
         response = await self.client.post('/api/v1/miniapp/boot-telemetry', json={

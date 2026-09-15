@@ -1,6 +1,7 @@
 """Same-origin Telegram Mini App API; all data is scoped to signed Telegram identity."""
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import tempfile
@@ -14,12 +15,32 @@ from urllib.parse import quote
 from aiohttp import web
 
 
-APP_BUILD_ID = "ui-1.12.0"
+MINIAPP_BUILD_ASSETS = (
+    "index.html", "tokens.js", "ui.js", "orb.js", "app.js", "screens.js", "mobile.js", "voice-conversation.js",
+    "style.css", "mobile.css", "refinement.css", "design-match.css", "EAGENT_DESIGN_TOKENS.json",
+)
+
+
+def miniapp_build_id(root: Path) -> str:
+    """Stable content address for every immutable Mini App asset, without Git."""
+    configured = os.getenv("NOEMA_BUILD_ID", "").strip()
+    if configured:
+        safe = "".join(char for char in configured if char.isascii() and (char.isalnum() or char in "._-"))[:80]
+        if safe:
+            return safe
+    digest = hashlib.sha256()
+    for name in MINIAPP_BUILD_ASSETS:
+        content = (root / name).read_bytes()
+        digest.update(name.encode("utf-8") + b"\0" + content + b"\0")
+    return "ui-" + digest.hexdigest()[:12]
+
+
+APP_BUILD_ID = miniapp_build_id(Path(__file__).parent / "miniapp")
 BOOT_TELEMETRY_STAGES = {
     "boot_started", "js_ready", "telegram_ready", "initdata_present",
     "auth_started", "auth_ok", "auth_failed", "bootstrap_started",
     "bootstrap_ok", "bootstrap_failed", "render_ready", "boot_timeout",
-    "window_error", "unhandledrejection", "sdk_load_failed", "sdk_loaded",
+    "window_error", "unhandledrejection", "sdk_load_failed", "sdk_loaded", "telegram_fallback",
 }
 
 
@@ -417,9 +438,14 @@ def register_miniapp(app, core):
             else:
                 raise ValueError("Неизвестное действие")
             duration_ms = (time.perf_counter() - started) * 1000
+            headers = {"Cache-Control": "no-store", "Server-Timing": f"ui_action;dur={duration_ms:.1f}"}
+            if action == "state":
+                state_bytes = len(json.dumps({"ok": True, "data": result}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                headers["X-Noema-State-Bytes"] = str(state_bytes)
+                core.LOGGER.info("miniapp_state bytes=%s duration_ms=%.1f", state_bytes, duration_ms)
             return web.json_response(
                 {"ok": True, "data": result},
-                headers={"Cache-Control": "no-store", "Server-Timing": f"ui_action;dur={duration_ms:.1f}"},
+                headers=headers,
             )
         except web.HTTPException:
             raise
