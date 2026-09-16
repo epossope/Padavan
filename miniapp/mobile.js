@@ -29,13 +29,15 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
 
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
+ const gestureConstants=Object.freeze({intentPx:10,dominance:1.2,commitProgress:.32,velocity:.34,edgeZone:56,settleMin:170,settleMax:280});
+ window.NoemaGestures={constants:gestureConstants,classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(Math.abs(dx)>30&&Math.abs(velocity)>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.55,Math.abs(velocity)*1.35))))}};
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
- function edgeSwipeStartZone(){return innerWidth*.5}
+ function edgeSwipeStartZone(){return Math.min(gestureConstants.edgeZone,innerWidth*.5)}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
  /* Budget charts are vertical/static content, not horizontal controls. Blocking
     their cards made an edge swipe work everywhere except Budget on iOS. */
  function hasTextSelection(target){const selection=window.getSelection?.();return Boolean(selection&&selection.type==='Range'&&selection.toString()&&target.closest('.bubble,.message-text,.message-content,pre,code'))}
- function blocksEdgeSwipe(target){return hasTextSelection(target)||Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
+ function blocksEdgeSwipe(target){return hasTextSelection(target)||Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing,.budget-chart'))}
  function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
  function renderEdgeSwipe(){edgeSwipeFrame=0;if(!edgeSwipe||edgeSwipe.axis!=='x')return;const shell=document.querySelector('#shell');if(!shell)return;edgeSwipe.rendered=clampedSwipeDistance(edgeSwipe.dx);shell.classList.add('edge-swipe-active');shell.style.setProperty('--edge-swipe-x',edgeSwipe.rendered+'px');shell.style.setProperty('--edge-swipe-progress',Math.min(1,edgeSwipe.rendered/innerWidth))}
  function scheduleEdgeSwipe(){if(!edgeSwipeFrame)edgeSwipeFrame=requestAnimationFrame(renderEdgeSwipe)}
@@ -45,28 +47,29 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
   if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0;renderEdgeSwipe()}
   edgeSwipeFinishing=true;
   const current=Math.max(0,edgeSwipe?.rendered||0),distance=commit?innerWidth:0,remaining=Math.abs(distance-current);
-  const projectedSpeed=Math.max(.55,Math.abs(velocity)*1.35),duration=Math.round(Math.min(commit?310:250,Math.max(commit?170:150,remaining/projectedSpeed)));
+  const duration=window.NoemaGestures.settleDuration(remaining,velocity);
   shell.style.setProperty('--edge-swipe-duration',duration+'ms');shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',distance+'px');shell.style.setProperty('--edge-swipe-progress',commit?1:0);
   let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);shell.classList.remove('edge-swipe-settling');if(commit){shell.classList.add('edge-swipe-reset');window.NoemaBack?.();shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');void shell.offsetWidth;shell.classList.remove('edge-swipe-reset')}else{shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress')}shell.style.removeProperty('--edge-swipe-duration');edgeSwipeFinishing=false};
   const onEnd=event=>{if(event.target===shell&&event.propertyName==='transform')complete()};shell.addEventListener('transitionend',onEnd);edgeSwipeTimer=setTimeout(complete,duration+80)
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false,edgeSwipe.velocity);else if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0}edgeSwipe=null}
  function beginEdgeSwipe(id,x,y,target,source){
-  if(edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone()||blocksEdgeSwipe(target))return false;
+  const chartEdge=Boolean(target.closest?.('.budget-chart'))&&x<=edgeSwipeStartZone();
+  if(edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone()||(blocksEdgeSwipe(target)&&!chartEdge))return false;
   edgeSwipe={x,y,id,source,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:performance.now(),startedAt:performance.now(),velocity:0,rendered:0};return true
  }
  function moveEdgeSwipe(id,x,y,event){
   if(!edgeSwipe||id!==edgeSwipe.id)return false;
   if(hasTextSelection(event.target)){edgeSwipe=null;return false}
   const now=performance.now(),instant=(x-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.dx=x-edgeSwipe.x;edgeSwipe.dy=y-edgeSwipe.y;edgeSwipe.velocity=edgeSwipe.velocity*.68+instant*.32;edgeSwipe.lastX=x;edgeSwipe.lastAt=now;
-  if(!edgeSwipe.axis&&Math.hypot(edgeSwipe.dx,edgeSwipe.dy)>=7)edgeSwipe.axis=Math.abs(edgeSwipe.dx)>Math.abs(edgeSwipe.dy)*1.2&&edgeSwipe.dx>0?'x':'cancel';
+  if(!edgeSwipe.axis){const intent=window.NoemaGestures.classify(edgeSwipe.dx,edgeSwipe.dy);if(intent==='horizontal')edgeSwipe.axis=edgeSwipe.dx>0?'x':'cancel';else if(intent==='vertical')edgeSwipe.axis='cancel'}
   if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return false}
   if(edgeSwipe.axis==='x'){event.preventDefault();scheduleEdgeSwipe();return true}return false
  }
  function endEdgeSwipe(id){
   if(!edgeSwipe||id!==edgeSwipe.id)return false;
   const {dx,axis,velocity,startedAt}=edgeSwipe;
-  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=dx>=innerWidth*.23||(dx>30&&releaseVelocity>.34);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
+  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=window.NoemaGestures.shouldCommit(dx,innerWidth,releaseVelocity);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
  }
  document.addEventListener('pointerdown',e=>{
   if(e.pointerType==='mouse'||e.isPrimary===false)return;beginEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e.target,'pointer');
@@ -80,4 +83,23 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
  document.addEventListener('touchmove',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.touches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)moveEdgeSwipe(edgeSwipe.id,touch.clientX,touch.clientY,e)},{passive:false,capture:true});
  document.addEventListener('touchend',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.changedTouches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)endEdgeSwipe(edgeSwipe.id)},{passive:true,capture:true});
  document.addEventListener('touchcancel',e=>{if(edgeSwipe?.source==='touch')cancelEdgeSwipe()},{passive:true,capture:true});
+
+ /* Local Budget chart controller.  It shares the intent/velocity/settle rules
+    with edge-back, but owns normal chart drags so they never navigate away. */
+ let chartSwipe=null,chartFrame=0,chartTimer=0;
+ function chartNode(target){return target?.closest?.('[data-budget-chart]')}
+ function drawChartSwipe(){chartFrame=0;if(!chartSwipe?.axis)return;const node=chartSwipe.node;if(!node)return;node.classList.add('budget-chart-dragging');node.style.setProperty('--budget-chart-drag-x',`${chartSwipe.dx}px`)}
+ function scheduleChartSwipe(){if(!chartFrame)chartFrame=requestAnimationFrame(drawChartSwipe)}
+ function finishChartSwipe(commit){const swipe=chartSwipe;if(!swipe)return;const node=swipe.node,width=Math.max(1,node.getBoundingClientRect().width),destination=commit?(swipe.dx<0?-width:width):0,remaining=Math.abs(destination-swipe.dx),duration=window.NoemaGestures.settleDuration(remaining,swipe.velocity);if(chartFrame){cancelAnimationFrame(chartFrame);chartFrame=0;drawChartSwipe()}node.classList.remove('budget-chart-dragging');node.classList.add('budget-chart-settling');node.style.setProperty('--budget-chart-drag-x',`${destination}px`);let settled=false;const done=()=>{if(settled)return;settled=true;clearTimeout(chartTimer);node.removeEventListener('transitionend',onEnd);node.classList.remove('budget-chart-settling');node.style.removeProperty('--budget-chart-drag-x');if(commit)window.NoemaBudgetPeriodGesture?.(swipe.dx<0?1:-1);chartSwipe=null};const onEnd=event=>{if(event.target===node&&event.propertyName==='transform')done()};node.style.setProperty('--budget-chart-duration',`${duration}ms`);node.addEventListener('transitionend',onEnd);chartTimer=setTimeout(done,duration+80)}
+ function beginChartSwipe(id,x,y,target,source){const node=chartNode(target);if(!node||chartSwipe||x<=edgeSwipeStartZone()&&canSwipeBack())return;chartSwipe={id,x,y,lastX:x,lastAt:performance.now(),dx:0,dy:0,velocity:0,axis:null,node,source}}
+ function moveChartSwipe(id,x,y,event){const swipe=chartSwipe;if(!swipe||swipe.id!==id)return false;const now=performance.now(),instant=(x-swipe.lastX)/Math.max(1,now-swipe.lastAt);swipe.dx=x-swipe.x;swipe.dy=y-swipe.y;swipe.velocity=swipe.velocity*.68+instant*.32;swipe.lastX=x;swipe.lastAt=now;if(!swipe.axis){const intent=window.NoemaGestures.classify(swipe.dx,swipe.dy);if(intent==='horizontal')swipe.axis='x';else if(intent==='vertical'){chartSwipe=null;return false}}if(swipe.axis==='x'){event.preventDefault();scheduleChartSwipe();return true}return false}
+ function endChartSwipe(id){const swipe=chartSwipe;if(!swipe||swipe.id!==id)return false;if(swipe.axis!=='x'){chartSwipe=null;return false}finishChartSwipe(window.NoemaGestures.shouldCommit(Math.abs(swipe.dx),Math.max(1,swipe.node.getBoundingClientRect().width),swipe.velocity));return true}
+ document.addEventListener('pointerdown',e=>{if(e.pointerType!=='mouse'&&e.isPrimary!==false)beginChartSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e.target,'pointer')},{passive:true,capture:true});
+ document.addEventListener('pointermove',e=>moveChartSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e),{passive:false,capture:true});
+ document.addEventListener('pointerup',e=>endChartSwipe(`pointer:${e.pointerId}`),{passive:true,capture:true});
+ document.addEventListener('pointercancel',e=>{if(chartSwipe?.id===`pointer:${e.pointerId}`)finishChartSwipe(false)},{passive:true,capture:true});
+ document.addEventListener('touchstart',e=>{if(chartSwipe||e.touches.length!==1)return;const touch=e.touches[0];beginChartSwipe(`touch:${touch.identifier}`,touch.clientX,touch.clientY,e.target,'touch')},{passive:true,capture:true});
+ document.addEventListener('touchmove',e=>{if(chartSwipe?.source!=='touch')return;const touch=[...e.touches].find(item=>`touch:${item.identifier}`===chartSwipe.id);if(touch)moveChartSwipe(chartSwipe.id,touch.clientX,touch.clientY,e)},{passive:false,capture:true});
+ document.addEventListener('touchend',e=>{if(chartSwipe?.source!=='touch')return;const touch=[...e.changedTouches].find(item=>`touch:${item.identifier}`===chartSwipe.id);if(touch)endChartSwipe(chartSwipe.id)},{passive:true,capture:true});
+ document.addEventListener('touchcancel',()=>{if(chartSwipe)finishChartSwipe(false)},{passive:true,capture:true});
 })();
