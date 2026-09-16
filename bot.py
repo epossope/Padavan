@@ -519,6 +519,18 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"person_media_list",
+        "description":"Получить только явно связанные с профилем человека изображения. Используй для вопроса о фото конкретного человека; не ищи по предположениям.",
+        "parameters":{"type":"object","properties":{"person_id":{"type":"integer"},"profile_only":{"type":"boolean"}},"required":["person_id"]}
+    }},
+
+    {"type":"function","function":{
+        "name":"link_person_media",
+        "description":"Явно привязать уже сохранённое изображение к человеку. Используй только если пользователь однозначно назвал человека и файл.",
+        "parameters":{"type":"object","properties":{"person_id":{"type":"integer"},"file_id":{"type":"integer"},"relation_type":{"type":"string","enum":["photo","profile_photo"]}},"required":["person_id","file_id"]}
+    }},
+
+    {"type":"function","function":{
 
         "name":"delete_note",
 
@@ -605,6 +617,12 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"delete_file",
+        "description":"Удалить сохранённый файл текущего пользователя по id. Связи с людьми и текущая фотография профиля очищаются безопасно.",
+        "parameters":{"type":"object","properties":{"file_id":{"type":"integer"}},"required":["file_id"]}
+    }},
+
+    {"type":"function","function":{
 
         "name":"get_file_from_telegram",
 
@@ -677,7 +695,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
 
 # Files received from Telegram are handled by the ingestion pipeline, not by
 # model-callable filesystem tools. artifact_create is the sole generated-file
@@ -768,6 +786,19 @@ def build_inquiry_input(result):
     return ("[Сохранено в память]\n" + body) if body else None
 
 
+def _canonical_person_name(value):
+    """Comparison key for an explicit person name; intentionally no fuzzy match."""
+    return " ".join(str(value or "").casefold().split())
+
+
+def _person_by_explicit_name(chat_id, name):
+    needle = _canonical_person_name(name)
+    with conn() as c:
+        rows = c.execute("SELECT id,name FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+    matches = [dict(row) for row in rows if _canonical_person_name(row["name"]) == needle]
+    return matches[0] if len(matches) == 1 else None
+
+
 def link_person_avatar_from_caption(chat_id, caption, ingestion_result):
     """Link an ingested image only for an explicit, unambiguous person-photo phrase."""
     text = str(caption or "").strip()
@@ -778,8 +809,9 @@ def link_person_avatar_from_caption(chat_id, caption, ingestion_result):
     if not image:
         return {"matched": False}
     create = re.search(r"(?iu)\bэто\s+мо(?:й|я)\s+(друг|подруга|коллега|мама|папа|брат|сестра)\s+([а-яё][а-яё-]{1,40})\b", text)
-    replace = re.search(r"(?iu)\b(?:поменяй|замени|обнови)\s+фото\s+([а-яё][а-яё-]{1,40})\b", text)
-    if not create and not replace:
+    replace = re.search(r"(?iu)\b(?:поменяй|замени|обнови|поставь)\s+(?:фото|аватар)\s+([а-яё][а-яё-]{1,40})\b", text)
+    bind = re.search(r"(?iu)\b(?:это\s+)?фото\s+([а-яё][а-яё-]{1,40})\b", text)
+    if not create and not replace and not bind:
         if re.search(r"(?iu)\b(?:это|фото|аватар)\b.*\b(?:друг\w*|человек\w*|контакт\w*|его|её)\b", text):
             return {"matched": True, "needs_clarification": True, "reply": "Уточни, пожалуйста, имя человека для этого фото."}
         return {"matched": False}
@@ -789,18 +821,26 @@ def link_person_avatar_from_caption(chat_id, caption, ingestion_result):
         group = {"друг": "Друзья", "подруга": "Друзья", "коллега": "Работа",
                  "мама": "Семья", "папа": "Семья", "брат": "Семья", "сестра": "Семья"}[relation.lower()]
         person = person_upsert(chat_id, name, relationship=relation.lower(), groups=[group])
-    else:
+        linked = set_person_avatar(chat_id, person["id"], image["id"])
+        reply = f"Фото для {person['name']} обновлено."
+    elif replace:
         raw_name = replace.group(1)
-        needle = raw_name.lower()
-        with conn() as c:
-            rows = c.execute("SELECT id,name FROM people WHERE chat_id=? AND (lower(name)=? OR lower(name) LIKE ?)",
-                             (chat_id, needle, needle.rstrip("аяыи") + "%")).fetchall()
-        if len(rows) != 1:
+        person = _person_by_explicit_name(chat_id, raw_name)
+        if not person:
             return {"matched": True, "needs_clarification": True, "reply": "Уточни, пожалуйста, кому именно заменить фото."}
-        person = {"id": rows[0]["id"], "name": rows[0]["name"]}
-    linked = set_person_avatar(chat_id, person["id"], image["id"])
+        linked = set_person_avatar(chat_id, person["id"], image["id"])
+        reply = f"Фото для {person['name']} обновлено."
+    elif bind:
+        person = _person_by_explicit_name(chat_id, bind.group(1))
+        if not person:
+            return {"matched": True, "needs_clarification": True, "reply": "Уточни, пожалуйста, кому принадлежит это фото."}
+        linked = link_person_media(chat_id, person["id"], image["id"], "photo")
+        reply = f"Фото привязано к {person['name']}."
+    else:
+        linked = set_person_avatar(chat_id, person["id"], image["id"])
+        reply = f"Фото для {person['name']} обновлено."
     return {"matched": True, "linked": bool(linked.get("ok")), "person_id": person["id"],
-            "reply": f"Фото для {person['name']} обновлено." if linked.get("ok") else "Не удалось связать фото с профилем."}
+            "reply": reply if linked.get("ok") else "Не удалось связать фото с профилем."}
 
 
 # ---------- AGENT RETRIEVAL TOOLS ----------
@@ -1797,6 +1837,16 @@ def init_db():
             extracted_text TEXT,created_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS person_media(
+            chat_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(person_id,file_id,relation_type)
+        );
+
         """)
 
         # migrate older prototype DBs
@@ -1823,6 +1873,8 @@ def init_db():
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_chat_created ON usage_events(chat_id,created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_request_events_chat_created ON user_request_events(chat_id,created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_person ON person_media(chat_id,person_id,is_current)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_file ON person_media(chat_id,file_id)")
 
     KnowledgeStore(DB).init_schema()
 
@@ -3295,6 +3347,12 @@ def get_people(chat_id,query=""):
 
             d["recent_interactions"]=[dict(x) for x in ints]
 
+            media_rows = c.execute("""SELECT pm.file_id,pm.relation_type,pm.is_current,
+                f.mime_type,f.created_at FROM person_media pm JOIN files f ON f.id=pm.file_id
+                WHERE pm.chat_id=? AND pm.person_id=? ORDER BY pm.is_current DESC,pm.created_at DESC""",
+                (chat_id, r["id"])).fetchall()
+            d["media"] = [dict(item) for item in media_rows]
+
             out.append(d)
 
     return {"ok":True,"tool":"get_people","people":out}
@@ -3388,21 +3446,65 @@ def delete_task(chat_id,task_id):
 def delete_person(chat_id,person_id):
 
     with conn() as c:
+        c.execute("DELETE FROM person_media WHERE chat_id=? AND person_id=?", (chat_id, person_id))
         cur = c.execute("DELETE FROM people WHERE id=? AND chat_id=?", (person_id,chat_id))
     return {"ok":True,"tool":"delete_person","deleted":cur.rowcount}
 
 
+def link_person_media(chat_id, person_id, file_id, relation_type="photo"):
+    """Attach one existing file to one existing person without duplicating it."""
+    if relation_type not in {"photo", "profile_photo"}:
+        return {"ok": False, "tool": "link_person_media", "error": "invalid_relation"}
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (int(person_id), chat_id)).fetchone()
+        image = c.execute("SELECT id,mime_type FROM files WHERE id=? AND chat_id=?", (int(file_id), chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "link_person_media", "error": "person_not_found"}
+        if not image or not str(image["mime_type"] or "").startswith("image/"):
+            return {"ok": False, "tool": "link_person_media", "error": "image_not_found"}
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute("INSERT OR IGNORE INTO person_media(chat_id,person_id,file_id,relation_type,is_current,created_at) VALUES(?,?,?,?,?,?)",
+                  (chat_id, int(person_id), int(file_id), "photo", 0, now))
+        if relation_type == "profile_photo":
+            c.execute("UPDATE person_media SET is_current=0 WHERE chat_id=? AND person_id=? AND relation_type='profile_photo'",
+                      (chat_id, int(person_id)))
+            c.execute("INSERT INTO person_media(chat_id,person_id,file_id,relation_type,is_current,created_at) VALUES(?,?,?,?,?,?) "
+                      "ON CONFLICT(person_id,file_id,relation_type) DO UPDATE SET is_current=1,created_at=excluded.created_at",
+                      (chat_id, int(person_id), int(file_id), "profile_photo", 1, now))
+            c.execute("UPDATE people SET avatar_file_id=?,updated_at=? WHERE id=? AND chat_id=?",
+                      (int(file_id), now, int(person_id), chat_id))
+    return {"ok": True, "tool": "link_person_media", "person_id": int(person_id), "file_id": int(file_id), "relation_type": relation_type}
+
+
+def person_media_list(chat_id, person_id, profile_only=False):
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (int(person_id), chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "person_media_list", "error": "person_not_found"}
+        query = """SELECT pm.file_id,pm.relation_type,pm.is_current,f.original_name,f.mime_type,f.kind,f.summary,f.created_at
+                   FROM person_media pm JOIN files f ON f.id=pm.file_id
+                   WHERE pm.chat_id=? AND pm.person_id=?"""
+        args = [chat_id, int(person_id)]
+        if profile_only:
+            query += " AND pm.relation_type='profile_photo' AND pm.is_current=1"
+        query += " ORDER BY pm.is_current DESC,pm.created_at DESC"
+        rows = [dict(row) for row in c.execute(query, args).fetchall()]
+    return {"ok": True, "tool": "person_media_list", "person_id": int(person_id), "items": rows}
+
+
 def set_person_avatar(chat_id, person_id, file_id=None):
+    if file_id is not None:
+        result = link_person_media(chat_id, person_id, file_id, "profile_photo")
+        result["tool"] = "set_person_avatar"
+        return result
     with conn() as c:
         person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (int(person_id), chat_id)).fetchone()
         if not person:
             return {"ok": False, "tool": "set_person_avatar", "error": "person_not_found"}
-        if file_id is not None:
-            image = c.execute("SELECT id,mime_type FROM files WHERE id=? AND chat_id=?", (int(file_id), chat_id)).fetchone()
-            if not image or not str(image["mime_type"] or "").startswith("image/"):
-                return {"ok": False, "tool": "set_person_avatar", "error": "image_not_found"}
+        c.execute("UPDATE person_media SET is_current=0 WHERE chat_id=? AND person_id=? AND relation_type='profile_photo'",
+                  (chat_id, int(person_id)))
         c.execute("UPDATE people SET avatar_file_id=?,updated_at=? WHERE id=? AND chat_id=?",
-                  (int(file_id) if file_id is not None else None, datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
+                  (None, datetime.now(timezone.utc).isoformat(), int(person_id), chat_id))
     return {"ok": True, "tool": "set_person_avatar", "person_id": int(person_id), "file_id": int(file_id) if file_id is not None else None}
 
 
@@ -3433,6 +3535,27 @@ def get_files(chat_id,kind=None,limit=5):
     with conn() as c:
         rows=c.execute(q,args).fetchall()
     return {"ok":True,"tool":"get_files","files":[dict(r) for r in rows]}
+
+
+def delete_file(chat_id, file_id):
+    """Remove one owned stored file and its person relations atomically in SQLite."""
+    with conn() as c:
+        row = c.execute("SELECT local_path FROM files WHERE id=? AND chat_id=?", (int(file_id), chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "tool": "delete_file", "error": "not_found"}
+        c.execute("DELETE FROM person_media WHERE chat_id=? AND file_id=?", (chat_id, int(file_id)))
+        c.execute("UPDATE people SET avatar_file_id=NULL,updated_at=? WHERE chat_id=? AND avatar_file_id=?",
+                  (datetime.now(timezone.utc).isoformat(), chat_id, int(file_id)))
+        c.execute("DELETE FROM files WHERE id=? AND chat_id=?", (int(file_id), chat_id))
+    # The path is server generated.  Refuse to unlink anything outside the
+    # configured storage root even if an old database row was corrupted.
+    try:
+        path, root = Path(row["local_path"]).resolve(), Path(STORAGE_ROOT).resolve()
+        if root in path.parents and path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+    return {"ok": True, "tool": "delete_file", "deleted": 1}
 
 
 def execute_tool(chat_id,name,args):
@@ -3495,6 +3618,10 @@ def execute_tool(chat_id,name,args):
 
         "get_people":get_people,
 
+        "person_media_list":person_media_list,
+
+        "link_person_media":link_person_media,
+
         "delete_note":delete_note,
 
         "delete_expense":delete_expense,
@@ -3510,6 +3637,8 @@ def execute_tool(chat_id,name,args):
         "save_image_to_db":save_image_to_db,
 
         "get_files":get_files,
+
+        "delete_file":delete_file,
 
         "get_file_from_telegram":get_file_from_telegram,
 
@@ -7401,7 +7530,7 @@ async def image_handler(update,context):
 
             src_image=msg.document if (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")) else msg.photo[-1]
 
-            orig_name=(msg.document.file_name if msg.document else None) or f"image_{datetime.now().strftime("%Y%m%d%H%M%S")}.img"
+            orig_name=(msg.document.file_name if msg.document else None) or f"image_{datetime.now().strftime('%Y%m%d%H%M%S')}.img"
 
             reply_body=((getattr(msg.reply_to_message,"text",None) if msg.reply_to_message else None) or (getattr(msg.reply_to_message,"caption",None) if msg.reply_to_message else None) or "")
 

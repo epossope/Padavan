@@ -7,3 +7,4 @@ aiohttp>=3.10,<4
 cryptography>=43,<46
 pypdf>=5,<7
 lxml>=5,<7
+Pillow>=10,<12

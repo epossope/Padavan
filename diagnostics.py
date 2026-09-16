@@ -15,6 +15,7 @@ class DiagnosticsJournal:
         "people_ms", "files_ms", "knowledge_ms", "serialize_ms", "total_ms",
         "error_class", "error_code", "source", "status", "action", "attempt",
         "event_loop_lag_ms", "delivered", "operation", "result",
+        "media_kind", "cache", "size_bucket", "duration_bucket",
     }
 
     def __init__(self, directory: Path, max_bytes=5 * 1024 * 1024, backups=2):

@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import quote as url_quote
 
 from aiohttp import web
+from media_cache import image_thumbnail, thumbnail_version
 
 
 MINIAPP_BUILD_ASSETS = (
@@ -438,6 +439,22 @@ def register_miniapp(app, core):
                 if not row or not row["local_path"] or not Path(row["local_path"]).is_file():
                     raise web.HTTPNotFound(text="Файл недоступен")
                 return web.FileResponse(row["local_path"], headers={"Cache-Control": "no-store", "Content-Disposition": "attachment"})
+            elif action == "thumbnail":
+                with core.conn() as c:
+                    row = c.execute("SELECT local_path,mime_type FROM files WHERE chat_id=? AND id=?", (cid, int(args["id"]))).fetchone()
+                if not row or not str(row["mime_type"] or "").startswith("image/") or not row["local_path"] or not Path(row["local_path"]).is_file():
+                    raise web.HTTPNotFound(text="Изображение недоступно")
+                thumbnail_started = time.perf_counter()
+                cached, hit = await asyncio.to_thread(image_thumbnail, row["local_path"], Path(core.STORAGE_ROOT) / "media_thumbnails")
+                if not cached:
+                    raise web.HTTPNotFound(text="Миниатюра недоступна")
+                diagnostic("media_thumbnail", media_kind="image", cache="hit" if hit else "miss",
+                           duration_ms=(time.perf_counter() - thumbnail_started) * 1000)
+                return web.FileResponse(cached, headers={
+                    "Cache-Control": "private, max-age=86400",
+                    "X-Content-Type-Options": "nosniff",
+                    "Vary": "Cookie",
+                })
             elif action == "artifact":
                 artifact_id = str(args.get("artifact_id") or "")
                 if not artifact_id or len(artifact_id) > 64:
@@ -611,9 +628,17 @@ def register_miniapp(app, core):
             relations = {row["file_id"]: dict(row) for row in c.execute(
                 "SELECT kf.file_id,ki.project_id,ki.tags_json,ki.entities_json,ki.urls_json,ki.source_message_id "
                 "FROM knowledge_files kf JOIN knowledge_items ki ON ki.id=kf.knowledge_id WHERE ki.chat_id=? ORDER BY ki.id DESC", (cid,))}
+            person_media = {}
+            for row in c.execute("""SELECT pm.file_id,pm.person_id,pm.relation_type,pm.is_current,p.name
+                                  FROM person_media pm JOIN people p ON p.id=pm.person_id
+                                  WHERE pm.chat_id=? ORDER BY pm.is_current DESC,pm.created_at DESC""", (cid,)):
+                person_media.setdefault(row["file_id"], []).append({
+                    "person_id": row["person_id"], "name": row["name"],
+                    "relation_type": row["relation_type"], "is_current": bool(row["is_current"]),
+                })
         timings["knowledge_ms"] = (time.perf_counter() - started) * 1000
         for item in files:
-            item.pop("local_path", None)
+            local_path = item.pop("local_path", None)
             relation = relations.get(item["id"], {})
             item["project"] = relation.get("project_id") or ""
             for source, target in (("tags_json", "tags"), ("entities_json", "people"), ("urls_json", "urls")):
@@ -623,6 +648,12 @@ def register_miniapp(app, core):
                     value = []
                 item[target] = value if isinstance(value, list) else []
             item["source"] = "Telegram" if relation.get("source_message_id") else "Mini App"
+            item["person_media"] = person_media.get(item["id"], [])
+            if str(item.get("mime_type") or "").startswith("image/") and local_path and Path(local_path).is_file():
+                try:
+                    item["thumbnail_version"] = thumbnail_version(local_path)
+                except OSError:
+                    item["thumbnail_version"] = ""
         beta_available = cid in getattr(core, "ADMIN_CHAT_IDS", set())
         realtime_beta = wake_enabled = False
         if beta_available and callable(getattr(core, "app_setting", None)):
