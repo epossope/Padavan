@@ -16,6 +16,10 @@ class DiagnosticsJournal:
         "error_class", "error_code", "source", "status", "action", "attempt",
         "event_loop_lag_ms", "delivered", "operation", "result",
         "media_kind", "cache", "size_bucket", "duration_bucket",
+        "rss_mb", "rss_peak_mb", "thread_count", "open_fds",
+        "thumbnail_cache_count", "download_ticket_cache_count",
+        "weather_cache_count", "exchange_cache_count", "miniapp_lock_count",
+        "miniapp_job_count", "active_stream_count", "activity",
     }
 
     def __init__(self, directory: Path, max_bytes=5 * 1024 * 1024, backups=2):
