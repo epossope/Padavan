@@ -43,6 +43,9 @@ body{font-weight:300}header h1{font-family:var(--font-ui);font-weight:300;text-t
 @media(min-width:680px){.distribution-body{display:flex;align-items:center;gap:20px}.budget-donut{flex-basis:154px;width:154px;height:154px}}
 @media(max-width:470px){.distribution-body{display:grid;gap:10px}.budget-donut{justify-self:center}.expense-category{padding-top:6px;padding-bottom:6px}.expense-category b,.expense-category strong{font-size:16px}.budget-chart .bar-group small{font-size:8px}}
 
+/* Fixed plot baseline: a value changes only the fill height, never its date. */
+.budget-chart .bars{justify-content:center;gap:5px}.budget-chart .bar-group{flex:1 1 0;max-width:54px}.budget-chart .bar-group i{align-self:end}.budget-chart .bar-group small{align-self:end}
+
 /* Runtime viewport safeguards stay independent from the restored visual system. */
 html{-webkit-text-size-adjust:100%;text-size-adjust:100%;background:var(--bg);overscroll-behavior:none}body{min-height:100dvh;overflow-x:clip;overscroll-behavior-y:none}#shell{position:relative;width:100%;min-height:var(--visible-height,100dvh)}#content{min-width:0}
 

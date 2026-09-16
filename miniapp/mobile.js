@@ -29,14 +29,14 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
 
  /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
     scrolling and horizontal controls before it acquires the gesture. */
- const gestureConstants=Object.freeze({intentPx:10,dominance:1.2,commitProgress:.32,velocity:.34,edgeZone:32,settleMin:180,settleMax:260});
+ const gestureConstants=Object.freeze({intentPx:10,dominance:1.2,commitProgress:.30,velocity:.32,edgeZone:44,settleMin:180,settleMax:260});
  window.NoemaGestures={constants:gestureConstants,classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(Math.abs(dx)>30&&Math.abs(velocity)>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.55,Math.abs(velocity)*1.35))))}};
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
  function edgeSwipeStartZone(){return Math.min(gestureConstants.edgeZone,innerWidth*.5)}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
  /* Budget charts are vertical/static content, not horizontal controls. Blocking
     their cards made an edge swipe work everywhere except Budget on iOS. */
- function hasTextSelection(target){const selection=window.getSelection?.();return Boolean(selection&&selection.type==='Range'&&selection.toString()&&target.closest('.bubble,.message-text,.message-content,pre,code'))}
+ function hasTextSelection(){const selection=window.getSelection?.();return Boolean(selection&&selection.type==='Range'&&selection.toString())}
  function blocksEdgeSwipe(target){return hasTextSelection(target)||Boolean(target.closest('input,textarea,select,button,a,dialog form,.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
  function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
  function renderEdgeSwipe(){edgeSwipeFrame=0;if(!edgeSwipe||edgeSwipe.axis!=='x')return;const shell=document.querySelector('#shell');if(!shell)return;edgeSwipe.rendered=clampedSwipeDistance(edgeSwipe.dx);shell.classList.add('edge-swipe-active');shell.style.setProperty('--edge-swipe-x',edgeSwipe.rendered+'px');shell.style.setProperty('--edge-swipe-progress',Math.min(1,edgeSwipe.rendered/innerWidth))}
