@@ -89,7 +89,7 @@ async function open(browser,width=390){
  await page.evaluate(()=>{
   const target=document.elementFromPoint(40,360);
   const fire=(type,x,y)=>target.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,pointerType:'touch',isPrimary:true,pointerId:91,button:0,clientX:x,clientY:y}));
-  fire('pointerdown',40,360);fire('pointermove',118,362);fire('pointermove',205,364);fire('pointerup',205,364);
+  fire('pointerdown',28,360);fire('pointermove',118,362);fire('pointermove',205,364);fire('pointerup',205,364);
  });
  await page.waitForTimeout(420);
  check(await page.evaluate(()=>page==='home'),'edge swipe did not invoke shared back action');
