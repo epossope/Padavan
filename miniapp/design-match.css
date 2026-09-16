@@ -1221,3 +1221,7 @@ dialog[tabindex="-1"]:focus{outline:none}
   #dock .focus-pill span{font-size:11px}
   #dock .keyboard-button{transform:translateY(34px)}
 }
+
+/* One dock position on every screen; never lift it above an open keyboard. */
+#dock{bottom:calc(var(--keyboard-inset,0px) - 18px)}
+html.keyboard-visible #dock{visibility:hidden;opacity:0;pointer-events:none}
