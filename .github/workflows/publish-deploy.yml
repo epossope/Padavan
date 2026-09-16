@@ -26,16 +26,28 @@ jobs:
           test -f "$RUNNER_TEMP/noema-deploy/bot.py"
           test -f "$RUNNER_TEMP/noema-deploy/miniapp/index.html"
           test -f "$RUNNER_TEMP/noema-deploy/miniapp/models/vosk-model-small-ru-0.22.tar.gz"
-      - name: Publish orphan deploy tree
+      - name: Publish production tree with linear deploy history
         env:
           SOURCE_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          cd "$RUNNER_TEMP/noema-deploy"
-          git init -b deploy
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The first publication starts an isolated deploy history.  Later
+          # publications extend that history so removed runtime files are real
+          # Git deletions for consumers that merge this branch.
+          if git ls-remote --exit-code --heads origin deploy >/dev/null 2>&1; then
+            git fetch origin deploy:refs/remotes/origin/deploy
+            git switch --create deploy --track origin/deploy
+          else
+            git switch --orphan deploy
+          fi
+
+          # This is the Actions runner's deploy checkout, never master.  Make
+          # its index and working tree exactly match the audited staging tree.
+          git rm -r --ignore-unmatch .
+          git clean -fdx
+          cp -a "$RUNNER_TEMP/noema-deploy/." .
           git add --all
-          git commit -m "deploy: ${SOURCE_SHA}"
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force origin deploy
+          git commit --allow-empty -m "deploy: ${SOURCE_SHA}"
+          git push origin deploy
