@@ -95,6 +95,11 @@ def register_miniapp(app, core):
     job_locks = {}
     jobs_lock = threading.Lock()
 
+    def diagnostic(event, **fields):
+        journal = getattr(core, "DIAGNOSTICS", None)
+        if journal:
+            journal.record(event, **fields)
+
     def ensure_jobs_table():
         if not callable(getattr(core, "conn", None)):
             return
@@ -143,6 +148,17 @@ def register_miniapp(app, core):
         if not job or job["chat_id"] != cid:
             raise ValueError("Запрос не найден")
         return {key: value for key, value in job.items() if key != "chat_id"}
+
+    def acknowledge_reminder_for_owner(cid, reminder_id):
+        """Stop repeats and reveal the one active Telegram message, if any."""
+        with core.conn() as c:
+            row = c.execute("SELECT acknowledged,last_sent_message_id FROM reminders WHERE id=? AND chat_id=?",
+                            (reminder_id, cid)).fetchone()
+            if not row or row["acknowledged"]:
+                return None
+            c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='',last_sent_message_id=NULL WHERE id=? AND chat_id=? AND acknowledged=0",
+                      (reminder_id, cid))
+        return row["last_sent_message_id"]
 
     def claim_completion_notification(job_id, cid):
         """Reserve one generic completion notice without ever storing answer text."""
@@ -238,6 +254,7 @@ def register_miniapp(app, core):
         # WARNING is intentional for this temporary trace: the application
         # does not configure an INFO log level, so INFO is not reliably visible.
         core.LOGGER.warning("miniapp_trace stage=HTML_REQUEST build=%s platform=%s", APP_BUILD_ID, platform)
+        diagnostic("miniapp_trace", stage="HTML_REQUEST", build=APP_BUILD_ID, platform=platform)
         html = (root / "index.html").read_text(encoding="utf-8").replace("__NOEMA_APP_BUILD_ID__", APP_BUILD_ID)
         return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
 
@@ -279,6 +296,7 @@ def register_miniapp(app, core):
             if logger:
                 logger.warning("miniapp_trace stage=%s build=%s platform=%s elapsed_ms=%s",
                                stage, build_id, platform, elapsed_ms)
+            diagnostic("miniapp_trace", stage=stage, build=build_id, platform=platform, elapsed_ms=elapsed_ms)
             return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
         if set(payload) != BOOT_FAILURE_FIELDS:
             raise web.HTTPBadRequest(text="Некорректная telemetry")
@@ -299,12 +317,15 @@ def register_miniapp(app, core):
         if logger:
             logger.warning("miniapp_boot_failed build=%s platform=%s stage=%s error=%s elapsed_ms=%s",
                            build_id, platform, stage, error_code, elapsed_ms)
+        diagnostic("miniapp_boot_failed", stage=stage, build=build_id, platform=platform,
+                   elapsed_ms=elapsed_ms, error_code=error_code)
         return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     async def api(request):
         started = time.perf_counter()
         action = "unknown"
         is_state_request = False
+        state_auth_ms = 0.0
 
         def log_failure(status, error):
             core.LOGGER.warning("miniapp_api_failure method=%s route=%s action=%s status=%s error_class=%s",
@@ -320,17 +341,22 @@ def register_miniapp(app, core):
                 platform = miniapp_platform_from_user_agent(request.headers.get("User-Agent", ""))
                 core.LOGGER.warning("miniapp_trace stage=STATE_REQUEST build=%s platform=%s",
                                     APP_BUILD_ID, platform)
+                diagnostic("miniapp_trace", stage="STATE_REQUEST", build=APP_BUILD_ID, platform=platform)
+            auth_started = time.perf_counter()
             user = core.valid_webapp_user(payload.get("init_data"))
             if not user or not isinstance(user.get("id"), int):
                 if is_state_request:
                     core.LOGGER.warning("miniapp_trace stage=STATE_AUTH_FAIL build=%s error=%s",
                                         APP_BUILD_ID, "INVALID_INIT_DATA")
+                    diagnostic("miniapp_trace", stage="STATE_AUTH_FAIL", build=APP_BUILD_ID,
+                               error_code="INVALID_INIT_DATA")
                 raise web.HTTPUnauthorized(text="Открой приложение через Telegram.")
             cid = user["id"]
             # A Mini App can be a person's first Noema interaction. Register
             # the signed Telegram profile before any state/LLM work so admin
             # accounting never depends on a separate API-key row.
             await register_signed_user(user)
+            state_auth_ms = (time.perf_counter() - auth_started) * 1000
             action = requested_action
             args = payload.get("args", {})
             if not isinstance(args, dict):
@@ -489,8 +515,20 @@ def register_miniapp(app, core):
                 core.clear_history(cid)
                 result = {"ok": True}
             elif action == "reminder_done":
-                with core.conn() as c:
-                    c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='' WHERE chat_id=? AND id=?", (cid, int(args["id"])))
+                reminder_id = int(args["id"])
+                lock_factory = getattr(core, "reminder_delivery_lock", None)
+                if callable(lock_factory):
+                    async with lock_factory(reminder_id):
+                        active_message_id = await asyncio.to_thread(acknowledge_reminder_for_owner, cid, reminder_id)
+                else:
+                    active_message_id = await asyncio.to_thread(acknowledge_reminder_for_owner, cid, reminder_id)
+                if active_message_id:
+                    bot = getattr(app.get("telegram_app"), "bot", None)
+                    if bot:
+                        try:
+                            await bot.delete_message(chat_id=cid, message_id=active_message_id)
+                        except Exception as error:
+                            diagnostic("reminder_delete_failed", source="miniapp_ack", error_class=type(error).__name__)
                 result = {"ok": True}
             elif action in {"add_task", "update_task", "delete_task", "save_note", "update_note", "delete_note", "set_reminder", "update_reminder", "delete_reminder",
                             "add_expense", "add_income", "update_expense", "delete_expense", "person_upsert", "update_person", "delete_person",
@@ -504,11 +542,16 @@ def register_miniapp(app, core):
             duration_ms = (time.perf_counter() - started) * 1000
             headers = {"Cache-Control": "no-store", "Server-Timing": f"ui_action;dur={duration_ms:.1f}"}
             if action == "state":
+                serialize_started = time.perf_counter()
                 state_bytes = len(json.dumps({"ok": True, "data": result}, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                serialize_ms = (time.perf_counter() - serialize_started) * 1000
                 headers["X-Noema-State-Bytes"] = str(state_bytes)
                 core.LOGGER.info("miniapp_state bytes=%s duration_ms=%.1f", state_bytes, duration_ms)
                 core.LOGGER.warning("miniapp_trace stage=STATE_OK build=%s duration_ms=%s",
                                     APP_BUILD_ID, round(duration_ms))
+                diagnostic("miniapp_trace", stage="STATE_OK", build=APP_BUILD_ID, duration_ms=round(duration_ms))
+                diagnostic("miniapp_state_request_timing", auth_ms=state_auth_ms, total_ms=duration_ms,
+                           serialize_ms=serialize_ms)
             return web.json_response(
                 {"ok": True, "data": result},
                 headers=headers,
@@ -517,33 +560,58 @@ def register_miniapp(app, core):
             if is_state_request and error.status != 401:
                 core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
                                     APP_BUILD_ID, type(error).__name__)
+                diagnostic("miniapp_trace", stage="STATE_FAIL", build=APP_BUILD_ID, error_class=type(error).__name__)
             log_failure(error.status, type(error).__name__)
             raise
         except (ValueError, TypeError, KeyError) as error:
             if is_state_request:
                 core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
                                     APP_BUILD_ID, type(error).__name__)
+                diagnostic("miniapp_trace", stage="STATE_FAIL", build=APP_BUILD_ID, error_class=type(error).__name__)
             log_failure(400, type(error).__name__)
             return web.json_response({"ok": False, "error": "Проверь введённые данные."}, status=400)
         except Exception as error:
             if is_state_request:
                 core.LOGGER.warning("miniapp_trace stage=STATE_FAIL build=%s error_class=%s",
                                     APP_BUILD_ID, type(error).__name__)
+                diagnostic("miniapp_trace", stage="STATE_FAIL", build=APP_BUILD_ID, error_class=type(error).__name__)
             log_failure(503, type(error).__name__)
             return web.json_response({"ok": False, "error": "Не удалось выполнить запрос. Попробуй ещё раз."}, status=503)
 
     def state(cid, args):
+        state_started = time.perf_counter()
+        timings = {}
         day = str(args.get("day") or datetime.now(core.timezone_for(cid)).date().isoformat())
         datetime.strptime(day, "%Y-%m-%d")
+        started = time.perf_counter()
         with core.conn() as c:
-            tasks = [dict(r) for r in c.execute("SELECT id,text,due_date,priority,status FROM tasks WHERE chat_id=? ORDER BY status,due_date,id DESC LIMIT 200", (cid,))]
+            task_rows = [dict(r) for r in c.execute("SELECT id,text,due_date,priority,status,completed_at FROM tasks WHERE chat_id=? ORDER BY status,due_date,id DESC LIMIT 200", (cid,))]
             reminders = [dict(r) for r in c.execute("SELECT id,text,remind_at_utc,acknowledged FROM reminders WHERE chat_id=? ORDER BY remind_at_utc DESC LIMIT 200", (cid,))]
             cfg = c.execute("SELECT enabled,time,city,topics FROM briefings WHERE chat_id=?", (cid,)).fetchone()
+        timings["tasks_ms"] = (time.perf_counter() - started) * 1000
+        timings["reminders_ms"] = timings["tasks_ms"]
+        selected_day = datetime.strptime(day, "%Y-%m-%d").date()
+        local_today = datetime.now(core.timezone_for(cid)).date()
+
+        def completed_on_selected(row):
+            try:
+                return datetime.fromisoformat(str(row.get("completed_at") or "")).astimezone(core.timezone_for(cid)).date() == selected_day
+            except ValueError:
+                return False
+
+        tasks = [row for row in task_rows if (
+            row["status"] == "open" if selected_day == local_today
+            else str(row.get("due_date") or "")[:10] == day
+        ) or (row["status"] == "done" and completed_on_selected(row))]
+        started = time.perf_counter()
         files = core.get_files(cid, limit=100)["files"]
+        timings["files_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
         with core.conn() as c:
             relations = {row["file_id"]: dict(row) for row in c.execute(
                 "SELECT kf.file_id,ki.project_id,ki.tags_json,ki.entities_json,ki.urls_json,ki.source_message_id "
                 "FROM knowledge_files kf JOIN knowledge_items ki ON ki.id=kf.knowledge_id WHERE ki.chat_id=? ORDER BY ki.id DESC", (cid,))}
+        timings["knowledge_ms"] = (time.perf_counter() - started) * 1000
         for item in files:
             item.pop("local_path", None)
             relation = relations.get(item["id"], {})
@@ -576,10 +644,21 @@ def register_miniapp(app, core):
             "voice": voice_runtime.get("tts_voice", "edge"), "speed": 1.0, "pitch": 1.0, "volume": 1.0,
             "engine": voice_runtime.get("tts_provider", "edge"), "supports_pitch": False, "supports_volume": False,
         }
-        return {"day": day, "plan": core.get_plan_for_date(cid, day), "tasks": tasks, "reminders": reminders,
-                "notes": core.get_notes(cid, 50)["notes"], "people": core.get_people(cid)["people"],
-                "expenses": core.get_expenses(cid)["items"], "files": files,
-                "history": core.history(cid, 50), "rules": core.behavior_rules_for(cid),
+        started = time.perf_counter()
+        plan = core.get_plan_for_date(cid, day)
+        notes = core.get_notes(cid, 50)["notes"]
+        timings["notes_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
+        people = core.get_people(cid)["people"]
+        timings["people_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
+        expenses = core.get_expenses(cid)["items"]
+        history = core.history(cid, 50)
+        rules = core.behavior_rules_for(cid)
+        timings["settings_ms"] = (time.perf_counter() - started) * 1000
+        result = {"day": day, "plan": plan, "tasks": tasks, "reminders": reminders,
+                "notes": notes, "people": people, "expenses": expenses, "files": files,
+                "history": history, "rules": rules,
                 "settings": {"timezone": core.timezone_name_for(cid), "mode": core.get_mode(cid),
                              "home_widgets": widgets_for(cid),
                              "is_admin": beta_available,
@@ -590,8 +669,12 @@ def register_miniapp(app, core):
                              "effective_ai": effective_ai,
                              "voice_runtime": voice_runtime,
                              "voice_preferences": voice_preferences,
-                             "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
-                             "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
+                              "telemetry_enabled": bool(getattr(core, "TELEMETRY_ENABLED", False)),
+                              "briefing": dict(cfg) if cfg else {"enabled": False, "time": "08:30", "topics": "главные новости мира", "city": ""}}}
+        timings["serialize_ms"] = (time.perf_counter() - started) * 1000
+        timings["total_ms"] = (time.perf_counter() - state_started) * 1000
+        diagnostic("miniapp_state_timing", **timings)
+        return result
 
     async def voice(request):
         form = await request.post()

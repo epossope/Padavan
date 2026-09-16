@@ -32,7 +32,9 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
  function edgeSwipeStartZone(){return innerWidth*.5}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
- function blocksEdgeSwipe(target){return Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.bars,.trend,.distribution-body,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
+ /* Budget charts are vertical/static content, not horizontal controls. Blocking
+    their cards made an edge swipe work everywhere except Budget on iOS. */
+ function blocksEdgeSwipe(target){return Boolean(target.closest('input,textarea,select,dialog form,.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
  function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
  function renderEdgeSwipe(){edgeSwipeFrame=0;if(!edgeSwipe||edgeSwipe.axis!=='x')return;const shell=document.querySelector('#shell');if(!shell)return;edgeSwipe.rendered=clampedSwipeDistance(edgeSwipe.dx);shell.classList.add('edge-swipe-active');shell.style.setProperty('--edge-swipe-x',edgeSwipe.rendered+'px');shell.style.setProperty('--edge-swipe-progress',Math.min(1,edgeSwipe.rendered/innerWidth))}
  function scheduleEdgeSwipe(){if(!edgeSwipeFrame)edgeSwipeFrame=requestAnimationFrame(renderEdgeSwipe)}

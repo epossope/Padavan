@@ -86,6 +86,23 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         unavailable.assert_called_once()
 
+    async def test_replace_active_ui_sends_before_deleting_old_message(self):
+        order = []
+
+        async def send(**_):
+            order.append("send")
+            return SimpleNamespace(message_id=9)
+
+        async def delete(**_):
+            order.append("delete")
+
+        telegram = SimpleNamespace(send_message=AsyncMock(side_effect=send), delete_message=AsyncMock(side_effect=delete))
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=42))
+        context = SimpleNamespace(bot=telegram)
+        with patch.object(bot, "active_ui_message_id", return_value=7), patch.object(bot, "set_active_ui_message_id"):
+            await bot.replace_active_ui(update, context, "Меню", None)
+        self.assertEqual(["send", "delete"], order)
+
     async def test_event_loop_lag_metric_is_recorded(self):
         loop = asyncio.get_running_loop()
         context = SimpleNamespace(job=SimpleNamespace(data={"expected": loop.time() - 0.02}))

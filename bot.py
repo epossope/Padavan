@@ -75,6 +75,7 @@ from retrieval import (compact_item, normalize_token, resolve_project, retrieve)
 from model_router import ModelRouter
 from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
+from diagnostics import DiagnosticsJournal
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
                                SentenceChunker, SpeechTextPolicy, SpeechTextStream,
                                artifact_request_instruction, enforce_artifact_request,
@@ -192,6 +193,7 @@ _configured_data_dir = os.getenv("DATA_DIR", "").strip()
 PERSISTENT_ROOT = Path(_configured_data_dir) if _configured_data_dir else (Path("/data") if Path("/data").is_dir() else BASE)
 PERSISTENT_ROOT.mkdir(parents=True, exist_ok=True)
 DB = PERSISTENT_ROOT / "noema_test.sqlite3"
+DIAGNOSTICS = DiagnosticsJournal(PERSISTENT_ROOT / "runtime_logs")
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
@@ -241,6 +243,7 @@ except ValueError:
     TELEMETRY_SERIES_LIMIT = 2048
 RUNTIME_METRIC_SERIES = {name: deque(maxlen=TELEMETRY_SERIES_LIMIT) for name in TELEMETRY_METRICS}
 RUNTIME_METRICS_LOCK = threading.Lock()
+REMINDER_DELIVERY_LOCKS = {}
 # This is deliberately process-local: benchmark metadata must not create or
 # mutate user records in SQLite. A restart simply requires a new reset.
 TELEMETRY_BENCHMARK_STARTED_AT = None
@@ -1232,14 +1235,6 @@ async def replace_active_ui(update, context, text, reply_markup, parse_mode="HTM
     """Keep exactly one persistent inline control window per private chat."""
     chat_id = update.effective_chat.id
     previous_id = await asyncio.to_thread(active_ui_message_id, chat_id)
-    if previous_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
-            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
-        except (BadRequest, Forbidden):
-            await asyncio.to_thread(set_active_ui_message_id, chat_id, 0)
-        except (TimedOut, NetworkError):
-            LOGGER.warning("Telegram delete delayed chat_id=%s", chat_id)
     try:
         rendered_text, rendered_markup = await asyncio.to_thread(
             lambda: (live_ui_text(text), live_markup(reply_markup)))
@@ -1255,6 +1250,15 @@ async def replace_active_ui(update, context, text, reply_markup, parse_mode="HTM
         LOGGER.warning("Telegram UI send timed out chat_id=%s after bounded retry", chat_id)
         return None
     await asyncio.to_thread(set_active_ui_message_id, chat_id, sent.message_id)
+    if previous_id and previous_id != sent.message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+            DIAGNOSTICS.record("old_message_deleted", source="replace_active_ui")
+        except (BadRequest, Forbidden):
+            await asyncio.to_thread(set_active_ui_message_id, chat_id, sent.message_id)
+        except (TimedOut, NetworkError):
+            LOGGER.warning("Telegram delete delayed chat_id=%s", chat_id)
+            DIAGNOSTICS.record("old_message_delete_failed", source="replace_active_ui", error_class="NetworkError")
     return sent
 
 
@@ -1546,6 +1550,7 @@ async def safe_callback_answer(query, *args, **kwargs):
         callback_ack_ms = (time.perf_counter() - started) * 1000
         record_runtime_metric("callback_ack_ms", callback_ack_ms)
         LOGGER.debug("telemetry callback_ack_ms=%.1f", callback_ack_ms)
+        DIAGNOSTICS.record("callback_answered", duration_ms=callback_ack_ms)
 
 
 def live_markup(markup):
@@ -1627,7 +1632,9 @@ class LiveCallbackQuery:
             kwargs["reply_markup"] = await asyncio.to_thread(live_markup, kwargs["reply_markup"])
         started = time.perf_counter()
         result = await self._query.edit_message_text(rendered, *args, **kwargs)
-        record_runtime_metric("telegram_send_ms", (time.perf_counter() - started) * 1000, source="edit_message_text")
+        elapsed = (time.perf_counter() - started) * 1000
+        record_runtime_metric("telegram_send_ms", elapsed, source="edit_message_text")
+        DIAGNOSTICS.record("menu_sent_or_edited", duration_ms=elapsed, source="edit_message_text")
         if kwargs.get("reply_markup") is not None and self._query.message:
             await asyncio.to_thread(set_active_ui_message_id, self._query.message.chat_id, self._query.message.message_id)
         return result
@@ -2707,7 +2714,7 @@ def update_reminder(chat_id, reminder_id, text="", remind_at=""):
         dt = dt.replace(tzinfo=chat_tz)
     utc_time = dt.astimezone(timezone.utc).isoformat()
     with conn() as c:
-        cur = c.execute("UPDATE reminders SET text=?,remind_at_utc=?,sent=0,acknowledged=0,next_followup_at='' WHERE id=? AND chat_id=?",
+        cur = c.execute("UPDATE reminders SET text=?,remind_at_utc=?,sent=0,acknowledged=0,next_followup_at='',last_sent_message_id=NULL WHERE id=? AND chat_id=?",
                         (text, utc_time, int(reminder_id), chat_id))
     return {"ok": bool(cur.rowcount), "tool": "update_reminder", "updated": cur.rowcount}
 
@@ -3124,25 +3131,44 @@ def reminder_list(chat_id, scope="upcoming", date_from="", date_to="", query="",
 
 
 def task_list(chat_id, scope="open", query="", limit=100):
-    """Canonical owner-scoped task read model."""
+    """Canonical owner-scoped task read model with derived daily carry-over."""
     scope = str(scope or "open").lower()
     if scope not in {"open", "done", "overdue", "today", "all"}:
         raise ValueError("invalid_task_scope")
     limit = max(1, min(int(limit or 100), 200))
-    today = datetime.now(timezone_for(chat_id)).date().isoformat()
-    clauses, args = ["chat_id=?"], [chat_id]
-    if scope == "open": clauses.append("status='open'")
-    elif scope == "done": clauses.append("status='done'")
-    elif scope == "overdue": clauses.extend(["status='open'", "due_date<>''", "substr(due_date,1,10)<?"]); args.append(today)
-    elif scope == "today": clauses.extend(["status='open'", "(due_date='' OR substr(due_date,1,10)<=?)"]); args.append(today)
+    chat_tz = timezone_for(chat_id)
+    today = datetime.now(chat_tz).date().isoformat()
     query = str(query or "").strip()
-    if query:
-        clauses.append("lower(text) LIKE ?"); args.append("%" + query.casefold().replace("%", "\\%").replace("_", "\\_") + "%")
-    where = " AND ".join(clauses)
     with conn() as c:
-        count = c.execute("SELECT count(*) FROM tasks WHERE " + where, args).fetchone()[0]
-        rows = [dict(row) for row in c.execute("SELECT id,text,due_date,priority,status,created_at FROM tasks WHERE " + where + " ORDER BY due_date,id LIMIT ?", args + [limit]).fetchall()]
-    return {"ok": True, "tool": "task_list", "scope": scope, "date": today, "count": count, "items": rows}
+        rows = [dict(row) for row in c.execute(
+            "SELECT id,text,due_date,priority,status,created_at,completed_at FROM tasks WHERE chat_id=? ORDER BY due_date,id",
+            (chat_id,)).fetchall()]
+
+    def completed_day(row):
+        try:
+            return datetime.fromisoformat(str(row.get("completed_at") or "")).astimezone(chat_tz).date().isoformat()
+        except ValueError:
+            return ""
+
+    selected = []
+    needle = query.casefold()
+    for row in rows:
+        due_day = str(row.get("due_date") or "")[:10]
+        is_open = row["status"] == "open"
+        is_done = row["status"] == "done"
+        matches = (
+            scope == "all" or
+            (scope == "open" and is_open) or
+            (scope == "done" and is_done) or
+            (scope == "overdue" and is_open and bool(due_day) and due_day < today) or
+            (scope == "today" and ((is_open and (not due_day or due_day <= today)) or (is_done and completed_day(row) == today)))
+        )
+        if not matches or (needle and needle not in str(row.get("text") or "").casefold()):
+            continue
+        row["carried_over"] = bool(is_open and due_day and due_day < today)
+        row["effective_day"] = today if scope == "today" and is_open else due_day
+        selected.append(row)
+    return {"ok": True, "tool": "task_list", "scope": scope, "date": today, "count": len(selected), "items": selected[:limit]}
 
 
 def get_plan_for_date(chat_id, day):
@@ -3151,15 +3177,31 @@ def get_plan_for_date(chat_id, day):
     chat_tz = timezone_for(chat_id)
     today = datetime.now(chat_tz).date()
     with conn() as c:
-        # Tasks without a date are actionable today, but don't clutter every
-        # calendar day.  A passed task remains open until the user decides it.
-        where = "substr(due_date,1,10)=?" if selected != today else "(due_date='' OR substr(due_date,1,10)<=?)"
-        tasks = [dict(r) for r in c.execute(
-            f"SELECT id,text,due_date,priority,status FROM tasks WHERE chat_id=? AND {where} ORDER BY due_date,id",
-            (chat_id, day)).fetchall()]
+        rows = [dict(r) for r in c.execute(
+            "SELECT id,text,due_date,priority,status,completed_at FROM tasks WHERE chat_id=? ORDER BY due_date,id", (chat_id,)).fetchall()]
         rem = [dict(r) for r in c.execute(
             "SELECT id,text,remind_at_utc,acknowledged FROM reminders WHERE chat_id=? ORDER BY remind_at_utc",
             (chat_id,)).fetchall()]
+    def completed_on_selected(row):
+        try:
+            return datetime.fromisoformat(str(row.get("completed_at") or "")).astimezone(chat_tz).date() == selected
+        except ValueError:
+            return False
+
+    tasks = []
+    for row in rows:
+        due_day = str(row.get("due_date") or "")[:10]
+        if selected == today:
+            include = ((row["status"] == "open" and (not due_day or due_day <= day)) or
+                       (row["status"] == "done" and completed_on_selected(row)))
+        else:
+            # Historical views preserve scheduled work and completions for the
+            # selected local day; overdue open work is only carried into today.
+            include = due_day == day or (row["status"] == "done" and completed_on_selected(row))
+        if include:
+            row["carried_over"] = bool(selected == today and row["status"] == "open" and due_day and due_day < day)
+            tasks.append(row)
+
     reminders = []
     for r in rem:
         dt = datetime.fromisoformat(r["remind_at_utc"]).astimezone(chat_tz)
@@ -5517,6 +5559,20 @@ async def telemetry_report_command(update, context):
     await update.effective_message.reply_text(telemetry_report_text(runtime_metric_export()), parse_mode="HTML")
 
 
+async def diagnostics_command(update, context):
+    """Send the current bounded diagnostics file to an existing admin only."""
+    if not telemetry_command_allowed(update):
+        return await update.effective_message.reply_text("Нет доступа.")
+    path = DIAGNOSTICS.current_file()
+    if not path:
+        return await update.effective_message.reply_text("Диагностика ещё не собрана.")
+    try:
+        with path.open("rb") as source:
+            await update.effective_message.reply_document(document=source, filename="noema_diagnostics.jsonl")
+    except OSError:
+        await update.effective_message.reply_text("Не удалось прочитать файл диагностики.")
+
+
 async def set_today_emoji(update, context):
     """Save a custom emoji supplied by the bot owner as the Today button icon."""
     chat_id = update.effective_chat.id
@@ -5900,13 +5956,27 @@ async def today_plan(update,context, day=None):
 
 
 
+def callback_timing(handler):
+    async def wrapped(update, context):
+        started = time.perf_counter()
+        DIAGNOSTICS.record("callback_received")
+        try:
+            return await handler(update, context)
+        finally:
+            DIAGNOSTICS.record("callback_done", duration_ms=(time.perf_counter() - started) * 1000)
+    return wrapped
+
+
+@callback_timing
 async def callback(update,context):
 
     raw_query=update.callback_query; await safe_callback_answer(raw_query)
     if not str(raw_query.data or "").startswith("ackrem:"):
         await adopt_active_ui(raw_query)
+    DIAGNOSTICS.record("menu_data_ready")
     q=LiveCallbackQuery(raw_query)
-    register_bot_user(q.message.chat_id, getattr(update, "effective_user", None))
+    # Registration writes SQLite. Never let a menu tap hold the event loop.
+    await asyncio.to_thread(register_bot_user, q.message.chat_id, getattr(update, "effective_user", None))
 
     if q.data == "ui:close":
         with contextlib.suppress(Exception):
@@ -6378,14 +6448,15 @@ async def callback(update,context):
         return await q.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
     if q.data.startswith("ackrem:"):
         reminder_id = int(q.data.split(":", 1)[1])
-        with conn() as c:
-            c.execute("UPDATE reminders SET acknowledged=1, next_followup_at='' WHERE id=? AND chat_id=?",
-                      (reminder_id, q.message.chat_id))
-        sent = await raw_query.edit_message_text(
-            live_ui_text("⏰ Напоминание выполнено."),
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([]))
-        schedule_ephemeral_delete(context, raw_query.message)
-        return sent
+        async with reminder_delivery_lock(reminder_id):
+            active_message_id = await asyncio.to_thread(acknowledge_reminder, reminder_id, q.message.chat_id)
+            if active_message_id:
+                try:
+                    await context.bot.delete_message(chat_id=q.message.chat_id, message_id=active_message_id)
+                except (BadRequest, Forbidden, TimedOut, NetworkError) as error:
+                    DIAGNOSTICS.record("reminder_delete_failed", source="ack", error_class=type(error).__name__)
+            DIAGNOSTICS.record("reminder_acknowledged", operation="ack", result="ok")
+        return None
     if q.data == "settings:status":
         return await q.edit_message_text(
             status_text(q.message.chat_id), parse_mode="HTML",
@@ -7420,10 +7491,41 @@ def due_reminder_rows(now_iso):
 
 
 def mark_reminder_delivered(reminder_id, message_id, is_followup):
+    """Store a replacement before its old Telegram message is removed."""
     next_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     with conn() as c:
-        c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=?",
+        row = c.execute("SELECT acknowledged,last_sent_message_id FROM reminders WHERE id=?", (reminder_id,)).fetchone()
+        if not row or row["acknowledged"]:
+            return None
+        previous = row["last_sent_message_id"]
+        c.execute("UPDATE reminders SET sent=1, followup_count=followup_count+?, next_followup_at=?, last_sent_message_id=? WHERE id=? AND acknowledged=0",
                   (1 if is_followup else 0, next_at, message_id, reminder_id))
+    return previous
+
+
+def reminder_is_active(reminder_id, chat_id):
+    with conn() as c:
+        row = c.execute("SELECT acknowledged FROM reminders WHERE id=? AND chat_id=?", (reminder_id, chat_id)).fetchone()
+    return bool(row and not row["acknowledged"])
+
+
+def acknowledge_reminder(reminder_id, chat_id):
+    """Idempotently stop follow-ups and return only the current active message."""
+    with conn() as c:
+        row = c.execute("SELECT acknowledged,last_sent_message_id FROM reminders WHERE id=? AND chat_id=?", (reminder_id, chat_id)).fetchone()
+        if not row or row["acknowledged"]:
+            return None
+        c.execute("UPDATE reminders SET acknowledged=1,next_followup_at='',last_sent_message_id=NULL WHERE id=? AND chat_id=? AND acknowledged=0",
+                  (reminder_id, chat_id))
+    return row["last_sent_message_id"]
+
+
+def reminder_delivery_lock(reminder_id):
+    lock = REMINDER_DELIVERY_LOCKS.get(reminder_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        REMINDER_DELIVERY_LOCKS[reminder_id] = lock
+    return lock
 
 
 def mark_reminder_unavailable(row, is_followup):
@@ -7453,23 +7555,34 @@ async def reminder_tick(context):
 
     async def deliver(row, is_followup=False):
         async with semaphore:
-            rendered_text, rendered_markup = await asyncio.to_thread(reminder_delivery_payload, row, is_followup)
-            sent_message = await telegram_send_with_retry(
-                context.bot, source="reminder_followup" if is_followup else "reminder",
-                chat_id=row["chat_id"], text=rendered_text, parse_mode="HTML",
-                reply_markup=rendered_markup,
-            )
-            await asyncio.to_thread(mark_reminder_delivered, row["id"], sent_message.message_id, is_followup)
+            async with reminder_delivery_lock(row["id"]):
+                if not await asyncio.to_thread(reminder_is_active, row["id"], row["chat_id"]):
+                    return
+                rendered_text, rendered_markup = await asyncio.to_thread(reminder_delivery_payload, row, is_followup)
+                sent_message = await telegram_send_with_retry(
+                    context.bot, source="reminder_followup" if is_followup else "reminder",
+                    chat_id=row["chat_id"], text=rendered_text, parse_mode="HTML",
+                    reply_markup=rendered_markup,
+                )
+                previous_id = await asyncio.to_thread(mark_reminder_delivered, row["id"], sent_message.message_id, is_followup)
+                if isinstance(previous_id, int) and previous_id > 0 and previous_id != sent_message.message_id:
+                    try:
+                        await context.bot.delete_message(chat_id=row["chat_id"], message_id=previous_id)
+                    except (BadRequest, Forbidden, TimedOut, NetworkError) as error:
+                        DIAGNOSTICS.record("reminder_delete_failed", source="repeat", error_class=type(error).__name__)
 
     async def guarded_deliver(row, is_followup=False):
         try:
             await deliver(row, is_followup)
         except Forbidden:
             await asyncio.to_thread(mark_reminder_unavailable, row, is_followup)
+            DIAGNOSTICS.record("reminder_send_failed", source="repeat" if is_followup else "initial", error_class="Forbidden")
             LOGGER.warning("Telegram destination unavailable chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
         except (TimedOut, NetworkError):
+            DIAGNOSTICS.record("reminder_send_failed", source="repeat" if is_followup else "initial", error_class="NetworkError")
             LOGGER.warning("Reminder delivery deferred chat_id=%s source=%s", row["chat_id"], "reminder_followup" if is_followup else "reminder")
         except Exception:
+            DIAGNOSTICS.record("reminder_send_failed", source="repeat" if is_followup else "initial", error_class="Exception")
             LOGGER.exception("Reminder delivery failed chat_id=%s", row["chat_id"])
 
     await asyncio.gather(
@@ -7556,6 +7669,7 @@ async def event_loop_lag_tick(context):
     record_runtime_metric("event_loop_lag_ms", lag_ms)
     if lag_ms > 500:
         LOGGER.warning("telemetry event_loop_lag_ms=%.1f", lag_ms)
+        DIAGNOSTICS.record("event_loop_lag_warning", event_loop_lag_ms=lag_ms)
 
 
 
@@ -7851,6 +7965,7 @@ async def main_async():
     app.add_handler(CommandHandler("telemetry_reset", telemetry_reset_command))
     app.add_handler(CommandHandler("telemetry_status", telemetry_status_command))
     app.add_handler(CommandHandler("telemetry_report", telemetry_report_command))
+    app.add_handler(CommandHandler("diagnostics", diagnostics_command))
 
     app.add_handler(CommandHandler("todayemoji", set_today_emoji))
 

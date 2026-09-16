@@ -28,7 +28,7 @@ class ExactStateDomainTests(unittest.TestCase):
 
     def test_task_and_note_exact_reads_are_owner_scoped_and_searchable(self):
         tasks = bot.task_list(11, "today")
-        self.assertEqual({"Купить молоко"}, {row["text"] for row in tasks["items"]})
+        self.assertEqual({"Купить молоко", "Закрытая задача"}, {row["text"] for row in tasks["items"]})
         self.assertEqual(0, bot.task_list(11, "all", query="чужая")["count"])
         notes = bot.note_list(11, query="alpha")
         self.assertEqual(1, notes["count"])
@@ -44,6 +44,38 @@ class ExactStateDomainTests(unittest.TestCase):
         bot.add_message(22, "assistant", "Чужая задача и Чужая заметка")
         context = " ".join(row["content"] for row in bot.conversation_context(11))
         self.assertNotIn("Чужая задача", context)
+
+    def test_today_carries_open_work_without_relisting_old_completions(self):
+        today = datetime.now(bot.timezone_for(11)).date()
+        yesterday = today - timedelta(days=1)
+        old = today - timedelta(days=14)
+        carry_yesterday = bot.add_task(11, "Вчерашняя открытая", due_date=yesterday.isoformat())["id"]
+        carry_old = bot.add_task(11, "Старая открытая", due_date=old.isoformat())["id"]
+        completed_yesterday = bot.add_task(11, "Вчера завершена", due_date=yesterday.isoformat())["id"]
+        completed_today = bot.add_task(11, "Сегодня завершена", due_date=yesterday.isoformat())["id"]
+        with bot.conn() as c:
+            c.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?", (
+                datetime.combine(yesterday, datetime.min.time(), bot.timezone_for(11)).astimezone(timezone.utc).isoformat(), completed_yesterday))
+        bot.set_task_status(11, completed_today, "done")
+        current = bot.task_list(11, "today")
+        names = {row["text"] for row in current["items"]}
+        self.assertIn("Вчерашняя открытая", names)
+        self.assertIn("Старая открытая", names)
+        self.assertIn("Сегодня завершена", names)
+        self.assertNotIn("Вчера завершена", names)
+        carried = {row["id"]: row["carried_over"] for row in current["items"]}
+        self.assertTrue(carried[carry_yesterday])
+        self.assertTrue(carried[carry_old])
+
+    def test_historical_plan_keeps_local_day_completion(self):
+        tz = bot.timezone_for(11)
+        selected = datetime.now(tz).date() - timedelta(days=2)
+        task_id = bot.add_task(11, "Исторически завершена", due_date=(selected - timedelta(days=1)).isoformat())["id"]
+        with bot.conn() as c:
+            c.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?", (
+                datetime.combine(selected, datetime.min.time(), tz).astimezone(timezone.utc).isoformat(), task_id))
+        plan = bot.get_plan_for_date(11, selected.isoformat())
+        self.assertIn("Исторически завершена", {row["text"] for row in plan["tasks"]})
 
     def test_exact_routing_and_model_owner_argument_protection(self):
         router = ToolPackResolver()

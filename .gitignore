@@ -12,6 +12,7 @@ __pycache__/
 *.db
 storage/
 data/
+runtime_logs/
 
 # Backups / temp artifacts
 *.backup
