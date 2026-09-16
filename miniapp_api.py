@@ -98,11 +98,47 @@ def register_miniapp(app, core):
     jobs_lock = threading.Lock()
     download_tickets = {}
     download_tickets_lock = threading.Lock()
+    MAX_DOWNLOAD_TICKETS = 256
 
     def diagnostic(event, **fields):
         journal = getattr(core, "DIAGNOSTICS", None)
         if journal:
             journal.record(event, **fields)
+
+    def thumbnail_record(cid, file_id):
+        """Resolve a thumbnail source and clean only provably stale relations."""
+        with core.conn() as c:
+            row = c.execute("SELECT local_path,mime_type FROM files WHERE chat_id=? AND id=?", (cid, file_id)).fetchone()
+            if not row:
+                stale = c.execute("SELECT 1 FROM person_media WHERE chat_id=? AND file_id=? LIMIT 1", (cid, file_id)).fetchone()
+                if stale:
+                    c.execute("DELETE FROM person_media WHERE chat_id=? AND file_id=?", (cid, file_id))
+                    return None, "STALE_PERSON_MEDIA"
+                # File deletion is a hard delete, so an old/deleted id and a
+                # never-valid id are intentionally indistinguishable.
+                return None, "FILE_RECORD_MISSING"
+        if not str(row["mime_type"] or "").startswith("image/"):
+            return None, "UNSUPPORTED_MEDIA"
+        if not row["local_path"] or not Path(row["local_path"]).is_file():
+            return None, "STORAGE_OBJECT_MISSING"
+        return row, ""
+
+    def runtime_cache_counts():
+        with download_tickets_lock:
+            now = time.monotonic()
+            expired = [key for key, value in download_tickets.items() if value["expires_at"] <= now]
+            for key in expired:
+                download_tickets.pop(key, None)
+            tickets = len(download_tickets)
+        try:
+            thumbnails = sum(1 for path in (Path(core.STORAGE_ROOT) / "media_thumbnails").glob("*.webp") if path.is_file())
+        except OSError:
+            thumbnails = -1
+        return {"thumbnail_cache_count": thumbnails, "download_ticket_cache_count": tickets,
+                "weather_cache_count": len(weather_cache), "exchange_cache_count": len(exchange_cache),
+                "miniapp_lock_count": len(locks), "miniapp_job_count": len(jobs)}
+
+    setattr(core, "miniapp_runtime_cache_counts", runtime_cache_counts)
 
     def issue_download_ticket(request, cid, path, filename, mime_type, source):
         """Create a single-use owner-authorized external download URL (five minutes)."""
@@ -112,6 +148,9 @@ def register_miniapp(app, core):
             for key, value in list(download_tickets.items()):
                 if value["expires_at"] <= now:
                     download_tickets.pop(key, None)
+            if len(download_tickets) >= MAX_DOWNLOAD_TICKETS:
+                oldest = min(download_tickets, key=lambda key: download_tickets[key]["expires_at"])
+                download_tickets.pop(oldest, None)
             download_tickets[ticket] = {"owner": cid, "path": str(path), "filename": str(filename),
                                         "mime_type": str(mime_type or "application/octet-stream"), "expires_at": now + 300}
         diagnostic("artifact_download_ticket", source=source, result="issued")
@@ -150,6 +189,10 @@ def register_miniapp(app, core):
                 "completed_at": completed_at, "notified_at": previous.get("notified_at"),
                 "error_code": error_code,
             }
+            if len(jobs) > 256:
+                completed = sorted((value for value in jobs.values() if value["status"] in {"done", "error"}), key=lambda value: value["completed_at"] or value["created_at"])
+                for value in completed[:max(0, len(jobs) - 256)]:
+                    jobs.pop(value["id"], None)
         if not callable(getattr(core, "conn", None)):
             return
         with core.conn() as c:
@@ -350,10 +393,15 @@ def register_miniapp(app, core):
         action = "unknown"
         is_state_request = False
         state_auth_ms = 0.0
+        thumbnail_reason = ""
 
         def log_failure(status, error):
+            if action == "thumbnail" and thumbnail_reason:
+                core.LOGGER.info("miniapp_thumbnail_unavailable status=%s reason=%s", status, thumbnail_reason)
+                diagnostic("media_thumbnail_unavailable", source=thumbnail_reason, status=status)
+                return
             core.LOGGER.warning("miniapp_api_failure method=%s route=%s action=%s status=%s error_class=%s",
-                                request.method, request.path, action, status, error)
+                                 request.method, request.path, action, status, error)
 
         try:
             payload = await request.json()
@@ -382,6 +430,8 @@ def register_miniapp(app, core):
             await register_signed_user(user)
             state_auth_ms = (time.perf_counter() - auth_started) * 1000
             action = requested_action
+            if callable(getattr(core, "record_runtime_activity", None)):
+                core.record_runtime_activity(f"miniapp:{action}")
             args = payload.get("args", {})
             if not isinstance(args, dict):
                 raise ValueError("Некорректные параметры")
@@ -407,7 +457,7 @@ def register_miniapp(app, core):
                 widgets = args.get("widgets")
                 if not isinstance(widgets, list) or len(widgets) > len(widget_types) or any(not isinstance(x, str) or x not in widget_types for x in widgets) or len(set(widgets)) != len(widgets):
                     raise ValueError("Некорректные виджеты")
-                core.set_app_setting(f"miniapp_home_widgets:{cid}", json.dumps(widgets))
+                await asyncio.to_thread(core.set_app_setting, f"miniapp_home_widgets:{cid}", json.dumps(widgets))
                 result = {"widgets": widgets}
             elif action == "budget":
                 result = await asyncio.to_thread(budget_for, cid, args)
@@ -435,8 +485,10 @@ def register_miniapp(app, core):
                 if not isinstance(city, str) or len(city) > 120:
                     raise ValueError("Некорректный город")
                 if not city.strip():
-                    with core.conn() as c:
-                        cfg = c.execute("SELECT city FROM briefings WHERE chat_id=?", (cid,)).fetchone()
+                    def briefing_city():
+                        with core.conn() as c:
+                            return c.execute("SELECT city FROM briefings WHERE chat_id=?", (cid,)).fetchone()
+                    cfg = await asyncio.to_thread(briefing_city)
                     city = (cfg["city"] if cfg else "") or ""
                 key = (cid, city.strip())
                 cached = weather_cache.get(key)
@@ -457,20 +509,22 @@ def register_miniapp(app, core):
                 results = [{k: v for k, v in item.items() if k in allowed} for item in found.get("results", [])]
                 result = {"query": query.strip(), "count": len(results), "results": results}
             elif action == "file":
-                with core.conn() as c:
-                    row = c.execute("SELECT local_path,original_name FROM files WHERE chat_id=? AND id=?", (cid, int(args["id"]))).fetchone()
+                def file_record():
+                    with core.conn() as c:
+                        return c.execute("SELECT local_path,original_name FROM files WHERE chat_id=? AND id=?", (cid, int(args["id"]))).fetchone()
+                row = await asyncio.to_thread(file_record)
                 if not row or not row["local_path"] or not Path(row["local_path"]).is_file():
                     raise web.HTTPNotFound(text="Файл недоступен")
                 return web.FileResponse(row["local_path"], headers={"Cache-Control": "no-store", "Content-Disposition": "attachment"})
             elif action == "thumbnail":
-                with core.conn() as c:
-                    row = c.execute("SELECT local_path,mime_type FROM files WHERE chat_id=? AND id=?", (cid, int(args["id"]))).fetchone()
-                if not row or not str(row["mime_type"] or "").startswith("image/") or not row["local_path"] or not Path(row["local_path"]).is_file():
-                    raise web.HTTPNotFound(text="Изображение недоступно")
+                row, thumbnail_reason = await asyncio.to_thread(thumbnail_record, cid, int(args["id"]))
+                if not row:
+                    raise web.HTTPNotFound(text="Изображение недоступно", headers={"X-Noema-Thumbnail-Status": thumbnail_reason})
                 thumbnail_started = time.perf_counter()
                 cached, hit = await asyncio.to_thread(image_thumbnail, row["local_path"], Path(core.STORAGE_ROOT) / "media_thumbnails")
                 if not cached:
-                    raise web.HTTPNotFound(text="Миниатюра недоступна")
+                    thumbnail_reason = "THUMBNAIL_GENERATION_FAILED"
+                    raise web.HTTPInternalServerError(text="Миниатюра временно недоступна", headers={"X-Noema-Thumbnail-Status": thumbnail_reason})
                 diagnostic("media_thumbnail", media_kind="image", cache="hit" if hit else "miss",
                            duration_ms=(time.perf_counter() - thumbnail_started) * 1000)
                 return web.FileResponse(cached, headers={
@@ -550,7 +604,7 @@ def register_miniapp(app, core):
             elif action == "mode":
                 if args.get("mode") not in {"text", "voice", "voice_and_text"}:
                     raise ValueError("Неизвестный режим")
-                core.set_mode(cid, args["mode"])
+                await asyncio.to_thread(core.set_mode, cid, args["mode"])
                 result = {"ok": True}
             elif action == "voice_preferences":
                 # ``gender`` is the only user-selectable voice identity.  It
@@ -589,11 +643,11 @@ def register_miniapp(app, core):
                     uuid.UUID(str(job_id))
                 except (ValueError, TypeError, AttributeError):
                     raise ValueError("Некорректный запрос")
-                result = job_status(str(job_id), cid)
+                result = await asyncio.to_thread(job_status, str(job_id), cid)
             elif action == "task_toggle":
-                result = core.toggle_task_status(cid, int(args["id"]))
+                result = await asyncio.to_thread(core.toggle_task_status, cid, int(args["id"]))
             elif action == "clear_history":
-                core.clear_history(cid)
+                await asyncio.to_thread(core.clear_history, cid)
                 result = {"ok": True}
             elif action == "reminder_done":
                 reminder_id = int(args["id"])

@@ -10,6 +10,19 @@ from pathlib import Path
 
 
 MAX_EDGE = 480
+MAX_CACHE_FILES = 512
+
+
+def prune_thumbnail_cache(cache_root: str | Path, keep: Path | None = None) -> None:
+    """Bound disk derivatives without touching originals or active output."""
+    try:
+        entries = [path for path in Path(cache_root).glob("*.webp") if path.is_file() and path != keep]
+        overflow = len(entries) - MAX_CACHE_FILES
+        if overflow > 0:
+            for path in sorted(entries, key=lambda item: item.stat().st_mtime_ns)[:overflow]:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def thumbnail_version(source: str | Path) -> str:
@@ -27,6 +40,7 @@ def image_thumbnail(source: str | Path, cache_root: str | Path) -> tuple[Path | 
         target_dir = Path(cache_root)
         target = target_dir / f"{version}.webp"
         if target.is_file():
+            prune_thumbnail_cache(target_dir, keep=target)
             return target, True
         # Pillow is deliberately imported lazily: a missing optional image
         # codec must not break state, chat, or ordinary file downloads.
@@ -40,6 +54,7 @@ def image_thumbnail(source: str | Path, cache_root: str | Path) -> tuple[Path | 
                 image = image.convert("RGBA" if "transparency" in image.info else "RGB")
             image.save(temporary, "WEBP", quality=78, method=4)
         temporary.replace(target)
+        prune_thumbnail_cache(target_dir, keep=target)
         return target, False
     except Exception:
         return None, False

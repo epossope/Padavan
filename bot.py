@@ -210,6 +210,8 @@ TELEGRAM_FINAL_CHUNK_KEYS = set()
 TELEGRAM_FINAL_CHUNK_ORDER = deque()
 TELEGRAM_FINAL_CHUNK_LOCK = threading.RLock()
 RUNTIME_METRICS = {}
+RUNTIME_ACTIVITY = deque(maxlen=32)
+RUNTIME_ACTIVITY_LOCK = threading.Lock()
 LATENCY_METRICS = (
     "callback_ack_ms", "event_loop_lag_ms", "telegram_send_ms", "wake_ms",
     "stt_first_partial_ms", "stt_final_ms", "context_build_ms",
@@ -1191,6 +1193,53 @@ def record_runtime_metric(name, value_ms, **detail):
         with RUNTIME_METRICS_LOCK:
             RUNTIME_METRIC_SERIES[name].append(sample["value_ms"])
     return sample
+
+
+def record_runtime_activity(activity):
+    """Keep only a short, fixed-label activity trail for lag correlation."""
+    safe = str(activity or "")[:80]
+    if not safe or not all(char.isascii() and (char.isalnum() or char in "_:-.") for char in safe):
+        return
+    with RUNTIME_ACTIVITY_LOCK:
+        RUNTIME_ACTIVITY.append((time.monotonic(), safe))
+
+
+def current_runtime_activity(max_age_seconds=5):
+    with RUNTIME_ACTIVITY_LOCK:
+        if not RUNTIME_ACTIVITY:
+            return "idle"
+        stamp, activity = RUNTIME_ACTIVITY[-1]
+    return activity if time.monotonic() - stamp <= max_age_seconds else "idle"
+
+
+def process_resource_snapshot():
+    """Portable, privacy-safe process counters for production RAM diagnosis."""
+    rss_mb = peak_mb = open_fds = None
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8", errors="ignore")
+        values = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        rss_mb = round(int(values.get("VmRSS", "0 kB").split()[0]) / 1024, 1)
+        peak_mb = round(int(values.get("VmHWM", "0 kB").split()[0]) / 1024, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        open_fds = len(list(Path("/proc/self/fd").iterdir()))
+    except OSError:
+        pass
+    cache_counts = {}
+    provider = globals().get("miniapp_runtime_cache_counts")
+    if callable(provider):
+        try:
+            cache_counts = provider()
+        except Exception:
+            cache_counts = {}
+    snapshot = {"rss_mb": rss_mb if rss_mb is not None else -1,
+                "rss_peak_mb": peak_mb if peak_mb is not None else -1,
+                "thread_count": threading.active_count(),
+                "open_fds": open_fds if open_fds is not None else -1,
+                "active_stream_count": len(ACTIVE_STREAM_RESPONSES),
+                **{name: int(value) for name, value in cache_counts.items() if isinstance(value, int)}}
+    return snapshot
 
 
 def reset_runtime_metric_series():
@@ -6124,6 +6173,7 @@ def callback_timing(handler):
 @callback_timing
 async def callback(update,context):
 
+    record_runtime_activity("telegram:callback")
     raw_query=update.callback_query; await safe_callback_answer(raw_query)
     if not str(raw_query.data or "").startswith("ackrem:"):
         await adopt_active_ui(raw_query)
@@ -7197,8 +7247,9 @@ def build_briefing(chat_id):
 
 async def text_handler(update,context):
 
+    record_runtime_activity("telegram:text")
     t=update.effective_message.text.strip(); cid=update.effective_chat.id
-    register_bot_user(cid, getattr(update, "effective_user", None))
+    await asyncio.to_thread(register_bot_user, cid, getattr(update, "effective_user", None))
 
     async def consume_menu_tap():
         """Reply-keyboard taps cannot carry a custom-emoji entity.
@@ -7489,7 +7540,8 @@ async def text_handler(update,context):
 
 async def voice_handler(update,context):
 
-    register_bot_user(update.effective_chat.id, getattr(update, "effective_user", None))
+    record_runtime_activity("telegram:voice")
+    await asyncio.to_thread(register_bot_user, update.effective_chat.id, getattr(update, "effective_user", None))
 
     fd,n=tempfile.mkstemp(suffix=".ogg"); os.close(fd); p=Path(n)
 
@@ -7513,8 +7565,9 @@ async def voice_handler(update,context):
 
 async def image_handler(update,context):
 
+    record_runtime_activity("telegram:image")
     cid=update.effective_chat.id
-    register_bot_user(cid, getattr(update, "effective_user", None))
+    await asyncio.to_thread(register_bot_user, cid, getattr(update, "effective_user", None))
 
     msg=update.effective_message
 
@@ -7822,8 +7875,17 @@ async def event_loop_lag_tick(context):
     context.job.data["expected"] = loop.time() + 1.0
     record_runtime_metric("event_loop_lag_ms", lag_ms)
     if lag_ms > 500:
-        LOGGER.warning("telemetry event_loop_lag_ms=%.1f", lag_ms)
-        DIAGNOSTICS.record("event_loop_lag_warning", event_loop_lag_ms=lag_ms)
+        activity = current_runtime_activity()
+        LOGGER.warning("telemetry event_loop_lag_ms=%.1f activity=%s", lag_ms, activity)
+        DIAGNOSTICS.record("event_loop_lag_warning", event_loop_lag_ms=lag_ms, activity=activity)
+
+
+async def process_resource_tick(context):
+    snapshot = await asyncio.to_thread(process_resource_snapshot)
+    LOGGER.info("telemetry process_resources rss_mb=%s rss_peak_mb=%s threads=%s open_fds=%s thumbnail_cache=%s tickets=%s",
+                snapshot.get("rss_mb"), snapshot.get("rss_peak_mb"), snapshot.get("thread_count"),
+                snapshot.get("open_fds"), snapshot.get("thumbnail_cache_count"), snapshot.get("download_ticket_cache_count"))
+    DIAGNOSTICS.record("process_resources", **snapshot)
 
 
 
@@ -8153,6 +8215,10 @@ async def main_async():
         event_loop_lag_tick, interval=1, first=1,
         data={"expected": asyncio.get_running_loop().time() + 1},
         job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+    )
+    app.job_queue.run_repeating(
+        process_resource_tick, interval=60, first=15,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
     )
 
     await app.initialize()
