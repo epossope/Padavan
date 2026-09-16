@@ -1,5 +1,8 @@
 import ast
 import asyncio
+import inspect
+import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -167,6 +170,32 @@ class AsyncResponsivenessTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("&lt;провайдер&gt;/&lt;модель&gt;", rendered)
         self.assertIn("<code>vendor/model</code>", rendered)
+
+
+class TelegramPollingOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_one_polling_owner_can_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "telegram_polling.lock"
+            first = bot.TelegramPollingSingleton(lock_path)
+            second = bot.TelegramPollingSingleton(lock_path)
+            updater = SimpleNamespace(start_polling=AsyncMock())
+            app = SimpleNamespace(updater=updater)
+            try:
+                with patch.object(bot.DIAGNOSTICS, "record") as diagnostic:
+                    owner = await bot.start_telegram_polling(app, ownership=first, instance_id="safe-first")
+                    with self.assertRaises(bot.PollingOwnershipError):
+                        await bot.start_telegram_polling(app, ownership=second, instance_id="safe-second")
+                updater.start_polling.assert_awaited_once_with(drop_pending_updates=False)
+                diagnostic.assert_any_call("telegram_polling_started", instance_id="safe-first", pid=os.getpid())
+                diagnostic.assert_any_call("telegram_polling_duplicate_blocked", instance_id="safe-second", pid=os.getpid())
+            finally:
+                first.release()
+                second.release()
+
+    def test_miniapp_http_startup_has_no_polling_path(self):
+        source = inspect.getsource(bot.start_quick_actions_server)
+        self.assertNotIn("start_polling", source)
+        self.assertNotIn("run_polling", source)
 
 
 class TelemetrySeriesTests(unittest.TestCase):
