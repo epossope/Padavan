@@ -195,6 +195,84 @@ PERSISTENT_ROOT.mkdir(parents=True, exist_ok=True)
 DB = PERSISTENT_ROOT / "noema_test.sqlite3"
 DIAGNOSTICS = DiagnosticsJournal(PERSISTENT_ROOT / "runtime_logs")
 
+
+class PollingOwnershipError(RuntimeError):
+    """Raised before a second process can issue Telegram getUpdates."""
+
+
+_POLLING_PATHS = set()
+_POLLING_PATHS_LOCK = threading.Lock()
+
+
+class TelegramPollingSingleton:
+    """An advisory process lock held for the lifetime of Telegram polling.
+
+    Amvera mounts ``/data`` for this app, so sibling/replacement processes see
+    the same lock. The in-process set also makes duplicate startup attempts
+    deterministic on platforms whose file locking is process-scoped.
+    """
+
+    def __init__(self, path=None):
+        self.path = Path(path or (PERSISTENT_ROOT / "telegram_polling.lock"))
+        self._path_key = str(self.path.resolve())
+        self._fd = None
+
+    def acquire(self):
+        with _POLLING_PATHS_LOCK:
+            if self._path_key in _POLLING_PATHS:
+                return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = None
+        try:
+            fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b" ")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            return False
+        with _POLLING_PATHS_LOCK:
+            if self._path_key in _POLLING_PATHS:
+                self._unlock_and_close(fd)
+                return False
+            _POLLING_PATHS.add(self._path_key)
+        self._fd = fd
+        return True
+
+    @staticmethod
+    def _unlock_and_close(fd):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def release(self):
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        with _POLLING_PATHS_LOCK:
+            _POLLING_PATHS.discard(self._path_key)
+        self._unlock_and_close(fd)
+
+
+def polling_instance_id():
+    """A short per-process diagnostic identifier with no token material."""
+    return uuid.uuid4().hex[:12]
+
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_KEYS_URL = "https://openrouter.ai/api/v1/keys"
 
@@ -8131,6 +8209,25 @@ async def start_quick_actions_server(telegram_app):
     return runner
 
 
+async def start_telegram_polling(telegram_app, *, ownership=None, instance_id=None):
+    """Start the sole getUpdates owner, or fail before a duplicate request."""
+    ownership = ownership or TelegramPollingSingleton()
+    instance_id = instance_id or polling_instance_id()
+    pid = os.getpid()
+    if not ownership.acquire():
+        LOGGER.error("telegram_polling_duplicate_blocked instance_id=%s pid=%s", instance_id, pid)
+        DIAGNOSTICS.record("telegram_polling_duplicate_blocked", instance_id=instance_id, pid=pid)
+        raise PollingOwnershipError("Telegram polling is already owned by another process")
+    try:
+        LOGGER.info("telegram_polling_started instance_id=%s pid=%s", instance_id, pid)
+        DIAGNOSTICS.record("telegram_polling_started", instance_id=instance_id, pid=pid)
+        await telegram_app.updater.start_polling(drop_pending_updates=False)
+    except BaseException:
+        ownership.release()
+        raise
+    return ownership
+
+
 async def main_async():
 
     if not TG or "PASTE_" in TG:
@@ -8221,18 +8318,30 @@ async def main_async():
         job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
     )
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=False)
-    web_runner = await start_quick_actions_server(app)
-    print("QUICK ACTIONS: HTTP server on", os.getenv("NOEMA_QUICK_PORT", "8080"))
+    polling_ownership = None
+    web_runner = None
+    app_initialized = False
+    app_started = False
     try:
+        await app.initialize()
+        app_initialized = True
+        await app.start()
+        app_started = True
+        polling_ownership = await start_telegram_polling(app)
+        web_runner = await start_quick_actions_server(app)
+        print("QUICK ACTIONS: HTTP server on", os.getenv("NOEMA_QUICK_PORT", "8080"))
         await asyncio.Event().wait()
     finally:
-        await web_runner.cleanup()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        if web_runner:
+            await web_runner.cleanup()
+        if polling_ownership:
+            await app.updater.stop()
+        if app_started:
+            await app.stop()
+        if app_initialized:
+            await app.shutdown()
+        if polling_ownership:
+            polling_ownership.release()
 
 
 def main():
