@@ -52,3 +52,12 @@ class PersonMediaTests(unittest.TestCase):
         self.assertTrue(bot.delete_file(7, self.file["id"])["ok"])
         self.assertEqual(bot.person_media_list(7, self.person["id"])["items"], [])
         self.assertIsNone(bot.get_people(7)["people"][0]["avatar_file_id"])
+
+    def test_description_is_owner_scoped_and_unlink_keeps_file(self):
+        self.assertTrue(bot.update_file_description(7, self.file["id"], "Портрет для встречи")["ok"])
+        self.assertEqual(bot.get_files(7)["files"][0]["description"], "Портрет для встречи")
+        self.assertFalse(bot.update_file_description(8, self.file["id"], "чужое")["ok"])
+        bot.set_person_avatar(7, self.person["id"], self.file["id"])
+        self.assertTrue(bot.unlink_person_media(7, self.person["id"], self.file["id"])["ok"])
+        self.assertEqual(bot.person_media_list(7, self.person["id"])["items"], [])
+        self.assertEqual(bot.get_files(7)["files"][0]["id"], self.file["id"])

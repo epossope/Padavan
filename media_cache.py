@@ -43,3 +43,11 @@ def image_thumbnail(source: str | Path, cache_root: str | Path) -> tuple[Path | 
         return target, False
     except Exception:
         return None, False
+
+
+def remove_thumbnail(source: str | Path, cache_root: str | Path) -> None:
+    """Best-effort invalidation for a deleted original."""
+    try:
+        (Path(cache_root) / f"{thumbnail_version(source)}.webp").unlink(missing_ok=True)
+    except OSError:
+        pass

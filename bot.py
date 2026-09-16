@@ -695,7 +695,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","unlink_person_media","update_file_description","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
 
 # Files received from Telegram are handled by the ingestion pipeline, not by
 # model-callable filesystem tools. artifact_create is the sole generated-file
@@ -1834,7 +1834,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS files(
             id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,telegram_file_id TEXT,
             original_name TEXT,mime_type TEXT,local_path TEXT,kind TEXT,summary TEXT,
-            extracted_text TEXT,created_at TEXT
+            extracted_text TEXT,description TEXT NOT NULL DEFAULT '',created_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS person_media(
@@ -1857,6 +1857,7 @@ def init_db():
 
             ("people","projects","TEXT"),("people","avatar_file_id","INTEGER"),
             ("people","groups_json","TEXT NOT NULL DEFAULT '[]'"),("people","tags_json","TEXT NOT NULL DEFAULT '[]'"),
+            ("files","description","TEXT NOT NULL DEFAULT ''"),
             ("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
             ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
@@ -3525,7 +3526,7 @@ def delete_reminder(chat_id,reminder_id):
 def get_files(chat_id,kind=None,limit=5):
 
     limit=max(1,min(int(limit or 5),100))
-    q="SELECT id,original_name,mime_type,local_path,kind,summary,created_at FROM files WHERE chat_id=?"
+    q="SELECT id,original_name,mime_type,local_path,kind,summary,description,created_at FROM files WHERE chat_id=?"
     args=[chat_id]
     if kind:
         q+=" AND kind=?"
@@ -3535,6 +3536,24 @@ def get_files(chat_id,kind=None,limit=5):
     with conn() as c:
         rows=c.execute(q,args).fetchall()
     return {"ok":True,"tool":"get_files","files":[dict(r) for r in rows]}
+
+
+def update_file_description(chat_id, file_id, description=""):
+    value = str(description or "").strip()[:4000]
+    with conn() as c:
+        cur = c.execute("UPDATE files SET description=? WHERE id=? AND chat_id=?", (value, int(file_id), chat_id))
+    return {"ok": bool(cur.rowcount), "tool": "update_file_description", "file_id": int(file_id), "description": value}
+
+
+def unlink_person_media(chat_id, person_id, file_id):
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (int(person_id), chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "unlink_person_media", "error": "person_not_found"}
+        c.execute("DELETE FROM person_media WHERE chat_id=? AND person_id=? AND file_id=?", (chat_id, int(person_id), int(file_id)))
+        c.execute("UPDATE people SET avatar_file_id=NULL,updated_at=? WHERE id=? AND chat_id=? AND avatar_file_id=?",
+                  (datetime.now(timezone.utc).isoformat(), chat_id, int(person_id), int(file_id)))
+    return {"ok": True, "tool": "unlink_person_media", "person_id": int(person_id), "file_id": int(file_id)}
 
 
 def delete_file(chat_id, file_id):
@@ -3551,6 +3570,8 @@ def delete_file(chat_id, file_id):
     # configured storage root even if an old database row was corrupted.
     try:
         path, root = Path(row["local_path"]).resolve(), Path(STORAGE_ROOT).resolve()
+        from media_cache import remove_thumbnail
+        remove_thumbnail(path, root / "media_thumbnails")
         if root in path.parents and path.is_file():
             path.unlink()
     except OSError:
@@ -3621,6 +3642,10 @@ def execute_tool(chat_id,name,args):
         "person_media_list":person_media_list,
 
         "link_person_media":link_person_media,
+
+        "unlink_person_media":unlink_person_media,
+
+        "update_file_description":update_file_description,
 
         "delete_note":delete_note,
 

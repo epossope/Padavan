@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -95,11 +96,33 @@ def register_miniapp(app, core):
     jobs = {}
     job_locks = {}
     jobs_lock = threading.Lock()
+    download_tickets = {}
+    download_tickets_lock = threading.Lock()
 
     def diagnostic(event, **fields):
         journal = getattr(core, "DIAGNOSTICS", None)
         if journal:
             journal.record(event, **fields)
+
+    def issue_download_ticket(request, cid, path, filename, mime_type, source):
+        """Create a single-use owner-authorized external download URL (five minutes)."""
+        ticket = secrets.token_urlsafe(32)
+        with download_tickets_lock:
+            now = time.monotonic()
+            for key, value in list(download_tickets.items()):
+                if value["expires_at"] <= now:
+                    download_tickets.pop(key, None)
+            download_tickets[ticket] = {"owner": cid, "path": str(path), "filename": str(filename),
+                                        "mime_type": str(mime_type or "application/octet-stream"), "expires_at": now + 300}
+        diagnostic("artifact_download_ticket", source=source, result="issued")
+        return f"{request.scheme}://{request.host}/api/v1/miniapp/download/{ticket}"
+
+    def take_download_ticket(ticket):
+        with download_tickets_lock:
+            value = download_tickets.pop(str(ticket), None)
+        if not value or value["expires_at"] <= time.monotonic() or not Path(value["path"]).is_file():
+            return None
+        return value
 
     def ensure_jobs_table():
         if not callable(getattr(core, "conn", None)):
@@ -477,6 +500,47 @@ def register_miniapp(app, core):
                     "X-Content-Type-Options": "nosniff",
                     "Content-Security-Policy": "sandbox",
                 })
+            elif action == "download_ticket":
+                kind = str(args.get("kind") or "")
+                diagnostic("artifact_download_request", source=kind)
+                if kind == "file":
+                    with core.conn() as c:
+                        row = c.execute("SELECT local_path,original_name,mime_type FROM files WHERE chat_id=? AND id=?", (cid, int(args["id"]))).fetchone()
+                    if not row or not row["local_path"] or not Path(row["local_path"]).is_file():
+                        raise web.HTTPNotFound(text="Файл недоступен")
+                    result = {"url": issue_download_ticket(request, cid, row["local_path"], row["original_name"] or "file", row["mime_type"], "file")}
+                elif kind == "artifact":
+                    artifact_id = str(args.get("id") or "")
+                    item = core.artifact_store().metadata(artifact_id, cid, is_admin=cid in getattr(core, "ADMIN_CHAT_IDS", set()), include_path=True)
+                    result = {"url": issue_download_ticket(request, cid, item["local_path"], item["filename"], item["mime_type"], "artifact")}
+                else:
+                    raise ValueError("Некорректный файл")
+            elif action == "file_update":
+                result = await asyncio.to_thread(core.update_file_description, cid, int(args["id"]), args.get("description", ""))
+                if not result.get("ok"):
+                    raise web.HTTPNotFound(text="Файл недоступен")
+            elif action == "file_delete":
+                result = await asyncio.to_thread(core.delete_file, cid, int(args["id"]))
+                if not result.get("ok"):
+                    raise web.HTTPNotFound(text="Файл недоступен")
+            elif action == "person_media_unlink":
+                result = await asyncio.to_thread(core.unlink_person_media, cid, int(args["person_id"]), int(args["file_id"]))
+                if not result.get("ok"):
+                    raise web.HTTPNotFound(text="Связь не найдена")
+            elif action == "person_media_link":
+                result = await asyncio.to_thread(core.link_person_media, cid, int(args["person_id"]), int(args["file_id"]), "photo")
+                if not result.get("ok"):
+                    raise web.HTTPNotFound(text="Фото недоступно")
+            elif action == "person_media_profile":
+                result = await asyncio.to_thread(core.set_person_avatar, cid, int(args["person_id"]), int(args["file_id"]))
+                if not result.get("ok"):
+                    raise web.HTTPNotFound(text="Фото недоступно")
+            elif action == "download_opened":
+                source = str(args.get("kind") or "")
+                if source not in {"file", "artifact"}:
+                    raise ValueError("Некорректный файл")
+                diagnostic("artifact_download_external_open", source=source)
+                result = {"ok": True}
             elif action == "chat":
                 text = str(args.get("text", "")).strip()
                 if not text or len(text) > 12000:
@@ -736,6 +800,16 @@ def register_miniapp(app, core):
         finally:
             Path(name).unlink(missing_ok=True)
 
+    async def external_download(request):
+        item = take_download_ticket(request.match_info.get("ticket", ""))
+        if not item:
+            diagnostic("artifact_download_error", result="expired")
+            raise web.HTTPNotFound(text="Ссылка недоступна")
+        suffix = Path(item["filename"]).suffix.lower().lstrip(".") or "bin"
+        disposition = f"attachment; filename=file.{suffix}; filename*=UTF-8''{url_quote(item['filename'])}"
+        return web.FileResponse(item["path"], headers={"Cache-Control": "no-store", "Content-Disposition": disposition,
+                                                         "X-Content-Type-Options": "nosniff", "Content-Type": item["mime_type"]})
+
     async def voice_transcribe(request):
         form = await request.post()
         user = core.valid_webapp_user(form.get("init_data"))
@@ -970,5 +1044,6 @@ def register_miniapp(app, core):
     app.router.add_get("/app", index)
     app.router.add_get("/app/", index)
     app.router.add_post("/api/v1/miniapp/boot-telemetry", boot_telemetry)
+    app.router.add_get("/api/v1/miniapp/download/{ticket}", external_download)
     app.router.add_get("/app/assets/{filename:.*}", asset)
     app.router.add_post("/api/v1/miniapp", api)
