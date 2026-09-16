@@ -1,0 +1,41 @@
+name: Publish clean deploy branch
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build exact production tree
+        run: python scripts/build_deploy_tree.py --output "$RUNNER_TEMP/noema-deploy"
+      - name: Verify required Amvera entrypoints
+        run: |
+          test -f "$RUNNER_TEMP/noema-deploy/amvera.yml"
+          test -f "$RUNNER_TEMP/noema-deploy/requirements.txt"
+          test -f "$RUNNER_TEMP/noema-deploy/bot.py"
+          test -f "$RUNNER_TEMP/noema-deploy/miniapp/index.html"
+          test -f "$RUNNER_TEMP/noema-deploy/miniapp/models/vosk-model-small-ru-0.22.tar.gz"
+      - name: Publish orphan deploy tree
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/noema-deploy"
+          git init -b deploy
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          git commit -m "deploy: ${SOURCE_SHA}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin deploy
