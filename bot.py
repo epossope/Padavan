@@ -41,7 +41,7 @@ from datetime import datetime, timezone, timedelta
 
 from pathlib import Path
 
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from urllib.parse import urlparse
 
@@ -415,6 +415,59 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"event_create",
+        "description":"Создать внутреннее событие Noema. Для встречи с человеком сначала найди/создай профиль и передай его person_id в participant_ids. Это не внешний календарь.",
+        "parameters":{"type":"object","properties":{
+            "kind":{"type":"string","enum":["meeting","call","appointment","lesson","travel","personal","other"]},
+            "title":{"type":"string"},"starts_at":{"type":"string"},"ends_at":{"type":"string"},
+            "all_day":{"type":"boolean"},"timezone":{"type":"string"},"location":{"type":"string"},
+            "notes":{"type":"string"},"project_id":{"type":"string"},"source_turn_id":{"type":"integer"},
+            "participant_ids":{"type":"array","items":{"type":"integer"}}
+        },"required":["title","starts_at"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_update",
+        "description":"Изменить owner-scoped внутреннее событие по id.",
+        "parameters":{"type":"object","properties":{
+            "event_id":{"type":"integer"},"kind":{"type":"string"},"title":{"type":"string"},
+            "starts_at":{"type":"string"},"ends_at":{"type":"string"},"all_day":{"type":"boolean"},
+            "timezone":{"type":"string"},"location":{"type":"string"},"notes":{"type":"string"},
+            "status":{"type":"string"},"project_id":{"type":"string"},
+            "participant_ids":{"type":"array","items":{"type":"integer"}}
+        },"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_delete",
+        "description":"Удалить owner-scoped внутреннее событие по id. Используй только по явной просьбе.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_get",
+        "description":"Получить точное внутреннее событие текущего пользователя по id.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_list",
+        "description":"Получить точные внутренние события пользователя по периоду и статусу.",
+        "parameters":{"type":"object","properties":{"date_from":{"type":"string"},"date_to":{"type":"string"},"status":{"type":"string"},"person_id":{"type":"integer"},"limit":{"type":"integer"}}}
+    }},
+    {"type":"function","function":{
+        "name":"event_search",
+        "description":"Искать точные внутренние события по названию, заметкам, месту или участнику. Не отвечай об актуальной встрече по истории.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"},"date_from":{"type":"string"},"date_to":{"type":"string"},"person_id":{"type":"integer"},"limit":{"type":"integer"}}}
+    }},
+    {"type":"function","function":{
+        "name":"event_participant_add",
+        "description":"Привязать owner-scoped профиль человека к owner-scoped внутреннему событию.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"},"person_id":{"type":"integer"},"role":{"type":"string"}},"required":["event_id","person_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_participant_remove",
+        "description":"Удалить связь участника с owner-scoped внутренним событием.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"},"person_id":{"type":"integer"}},"required":["event_id","person_id"]}
+    }},
+
+    {"type":"function","function":{
 
         "name":"save_note",
 
@@ -775,7 +828,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","unlink_person_media","update_file_description","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","unlink_person_media","update_file_description","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create","event_create","event_update","event_delete","event_participant_add","event_participant_remove"}
 
 # Files received from Telegram are handled by the ingestion pipeline, not by
 # model-callable filesystem tools. artifact_create is the sole generated-file
@@ -1886,6 +1939,33 @@ def init_db():
 
         );
 
+        CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'other',
+            title TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            ends_at TEXT,
+            all_day INTEGER NOT NULL DEFAULT 0,
+            timezone TEXT NOT NULL,
+            location TEXT,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'scheduled',
+            project_id TEXT,
+            source_turn_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_participants(
+            event_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT,
+            PRIMARY KEY(event_id, person_id),
+            FOREIGN KEY(event_id) REFERENCES events(id),
+            FOREIGN KEY(person_id) REFERENCES people(id)
+        );
+
         CREATE TABLE IF NOT EXISTS expenses(
 
             id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,amount REAL,currency TEXT,category TEXT,
@@ -2003,6 +2083,9 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_request_events_chat_created ON user_request_events(chat_id,created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_person ON person_media(chat_id,person_id,is_current)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_file ON person_media(chat_id,file_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events(chat_id,starts_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_status ON events(chat_id,status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id,event_id)")
 
     KnowledgeStore(DB).init_schema()
 
@@ -3356,6 +3439,253 @@ def task_list(chat_id, scope="open", query="", limit=100):
     return {"ok": True, "tool": "task_list", "scope": scope, "date": today, "count": len(selected), "items": selected[:limit]}
 
 
+EVENT_KINDS = {"meeting", "call", "appointment", "lesson", "travel", "personal", "other"}
+EVENT_STATUSES = {"scheduled", "completed", "cancelled"}
+
+
+def _event_error(tool, code):
+    return {"ok": False, "tool": tool, "error": code}
+
+
+def _event_datetime(chat_id, value, timezone_name="", *, required=False):
+    value = str(value or "").strip()
+    if not value:
+        if required:
+            raise ValueError("missing_datetime")
+        return ""
+    zone_name = str(timezone_name or timezone_name_for(chat_id))
+    zone = ZoneInfo(zone_name)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _event_row(c, chat_id, event_id):
+    row = c.execute("SELECT * FROM events WHERE id=? AND chat_id=?", (int(event_id), chat_id)).fetchone()
+    if not row:
+        return None
+    event = dict(row)
+    event["all_day"] = bool(event["all_day"])
+    event["participants"] = [dict(item) for item in c.execute(
+        """SELECT p.id AS person_id,p.name,ep.role FROM event_participants ep
+           JOIN people p ON p.id=ep.person_id
+           WHERE ep.event_id=? AND p.chat_id=? ORDER BY p.name,p.id""",
+        (event["id"], chat_id),
+    ).fetchall()]
+    return event
+
+
+def event_participant_add(chat_id, event_id, person_id, role=""):
+    try:
+        event_id, person_id = int(event_id), int(person_id)
+    except (TypeError, ValueError):
+        return _event_error("event_participant_add", "invalid_id")
+    with conn() as c:
+        event = c.execute("SELECT id FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone()
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone()
+        if not event:
+            return _event_error("event_participant_add", "event_not_found")
+        if not person:
+            return _event_error("event_participant_add", "person_not_found")
+        c.execute("INSERT OR REPLACE INTO event_participants(event_id,person_id,role) VALUES(?,?,?)",
+                  (event_id, person_id, str(role or "")[:80]))
+    return {"ok": True, "tool": "event_participant_add", "event_id": event_id, "person_id": person_id}
+
+
+def event_participant_remove(chat_id, event_id, person_id):
+    try:
+        event_id, person_id = int(event_id), int(person_id)
+    except (TypeError, ValueError):
+        return _event_error("event_participant_remove", "invalid_id")
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone():
+            return _event_error("event_participant_remove", "event_not_found")
+        cur = c.execute(
+            """DELETE FROM event_participants WHERE event_id=? AND person_id=?
+               AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+            (event_id, person_id, person_id, chat_id),
+        )
+    return {"ok": True, "tool": "event_participant_remove", "removed": cur.rowcount}
+
+
+def event_create(chat_id, title, starts_at, kind="other", ends_at="", all_day=False,
+                 timezone="", location="", notes="", status="scheduled", project_id="",
+                 source_turn_id=None, participant_ids=None):
+    tool = "event_create"
+    title = str(title or "").strip()[:500]
+    kind, status = str(kind or "other"), str(status or "scheduled")
+    zone_name = str(timezone or timezone_name_for(chat_id))
+    if not title:
+        return _event_error(tool, "missing_title")
+    if kind not in EVENT_KINDS:
+        return _event_error(tool, "invalid_kind")
+    if status not in EVENT_STATUSES:
+        return _event_error(tool, "invalid_status")
+    try:
+        ZoneInfo(zone_name)
+        start_utc = _event_datetime(chat_id, starts_at, zone_name, required=True)
+        end_utc = _event_datetime(chat_id, ends_at, zone_name)
+        if end_utc and datetime.fromisoformat(end_utc) < datetime.fromisoformat(start_utc):
+            return _event_error(tool, "ends_before_start")
+        participants = list(dict.fromkeys(int(item) for item in (participant_ids or [])))
+        source_id = int(source_turn_id) if source_turn_id is not None else None
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error(tool, "invalid_datetime_or_participant")
+    now = datetime.now(ZoneInfo("UTC")).isoformat()
+    with conn() as c:
+        if source_id is not None and not c.execute(
+            "SELECT 1 FROM messages WHERE id=? AND chat_id=?", (source_id, chat_id)
+        ).fetchone():
+            return _event_error(tool, "source_turn_not_found")
+        if participants:
+            owned = {row["id"] for row in c.execute(
+                f"SELECT id FROM people WHERE chat_id=? AND id IN ({','.join('?' for _ in participants)})",
+                (chat_id, *participants),
+            ).fetchall()}
+            if owned != set(participants):
+                return _event_error(tool, "participant_not_found")
+        cur = c.execute(
+            """INSERT INTO events(chat_id,kind,title,starts_at,ends_at,all_day,timezone,location,notes,status,
+                                  project_id,source_turn_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (chat_id, kind, title, start_utc, end_utc or None, int(bool(all_day)), zone_name,
+             str(location or "")[:500] or None, str(notes or "")[:4000] or None, status,
+             str(project_id or "")[:200] or None, source_id,
+             now, now),
+        )
+        event_id = cur.lastrowid
+        for person_id in participants:
+            c.execute("INSERT INTO event_participants(event_id,person_id,role) VALUES(?,?,NULL)",
+                      (event_id, person_id))
+        event = _event_row(c, chat_id, event_id)
+    return {"ok": True, "tool": tool, "event": event, "id": event_id}
+
+
+def event_get(chat_id, event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return _event_error("event_get", "invalid_id")
+    with conn() as c:
+        event = _event_row(c, chat_id, event_id)
+    return ({"ok": True, "tool": "event_get", "event": event} if event else
+            _event_error("event_get", "not_found"))
+
+
+def event_list(chat_id, date_from="", date_to="", status="", person_id=None, limit=100):
+    try:
+        limit = max(1, min(int(limit or 100), 200))
+        person_id = int(person_id) if person_id is not None else None
+        start = _event_datetime(chat_id, date_from, required=False) if date_from else ""
+        end_value = str(date_to or "")
+        if end_value and len(end_value) == 10:
+            end_value += "T23:59:59.999999"
+        end = _event_datetime(chat_id, end_value, required=False) if end_value else ""
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error("event_list", "invalid_filter")
+    clauses, values = ["e.chat_id=?"], [chat_id]
+    if start:
+        clauses.append("e.starts_at>=?"); values.append(start)
+    if end:
+        clauses.append("e.starts_at<=?"); values.append(end)
+    if status:
+        if status not in EVENT_STATUSES:
+            return _event_error("event_list", "invalid_status")
+        clauses.append("e.status=?"); values.append(status)
+    if person_id is not None:
+        clauses.append("EXISTS(SELECT 1 FROM event_participants ep WHERE ep.event_id=e.id AND ep.person_id=?)")
+        values.append(person_id)
+    with conn() as c:
+        ids = [row["id"] for row in c.execute(
+            f"SELECT e.id FROM events e WHERE {' AND '.join(clauses)} ORDER BY e.starts_at,e.id LIMIT ?",
+            (*values, limit),
+        ).fetchall()]
+        events = [_event_row(c, chat_id, event_id) for event_id in ids]
+    return {"ok": True, "tool": "event_list", "count": len(events), "events": events}
+
+
+def event_search(chat_id, query="", date_from="", date_to="", person_id=None, limit=100):
+    result = event_list(chat_id, date_from, date_to, person_id=person_id, limit=limit)
+    if not result.get("ok"):
+        result["tool"] = "event_search"
+        return result
+    needle = str(query or "").strip().casefold()
+    events = result["events"]
+    if needle:
+        events = [event for event in events if needle in " ".join((
+            str(event.get("title") or ""), str(event.get("notes") or ""),
+            str(event.get("location") or ""),
+            " ".join(person.get("name", "") for person in event.get("participants", [])),
+        )).casefold()]
+    return {"ok": True, "tool": "event_search", "count": len(events), "events": events}
+
+
+def event_update(chat_id, event_id, **changes):
+    tool = "event_update"
+    current = event_get(chat_id, event_id)
+    if not current.get("ok"):
+        return _event_error(tool, "not_found")
+    event = current["event"]
+    allowed = {"kind", "title", "starts_at", "ends_at", "all_day", "timezone", "location",
+               "notes", "status", "project_id", "participant_ids"}
+    if any(key not in allowed for key in changes):
+        return _event_error(tool, "invalid_field")
+    merged = {key: event.get(key) for key in allowed if key != "participant_ids"}
+    merged.update(changes)
+    title = str(merged.get("title") or "").strip()[:500]
+    kind, status = str(merged.get("kind") or "other"), str(merged.get("status") or "scheduled")
+    zone_name = str(merged.get("timezone") or timezone_name_for(chat_id))
+    if not title or kind not in EVENT_KINDS or status not in EVENT_STATUSES:
+        return _event_error(tool, "invalid_value")
+    try:
+        ZoneInfo(zone_name)
+        starts_at = _event_datetime(chat_id, merged.get("starts_at"), zone_name, required=True)
+        ends_at = _event_datetime(chat_id, merged.get("ends_at"), zone_name)
+        if ends_at and datetime.fromisoformat(ends_at) < datetime.fromisoformat(starts_at):
+            return _event_error(tool, "ends_before_start")
+        participants = changes.get("participant_ids")
+        participants = None if participants is None else list(dict.fromkeys(int(item) for item in participants))
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error(tool, "invalid_datetime_or_participant")
+    with conn() as c:
+        if participants is not None:
+            owned = {row["id"] for row in c.execute(
+                f"SELECT id FROM people WHERE chat_id=? AND id IN ({','.join('?' for _ in participants)})",
+                (chat_id, *participants),
+            ).fetchall()} if participants else set()
+            if owned != set(participants):
+                return _event_error(tool, "participant_not_found")
+        c.execute(
+            """UPDATE events SET kind=?,title=?,starts_at=?,ends_at=?,all_day=?,timezone=?,location=?,notes=?,
+                                 status=?,project_id=?,updated_at=? WHERE id=? AND chat_id=?""",
+            (kind, title, starts_at, ends_at or None, int(bool(merged.get("all_day"))), zone_name,
+             str(merged.get("location") or "")[:500] or None, str(merged.get("notes") or "")[:4000] or None,
+             status, str(merged.get("project_id") or "")[:200] or None, datetime.now(timezone.utc).isoformat(),
+             int(event_id), chat_id),
+        )
+        if participants is not None:
+            c.execute("DELETE FROM event_participants WHERE event_id=?", (int(event_id),))
+            for person_id in participants:
+                c.execute("INSERT INTO event_participants(event_id,person_id,role) VALUES(?,?,NULL)",
+                          (int(event_id), person_id))
+        updated = _event_row(c, chat_id, int(event_id))
+    return {"ok": True, "tool": tool, "event": updated, "id": int(event_id)}
+
+
+def event_delete(chat_id, event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return _event_error("event_delete", "invalid_id")
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone():
+            return _event_error("event_delete", "not_found")
+        c.execute("DELETE FROM event_participants WHERE event_id=?", (event_id,))
+        cur = c.execute("DELETE FROM events WHERE id=? AND chat_id=?", (event_id, chat_id))
+    return {"ok": True, "tool": "event_delete", "deleted": cur.rowcount}
+
+
 def get_plan_for_date(chat_id, day):
     """Return a calendar day without silently completing anything overdue."""
     selected = datetime.fromisoformat(day).date()
@@ -3393,7 +3723,9 @@ def get_plan_for_date(chat_id, day):
         if dt.date() == selected:
             reminders.append({"id": r["id"], "text": r["text"], "time": dt.strftime("%H:%M"),
                               "acknowledged": r["acknowledged"]})
-    return {"ok": True, "tool": "get_today_plan", "date": day, "tasks": tasks, "reminders": reminders}
+    events = event_list(chat_id, day, day, limit=200)
+    return {"ok": True, "tool": "get_today_plan", "date": day, "events": events.get("events", []),
+            "tasks": tasks, "reminders": reminders}
 
 
 def get_today_plan(chat_id):
@@ -3579,6 +3911,9 @@ def delete_task(chat_id,task_id):
 def delete_person(chat_id,person_id):
 
     with conn() as c:
+        c.execute("""DELETE FROM event_participants WHERE person_id=?
+                     AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+                  (person_id, person_id, chat_id))
         c.execute("DELETE FROM person_media WHERE chat_id=? AND person_id=?", (chat_id, person_id))
         cur = c.execute("DELETE FROM people WHERE id=? AND chat_id=?", (person_id,chat_id))
     return {"ok":True,"tool":"delete_person","deleted":cur.rowcount}
@@ -3762,6 +4097,22 @@ def execute_tool(chat_id,name,args):
         "task_list":task_list,
 
         "reminder_list":reminder_list,
+
+        "event_create":event_create,
+
+        "event_get":event_get,
+
+        "event_list":event_list,
+
+        "event_update":event_update,
+
+        "event_delete":event_delete,
+
+        "event_search":event_search,
+
+        "event_participant_add":event_participant_add,
+
+        "event_participant_remove":event_participant_remove,
 
         "set_briefing_preferences":set_briefing_preferences,
 
