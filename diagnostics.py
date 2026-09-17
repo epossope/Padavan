@@ -20,6 +20,8 @@ class DiagnosticsJournal:
         "thumbnail_cache_count", "download_ticket_cache_count",
         "weather_cache_count", "exchange_cache_count", "miniapp_lock_count",
         "miniapp_job_count", "active_stream_count", "activity", "instance_id", "pid",
+        "intent", "disposition", "entity_count", "read_count", "action_count",
+        "failure_category", "planner_latency_ms",
     }
 
     def __init__(self, directory: Path, max_bytes=5 * 1024 * 1024, backups=2):
