@@ -3345,6 +3345,17 @@ def person_interaction(chat_id, name="", interaction="", interaction_date="",
             "person_id": person_id, "name": canonical_name, "interaction": interaction}
 
 
+def person_interactions_list(chat_id, person_id, limit=50):
+    """Stable owner-scoped interaction history; detached legacy rows never attach."""
+    try: person_id, limit = int(person_id), max(1, min(int(limit), 100))
+    except (TypeError, ValueError): return {"ok": False, "tool": "person_interactions_list", "error": "invalid_id"}
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone():
+            return {"ok": False, "tool": "person_interactions_list", "error": "person_not_found"}
+        rows = c.execute("SELECT id,person_id,interaction,interaction_date,interaction_type FROM interactions WHERE chat_id=? AND person_id=? AND identity_detached=0 ORDER BY id DESC LIMIT ?", (chat_id, person_id, limit)).fetchall()
+    return {"ok": True, "tool": "person_interactions_list", "items": [dict(row) for row in rows]}
+
+
 
 def normalize_spent_at(x):
 

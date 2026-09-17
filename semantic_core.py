@@ -80,6 +80,7 @@ class EvidenceItem:
     timestamp: str = ""
     confidence: float = 1.0
     evidence_id: str = ""
+    domain: str = ""
 
     @property
     def precedence(self) -> int:

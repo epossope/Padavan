@@ -15,7 +15,7 @@ from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticP
 EXACT_ID_KEYS = frozenset({"id", "person_id", "event_id", "task_id", "reminder_id", "transaction_id", "note_id", "file_id", "project_id", "source_turn_id", "resolved_id"})
 WRITE_OPS = frozenset({"create", "upsert", "update", "delete", "cancel", "overwrite", "replace", "resolve_or_create"})
 DESTRUCTIVE = frozenset({"delete", "cancel", "overwrite", "replace", "update"})
-READ_OPERATIONS = {"person": {"resolve"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
+READ_OPERATIONS = {"person": {"resolve", "interactions_list"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
 WRITE_OPERATIONS = {"person": {"upsert", "resolve_or_create"}, "event": {"create", "update", "delete", "cancel"}, "reminder": {"create"}, "transaction": {"create"}, "note": {"create"}, "task": {"create"}}
 
 
@@ -188,6 +188,9 @@ class BotDomainServices:
     def read(self, owner: int, item: ValidatedRead) -> dict[str, Any]:
         person = next((r.resolved_id for r in item.entity_refs if r.type == "person"), None)
         if item.domain == "person" and item.operation == "resolve": return {"ok": True, "person_id": person}
+        if item.domain == "person" and item.operation == "interactions_list":
+            if person is None: raise PlanValidationError("person_not_found")
+            return self.bot.person_interactions_list(owner, person, **item.filters)
         if item.domain == "event" and item.operation == "list": return self.bot.event_list(owner, person_id=person, **item.filters)
         if item.domain == "event" and item.operation == "search": return self.bot.event_search(owner, person_id=person, **item.filters)
         if item.domain == "finance": return self.bot.finance_summary(owner, **item.filters)
