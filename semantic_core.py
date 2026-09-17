@@ -79,6 +79,7 @@ class EvidenceItem:
     fields: dict[str, Any]
     timestamp: str = ""
     confidence: float = 1.0
+    evidence_id: str = ""
 
     @property
     def precedence(self) -> int:
@@ -89,10 +90,16 @@ class EvidenceItem:
 class EvidencePacket:
     items: list[EvidenceItem] = field(default_factory=list)
     exact_empty: bool = False
+    checked_exact_domains: list[str] = field(default_factory=list)
+    exact_empty_domains: list[str] = field(default_factory=list)
 
     def add(self, item: EvidenceItem) -> None:
+        if not item.evidence_id:
+            item.evidence_id = f"e{len(self.items) + 1}"
         self.items.append(item)
         self.items.sort(key=lambda value: value.precedence, reverse=True)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"items": [asdict(item) for item in self.items], "exact_empty": self.exact_empty}
+        return {"items": [asdict(item) for item in self.items], "exact_empty": self.exact_empty,
+                "checked_exact_domains": self.checked_exact_domains,
+                "exact_empty_domains": self.exact_empty_domains}

@@ -54,6 +54,8 @@ class ExecutionStep:
     kind: str
     status: str
     result: dict[str, Any] = field(default_factory=dict)
+    domain: str = ""
+    operation: str = ""
 
 
 @dataclass(slots=True)
@@ -253,11 +255,11 @@ class PlanExecutor:
         self._emit("semantic_execution_started"); result = ExecutionResult("EXECUTED", plan.request_id); deps: dict[str, dict[str, Any]] = {}
         try:
             for item in plan.reads:
-                value = self.services.read(plan.owner, item); deps[item.read_id] = {"domain": item.domain, "operation": item.operation, "result": value}; result.reads.append(ExecutionStep(item.read_id, "read", "EXECUTED", value))
+                value = self.services.read(plan.owner, item); deps[item.read_id] = {"domain": item.domain, "operation": item.operation, "result": value}; result.reads.append(ExecutionStep(item.read_id, "read", "EXECUTED", value, item.domain, item.operation))
             for item in plan.actions:
                 value = self.services.write(plan.owner, item, deps, timezone_name); trusted_target_id = value.pop("_semantic_target_id", None); deps[item.action_id] = {"domain": item.domain, "operation": item.operation, "result": value}
                 if not value.get("ok"): raise PlanValidationError("domain_failure")
-                result.actions.append(ExecutionStep(item.action_id, "action", "EXECUTED", value)); self._emit("semantic_execution_step", operation=item.operation)
+                result.actions.append(ExecutionStep(item.action_id, "action", "EXECUTED", value, item.domain, item.operation)); self._emit("semantic_execution_step", operation=item.operation)
                 affected_id = trusted_target_id if item.operation in {"delete", "update", "cancel"} else value.get("id")
                 if affected_id is not None:
                     target = result.deleted_entities if item.operation == "delete" else result.updated_entities if item.operation in {"update", "cancel"} else result.created_entities
