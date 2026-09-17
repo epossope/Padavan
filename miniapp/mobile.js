@@ -32,12 +32,12 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
     their native gestures. */
  const gestureConstants=Object.freeze({startZoneRatio:.60,intentPx:8,dominance:1.16,commitProgress:.25,velocity:.40,settleMin:150,settleMax:220});
  const pointerInput=typeof window.PointerEvent==='function';
- window.NoemaGestures={constants:gestureConstants,input:pointerInput?'pointer':'touch',startZone(width=window.visualViewport?.width||innerWidth){return width*gestureConstants.startZoneRatio},classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(Math.abs(dx)>30&&Math.abs(velocity)>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.65,Math.abs(velocity)*1.45))))}};
+ window.NoemaGestures={constants:gestureConstants,input:pointerInput?'pointer':'touch',startZone(width=window.visualViewport?.width||innerWidth){return width*gestureConstants.startZoneRatio},classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(dx>30&&velocity>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.65,Math.abs(velocity)*1.45))))}};
  let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
  function edgeSwipeStartZone(width){return width*gestureConstants.startZoneRatio}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
  function hasTextSelection(){const selection=window.getSelection?.();return Boolean(selection&&selection.type==='Range'&&selection.toString())}
- function blocksEdgeSwipe(target){return hasTextSelection()||Boolean(target.closest('input,textarea,select,button,a,.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
+ function blocksEdgeSwipe(target){return hasTextSelection()||Boolean(target.closest('input,textarea,select,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.chip-row,.segments,.voice-slider,.home-grid.editing,[data-voice]'))}
  function clampedSwipeDistance(distance,width){const limit=width*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.16}
  function renderEdgeSwipe(){edgeSwipeFrame=0;const swipe=edgeSwipe;if(!swipe||swipe.axis!=='x')return;swipe.rendered=clampedSwipeDistance(swipe.dx,swipe.width);swipe.shell.classList.add('edge-swipe-active');swipe.shell.style.setProperty('--edge-swipe-x',swipe.rendered+'px')}
  function scheduleEdgeSwipe(){if(!edgeSwipeFrame)edgeSwipeFrame=requestAnimationFrame(renderEdgeSwipe)}
@@ -56,7 +56,7 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
  function beginEdgeSwipe(id,x,y,target,source){
   const shell=document.querySelector('#shell'),width=window.visualViewport?.width||innerWidth;
   if(!shell||edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone(width)||blocksEdgeSwipe(target))return false;
-  const now=performance.now();edgeSwipe={x,y,id,source,shell,width,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:now,startedAt:now,velocity:0,rendered:0};return true
+  const now=performance.now();edgeSwipe={x,y,id,source,target,shell,width,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:now,startedAt:now,velocity:0,rendered:0};return true
  }
  function moveEdgeSwipe(id,x,y,event){
   const swipe=edgeSwipe;if(!swipe||id!==swipe.id)return false;
@@ -64,12 +64,12 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
   const now=performance.now(),instant=(x-swipe.lastX)/Math.max(1,now-swipe.lastAt);swipe.dx=x-swipe.x;swipe.dy=y-swipe.y;swipe.velocity=swipe.velocity*.7+instant*.3;swipe.lastX=x;swipe.lastAt=now;
   if(!swipe.axis){const intent=window.NoemaGestures.classify(swipe.dx,swipe.dy);if(intent==='horizontal')swipe.axis=swipe.dx>0?'x':'cancel';else if(intent==='vertical')swipe.axis='cancel'}
   if(swipe.axis==='cancel'||swipe.dx<0){cancelEdgeSwipe();return false}
-  if(swipe.axis==='x'){event.preventDefault();scheduleEdgeSwipe();return true}return false
+  if(swipe.axis==='x'){window.NoemaPress?.cancelForBack?.(swipe.target);event.preventDefault();scheduleEdgeSwipe();return true}return false
  }
  function endEdgeSwipe(id){
   const swipe=edgeSwipe;if(!swipe||id!==swipe.id)return false;
   const {dx,axis,velocity,startedAt,width}=swipe;
-  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=window.NoemaGestures.shouldCommit(dx,width,releaseVelocity);if(commit)window.NoemaHaptics?.impact('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
+  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=velocity<0?velocity:Math.max(velocity,averageVelocity*.7),commit=window.NoemaGestures.shouldCommit(dx,width,releaseVelocity);if(commit)window.NoemaHaptics?.impact('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
  }
  function cancelInputSwipe(id){if(edgeSwipe?.id!==id)return;if(edgeSwipe.axis==='x')finishEdgeSwipe(false,0);edgeSwipe=null}
  if(pointerInput){
