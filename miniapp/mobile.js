@@ -27,60 +27,61 @@ window.NoemaBoot?.assetReady?.('mobile.js','__NOEMA_APP_BUILD_ID__');
  document.addEventListener('pointerup',()=>finish());document.addEventListener('pointercancel',()=>finish(true));document.addEventListener('touchmove',e=>{if(drag)e.preventDefault()},{passive:false});document.addEventListener('contextmenu',e=>{if(e.target.closest('[data-widget]'))e.preventDefault()});
  window.NoemaChatViewport?.bindBrowser?.();
 
- /* iPhone-like edge swipe: a global, touch-only gesture that yields to vertical
-    scrolling and horizontal controls before it acquires the gesture. */
- const gestureConstants=Object.freeze({intentPx:9,dominance:1.18,commitProgress:.26,velocity:.38,edgeZone:28,settleMin:160,settleMax:230});
- window.NoemaGestures={constants:gestureConstants,classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(Math.abs(dx)>30&&Math.abs(velocity)>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.55,Math.abs(velocity)*1.35))))}};
- let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0,ignoreTouchUntil=0;
+ /* One iOS-style edge-back engine for every secondary screen. It takes over
+    only after a horizontal intent; scrolling and every local control keep
+    their native gestures. */
+ const gestureConstants=Object.freeze({intentPx:8,dominance:1.16,commitProgress:.25,velocity:.40,edgeZone:26,settleMin:150,settleMax:220});
+ const pointerInput=typeof window.PointerEvent==='function';
+ window.NoemaGestures={constants:gestureConstants,input:pointerInput?'pointer':'touch',classify(dx,dy){if(Math.hypot(dx,dy)<gestureConstants.intentPx)return 'pending';return Math.abs(dx)>Math.abs(dy)*gestureConstants.dominance?'horizontal':'vertical'},shouldCommit(dx,width,velocity){return dx>=width*gestureConstants.commitProgress||(Math.abs(dx)>30&&Math.abs(velocity)>gestureConstants.velocity)},settleDuration(remaining,velocity){return reduced?1:Math.round(Math.min(gestureConstants.settleMax,Math.max(gestureConstants.settleMin,remaining/Math.max(.65,Math.abs(velocity)*1.45))))}};
+ let edgeSwipe=null,edgeSwipeFinishing=false,edgeSwipeFrame=0,edgeSwipeTimer=0;
  function edgeSwipeStartZone(){return Math.min(gestureConstants.edgeZone,innerWidth*.5)}
  function canSwipeBack(){return page!=='home'||navHistory.length>0||[...document.querySelectorAll('dialog')].some(dialog=>dialog.open)}
- /* Budget charts are vertical/static content, not horizontal controls. Blocking
-    their cards made an edge swipe work everywhere except Budget on iOS. */
  function hasTextSelection(){const selection=window.getSelection?.();return Boolean(selection&&selection.type==='Range'&&selection.toString())}
- function blocksEdgeSwipe(target){return hasTextSelection(target)||Boolean(target.closest('input,textarea,select,button,a,dialog,[role=dialog],.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
- function clampedSwipeDistance(distance){const limit=innerWidth*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.18}
- function renderEdgeSwipe(){edgeSwipeFrame=0;if(!edgeSwipe||edgeSwipe.axis!=='x')return;const shell=document.querySelector('#shell');if(!shell)return;edgeSwipe.rendered=clampedSwipeDistance(edgeSwipe.dx);shell.classList.add('edge-swipe-active');shell.style.setProperty('--edge-swipe-x',edgeSwipe.rendered+'px');shell.style.setProperty('--edge-swipe-progress',Math.min(1,edgeSwipe.rendered/innerWidth))}
+ function blocksEdgeSwipe(target){return hasTextSelection()||Boolean(target.closest('input,textarea,select,button,a,dialog,[role=dialog],.chip-row,.segments,.voice-slider,[type=range],[contenteditable=true],[draggable=true],[data-no-swipe-back],.home-grid.editing'))}
+ function clampedSwipeDistance(distance,width){const limit=width*.9,positive=Math.max(0,distance);return positive<=limit?positive:limit+(positive-limit)*.16}
+ function renderEdgeSwipe(){edgeSwipeFrame=0;const swipe=edgeSwipe;if(!swipe||swipe.axis!=='x')return;swipe.rendered=clampedSwipeDistance(swipe.dx,swipe.width);swipe.shell.classList.add('edge-swipe-active');swipe.shell.style.setProperty('--edge-swipe-x',swipe.rendered+'px')}
  function scheduleEdgeSwipe(){if(!edgeSwipeFrame)edgeSwipeFrame=requestAnimationFrame(renderEdgeSwipe)}
+ function clearEdgeSwipe(shell){shell.classList.remove('edge-swipe-active','edge-swipe-settling','edge-swipe-reset');shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');shell.style.removeProperty('--edge-swipe-duration')}
  function finishEdgeSwipe(commit,velocity=0){
   if(edgeSwipeFinishing)return;
-  const shell=document.querySelector('#shell');if(!shell)return;
+  const swipe=edgeSwipe;if(!swipe)return;
   if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0;renderEdgeSwipe()}
   edgeSwipeFinishing=true;
-  const current=Math.max(0,edgeSwipe?.rendered||0),distance=commit?innerWidth:0,remaining=Math.abs(distance-current);
-  const duration=window.NoemaGestures.settleDuration(remaining,velocity);
-  shell.style.setProperty('--edge-swipe-duration',duration+'ms');shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',distance+'px');shell.style.setProperty('--edge-swipe-progress',commit?1:0);
-  let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);shell.classList.remove('edge-swipe-settling');if(commit){shell.classList.add('edge-swipe-reset');window.NoemaBack?.();shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress');void shell.offsetWidth;shell.classList.remove('edge-swipe-reset')}else{shell.style.removeProperty('--edge-swipe-x');shell.style.removeProperty('--edge-swipe-progress')}shell.style.removeProperty('--edge-swipe-duration');edgeSwipeFinishing=false};
+  const current=Math.max(0,swipe.rendered||0),destination=commit?swipe.width:0,remaining=Math.abs(destination-current),duration=window.NoemaGestures.settleDuration(remaining,velocity),shell=swipe.shell;
+  shell.style.setProperty('--edge-swipe-duration',duration+'ms');shell.classList.remove('edge-swipe-active');shell.classList.add('edge-swipe-settling');shell.style.setProperty('--edge-swipe-x',destination+'px');
+  let settled=false;const complete=()=>{if(settled)return;settled=true;clearTimeout(edgeSwipeTimer);shell.removeEventListener('transitionend',onEnd);if(!commit){clearEdgeSwipe(shell);edgeSwipeFinishing=false;return}shell.classList.remove('edge-swipe-settling');shell.classList.add('edge-swipe-reset');window.NoemaBack?.();requestAnimationFrame(()=>{clearEdgeSwipe(shell);edgeSwipeFinishing=false})};
   const onEnd=event=>{if(event.target===shell&&event.propertyName==='transform')complete()};shell.addEventListener('transitionend',onEnd);edgeSwipeTimer=setTimeout(complete,duration+80)
  }
  function cancelEdgeSwipe(){if(edgeSwipe?.axis==='x')finishEdgeSwipe(false,edgeSwipe.velocity);else if(edgeSwipeFrame){cancelAnimationFrame(edgeSwipeFrame);edgeSwipeFrame=0}edgeSwipe=null}
  function beginEdgeSwipe(id,x,y,target,source){
-  if(edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone()||blocksEdgeSwipe(target))return false;
-  edgeSwipe={x,y,id,source,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:performance.now(),startedAt:performance.now(),velocity:0,rendered:0};return true
+  const shell=document.querySelector('#shell'),width=window.visualViewport?.width||innerWidth;
+  if(!shell||edgeSwipe||edgeSwipeFinishing||document.body.classList.contains('sorting')||!canSwipeBack()||x>edgeSwipeStartZone()||blocksEdgeSwipe(target))return false;
+  const now=performance.now();edgeSwipe={x,y,id,source,shell,width,axis:null,captured:false,dx:0,dy:0,lastX:x,lastAt:now,startedAt:now,velocity:0,rendered:0};return true
  }
  function moveEdgeSwipe(id,x,y,event){
-  if(!edgeSwipe||id!==edgeSwipe.id)return false;
-  if(hasTextSelection(event.target)){edgeSwipe=null;return false}
-  const now=performance.now(),instant=(x-edgeSwipe.lastX)/Math.max(1,now-edgeSwipe.lastAt);edgeSwipe.dx=x-edgeSwipe.x;edgeSwipe.dy=y-edgeSwipe.y;edgeSwipe.velocity=edgeSwipe.velocity*.68+instant*.32;edgeSwipe.lastX=x;edgeSwipe.lastAt=now;
-  if(!edgeSwipe.axis){const intent=window.NoemaGestures.classify(edgeSwipe.dx,edgeSwipe.dy);if(intent==='horizontal')edgeSwipe.axis=edgeSwipe.dx>0?'x':'cancel';else if(intent==='vertical')edgeSwipe.axis='cancel'}
-  if(edgeSwipe.axis==='cancel'||edgeSwipe.dx<0){cancelEdgeSwipe();return false}
-  if(edgeSwipe.axis==='x'){event.preventDefault();scheduleEdgeSwipe();return true}return false
+  const swipe=edgeSwipe;if(!swipe||id!==swipe.id)return false;
+  if(hasTextSelection()){cancelEdgeSwipe();return false}
+  const now=performance.now(),instant=(x-swipe.lastX)/Math.max(1,now-swipe.lastAt);swipe.dx=x-swipe.x;swipe.dy=y-swipe.y;swipe.velocity=swipe.velocity*.7+instant*.3;swipe.lastX=x;swipe.lastAt=now;
+  if(!swipe.axis){const intent=window.NoemaGestures.classify(swipe.dx,swipe.dy);if(intent==='horizontal')swipe.axis=swipe.dx>0?'x':'cancel';else if(intent==='vertical')swipe.axis='cancel'}
+  if(swipe.axis==='cancel'||swipe.dx<0){cancelEdgeSwipe();return false}
+  if(swipe.axis==='x'){event.preventDefault();scheduleEdgeSwipe();return true}return false
  }
  function endEdgeSwipe(id){
-  if(!edgeSwipe||id!==edgeSwipe.id)return false;
-  const {dx,axis,velocity,startedAt}=edgeSwipe;
-  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=window.NoemaGestures.shouldCommit(dx,innerWidth,releaseVelocity);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
+  const swipe=edgeSwipe;if(!swipe||id!==swipe.id)return false;
+  const {dx,axis,velocity,startedAt,width}=swipe;
+  if(axis!=='x'){edgeSwipe=null;return false}const averageVelocity=dx/Math.max(1,performance.now()-startedAt),releaseVelocity=Math.max(velocity,averageVelocity*.7),commit=window.NoemaGestures.shouldCommit(dx,width,releaseVelocity);if(commit)tg?.HapticFeedback?.impactOccurred('light');finishEdgeSwipe(commit,releaseVelocity);edgeSwipe=null;return commit
  }
- document.addEventListener('pointerdown',e=>{
-  if(e.pointerType==='mouse'||e.isPrimary===false)return;ignoreTouchUntil=performance.now()+350;beginEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e.target,'pointer');
- },{passive:true,capture:true});
- document.addEventListener('pointermove',e=>{
-  if(moveEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e)&&edgeSwipe&&!edgeSwipe.captured){e.target.setPointerCapture?.(e.pointerId);edgeSwipe.captured=true}
- },{passive:false,capture:true});
- document.addEventListener('pointerup',e=>endEdgeSwipe(`pointer:${e.pointerId}`),{passive:true,capture:true});
- document.addEventListener('pointercancel',e=>{if(edgeSwipe?.id!==`pointer:${e.pointerId}`)return;if(edgeSwipe.axis==='x')endEdgeSwipe(edgeSwipe.id);else cancelEdgeSwipe()},{passive:true,capture:true});
- document.addEventListener('touchstart',e=>{if(edgeSwipe||performance.now()<ignoreTouchUntil||e.touches.length!==1)return;const touch=e.touches[0];beginEdgeSwipe(`touch:${touch.identifier}`,touch.clientX,touch.clientY,e.target,'touch')},{passive:true,capture:true});
- document.addEventListener('touchmove',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.touches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)moveEdgeSwipe(edgeSwipe.id,touch.clientX,touch.clientY,e)},{passive:false,capture:true});
- document.addEventListener('touchend',e=>{if(edgeSwipe?.source!=='touch')return;const touch=[...e.changedTouches].find(item=>`touch:${item.identifier}`===edgeSwipe.id);if(touch)endEdgeSwipe(edgeSwipe.id)},{passive:true,capture:true});
- document.addEventListener('touchcancel',e=>{if(edgeSwipe?.source==='touch')cancelEdgeSwipe()},{passive:true,capture:true});
+ function cancelInputSwipe(id){if(edgeSwipe?.id!==id)return;if(edgeSwipe.axis==='x')finishEdgeSwipe(false,0);edgeSwipe=null}
+ if(pointerInput){
+  document.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'||e.isPrimary===false)return;beginEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e.target,'pointer')},{passive:true,capture:true});
+  document.addEventListener('pointermove',e=>{if(moveEdgeSwipe(`pointer:${e.pointerId}`,e.clientX,e.clientY,e)&&edgeSwipe&&!edgeSwipe.captured){try{e.target.setPointerCapture?.(e.pointerId)}catch{}edgeSwipe.captured=true}},{passive:false,capture:true});
+  document.addEventListener('pointerup',e=>endEdgeSwipe(`pointer:${e.pointerId}`),{passive:true,capture:true});
+  document.addEventListener('pointercancel',e=>cancelInputSwipe(`pointer:${e.pointerId}`),{passive:true,capture:true});
+ }else{
+  document.addEventListener('touchstart',e=>{if(edgeSwipe||e.touches.length!==1)return;const touch=e.touches[0];beginEdgeSwipe(`touch:${touch.identifier}`,touch.clientX,touch.clientY,e.target,'touch')},{passive:true,capture:true});
+  document.addEventListener('touchmove',e=>{if(e.touches.length!==1){cancelEdgeSwipe();return}const touch=[...e.touches].find(item=>`touch:${item.identifier}`===edgeSwipe?.id);if(touch)moveEdgeSwipe(edgeSwipe.id,touch.clientX,touch.clientY,e)},{passive:false,capture:true});
+  document.addEventListener('touchend',e=>{const touch=[...e.changedTouches].find(item=>`touch:${item.identifier}`===edgeSwipe?.id);if(touch)endEdgeSwipe(edgeSwipe.id)},{passive:true,capture:true});
+  document.addEventListener('touchcancel',()=>cancelEdgeSwipe(),{passive:true,capture:true});
+ }
 
 })();

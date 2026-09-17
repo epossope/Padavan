@@ -204,7 +204,7 @@ header h1{margin:0;color:rgba(248,248,246,.92);text-transform:none}
 .chat-screen .bubble.user{max-width:80%;padding:9px 12px;background:rgba(255,255,255,.075)}
 .chat-screen .chat-latest{position:absolute;z-index:4;right:12px;bottom:82px;width:34px;height:34px;min-height:34px;padding:0;border:1px solid rgba(244,244,242,.24);border-radius:50%;background:rgba(20,20,20,.88);box-shadow:0 8px 24px rgba(0,0,0,.35);font-size:20px;line-height:1;color:var(--ink)}
 .chat-screen .chat-latest[hidden]{display:none}
-#shell.edge-swipe-active,#shell.edge-swipe-settling{will-change:transform;transform:translate3d(var(--edge-swipe-x,0),0,0);backface-visibility:hidden;box-shadow:-12px 0 24px rgba(0,0,0,calc(.30 * (1 - var(--edge-swipe-progress,0))))}
+#shell.edge-swipe-active,#shell.edge-swipe-settling{will-change:transform;transform:translate3d(var(--edge-swipe-x,0),0,0);backface-visibility:hidden;box-shadow:-12px 0 24px rgba(0,0,0,.30)}
 #shell.edge-swipe-active,#shell.edge-swipe-reset{transition:none!important}
 #shell.edge-swipe-settling{transition:transform var(--edge-swipe-duration,220ms) cubic-bezier(.22,.61,.36,1),box-shadow var(--edge-swipe-duration,220ms) ease-out}
 @media(prefers-reduced-motion:reduce){#shell.edge-swipe-settling{transition-duration:1ms}}
@@ -1222,6 +1222,7 @@ dialog[tabindex="-1"]:focus{outline:none}
   #dock .keyboard-button{transform:translateY(34px)}
 }
 
-/* One dock position on every screen; never lift it above an open keyboard. */
-#dock{bottom:calc(var(--keyboard-inset,0px) - 18px)}
+/* One dock position on every screen. A software keyboard hides it instead of
+   lifting the cloud/sphere controls into the typing area. */
+#dock{bottom:-18px}
 html.keyboard-visible #dock{visibility:hidden;opacity:0;pointer-events:none}
