@@ -76,6 +76,7 @@ from model_router import ModelRouter
 from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from diagnostics import DiagnosticsJournal
+from entity_resolver import EntityResolver, normalize_person_identity, plausible_person_name
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
                                SentenceChunker, SpeechTextPolicy, SpeechTextStream,
                                artifact_request_instruction, enforce_artifact_request,
@@ -501,7 +502,8 @@ TOOLS = [
 
             "projects":{"type":"string"},"notes":{"type":"string"},
             "groups":{"type":"array","items":{"type":"string"}},
-            "tags":{"type":"array","items":{"type":"string"}}
+            "tags":{"type":"array","items":{"type":"string"}},
+            "aliases":{"type":"array","items":{"type":"string"}}
 
         },"required":["name"]}
 
@@ -1931,6 +1933,17 @@ def init_db():
 
         );
 
+        CREATE TABLE IF NOT EXISTS person_aliases(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(chat_id, person_id, normalized_alias),
+            FOREIGN KEY(person_id) REFERENCES people(id)
+        );
+
         CREATE TABLE IF NOT EXISTS interactions(
 
             id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,person_name TEXT,interaction TEXT,
@@ -2083,6 +2096,8 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_request_events_chat_created ON user_request_events(chat_id,created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_person ON person_media(chat_id,person_id,is_current)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_file ON person_media(chat_id,file_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_owner_normalized ON person_aliases(chat_id,normalized_alias)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_person ON person_aliases(person_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events(chat_id,starts_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_status ON events(chat_id,status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id,event_id)")
@@ -3145,16 +3160,59 @@ def classify_person_groups(relationship="", projects="", notes="", groups=None):
     return found or ["Другое"]
 
 
-def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes="",groups=None,tags=None,avatar_file_id=None):
+def person_alias_add(chat_id, person_id, alias):
+    alias = " ".join(str(alias or "").split())[:160]
+    normalized = normalize_person_identity(alias)
+    if not normalized or not plausible_person_name(alias):
+        return {"ok": False, "tool": "person_alias_add", "error": "invalid_alias"}
+    try:
+        person_id = int(person_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "person_alias_add", "error": "invalid_id"}
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "person_alias_add", "error": "person_not_found"}
+        c.execute("""INSERT OR IGNORE INTO person_aliases(chat_id,person_id,alias,normalized_alias,created_at)
+                     VALUES(?,?,?,?,?)""",
+                  (chat_id, person_id, alias, normalized, datetime.now(timezone.utc).isoformat()))
+    return {"ok": True, "tool": "person_alias_add", "person_id": person_id, "alias": alias}
+
+
+def person_alias_remove(chat_id, person_id, alias):
+    normalized = normalize_person_identity(alias)
+    try:
+        person_id = int(person_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "person_alias_remove", "error": "invalid_id"}
+    with conn() as c:
+        cur = c.execute("""DELETE FROM person_aliases WHERE chat_id=? AND person_id=? AND normalized_alias=?
+                           AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+                        (chat_id, person_id, normalized, person_id, chat_id))
+    return {"ok": True, "tool": "person_alias_remove", "removed": cur.rowcount}
+
+
+def person_entity_resolver():
+    return EntityResolver(conn, person_upsert)
+
+
+def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes="",groups=None,tags=None,avatar_file_id=None,aliases=None):
+
+    name = " ".join(str(name or "").split())[:160]
+    if not name:
+        return {"ok": False, "tool": "person_upsert", "error": "empty_name"}
 
     with conn() as c:
 
         # SQLite's built-in lower() is ASCII-oriented in common deployments.
         # Compare Unicode names in Python so Cyrillic case variants do not
         # create duplicate owner-scoped person profiles.
-        normalized_name = str(name or "").strip().casefold()
-        old = next((row for row in c.execute("SELECT * FROM people WHERE chat_id=?", (chat_id,)).fetchall()
-                    if str(row["name"] or "").strip().casefold() == normalized_name), None)
+        normalized_name = normalize_person_identity(name)
+        matches = [row for row in c.execute("SELECT * FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+                   if normalize_person_identity(row["name"]) == normalized_name]
+        if len(matches) > 1:
+            return {"ok": False, "tool": "person_upsert", "error": "ambiguous_identity"}
+        old = matches[0] if matches else None
 
         if old:
 
@@ -3191,6 +3249,7 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
              vals["avatar_file_id"],datetime.now(timezone.utc).isoformat(),old["id"]))
 
             pid=old["id"]
+            canonical_name = old["name"]
 
         else:
 
@@ -3203,8 +3262,11 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
              json.dumps(inferred_groups,ensure_ascii=False),json.dumps(_person_list(tags),ensure_ascii=False),datetime.now(timezone.utc).isoformat()))
 
             pid=cur.lastrowid
+            canonical_name = name
 
-    return {"ok":True,"tool":"person_upsert","id":pid,"name":name}
+    for alias in _person_list(aliases):
+        person_alias_add(chat_id, pid, alias)
+    return {"ok":True,"tool":"person_upsert","id":pid,"name":canonical_name}
 
 
 
@@ -3870,10 +3932,15 @@ def update_person(chat_id, person_id, name="", relationship="", birthday="", age
     except (TypeError, ValueError):
         return {"ok": False, "tool": "update_person", "error": "invalid_age"}
     with conn() as c:
-        existing = c.execute("SELECT age,home_city,current_location,groups_json,tags_json FROM people WHERE id=? AND chat_id=?",
+        existing = c.execute("SELECT id,age,home_city,current_location,groups_json,tags_json FROM people WHERE id=? AND chat_id=?",
                              (int(person_id), chat_id)).fetchone()
         if not existing:
             return {"ok": False, "tool": "update_person", "error": "not_found"}
+        normalized_name = normalize_person_identity(name)
+        duplicate = next((row for row in c.execute("SELECT id,name FROM people WHERE chat_id=? AND id<>?", (chat_id, int(person_id))).fetchall()
+                          if normalize_person_identity(row["name"]) == normalized_name), None)
+        if duplicate:
+            return {"ok": False, "tool": "update_person", "error": "duplicate_name"}
         normalized_groups = classify_person_groups(relationship, projects, notes, groups if groups is not None else existing["groups_json"])
         normalized_tags = _person_list(tags if tags is not None else existing["tags_json"])
         cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,groups_json=?,tags_json=?,updated_at=? WHERE id=? AND chat_id=?",
@@ -3911,6 +3978,7 @@ def delete_task(chat_id,task_id):
 def delete_person(chat_id,person_id):
 
     with conn() as c:
+        c.execute("DELETE FROM person_aliases WHERE chat_id=? AND person_id=?", (chat_id, person_id))
         c.execute("""DELETE FROM event_participants WHERE person_id=?
                      AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
                   (person_id, person_id, chat_id))
