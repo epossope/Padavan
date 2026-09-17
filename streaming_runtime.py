@@ -178,9 +178,19 @@ def assistant_reasoning_contract_violated(message: dict) -> bool:
 class ToolPackResolver:
     """Cheap conservative routing: no extra LLM request and no lost common actions."""
     RULES = {
-        "planning": ("задач", "напом", "план", "встреч", "календар"),
+        "planning": ("задач", "напом", "план", "встреч", "встрет", "увидеть", "созвон", "календар"),
         "finance": ("руб", "расход", "трат", "доход", "бюджет", "купил", "потрат", "баланс", "бензин", "операци"),
-        "people": ("контакт", "человек", "день рождения", "познаком", "созвон"),
+        # A meeting with a named person belongs to two independent internal
+        # domains: the person profile/interaction and the daily plan.  Keep
+        # the routing conservative: this only exposes tools; it never writes
+        # anything by itself.
+        "people": (
+            "контакт", "человек", "день рождения", "познаком",
+            "встреч", "встрет", "увидеть", "созвон",
+            "коллег", "друг", "подруг", "мама", "папа", "мать", "отец",
+            "брат", "сестр", "муж", "жен", "клиент", "партнер", "партнёр",
+            "начальник", "руководител", "однокласс", "однокурс", "работает со мной",
+        ),
         "notes": ("заметк", "записывал", "записала", "записано"),
         "web": ("интернет", "найди", "проверь", "погода", "новост", "сайт"),
         "files": ("файл", "фото", "скрин", "документ", "отправ", "таблиц", "html", "json",
