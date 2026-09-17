@@ -72,3 +72,19 @@ class PlanRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "invalid_transaction_amount"):
             self.validate(plan, request="failed-1")
         self.assertEqual([], bot.get_people(self.owner)["people"])
+
+    def test_reminder_without_time_and_top_level_model_id_fail_preflight(self):
+        plan = SemanticPlan("bad", "commit", entities=[EntityReference("person", "Иван", attributes={"person_id": 99})], actions=[ActionRequest("reminder", "create", fields={"title": "x"}, action_id="reminder")])
+        with self.assertRaisesRegex(PlanValidationError, "model_exact_id"):
+            self.validate(plan)
+        plan.entities = []
+        with self.assertRaisesRegex(PlanValidationError, "missing_time"):
+            self.validate(plan)
+        self.assertEqual([], bot.get_people(self.owner)["people"])
+
+    def test_execution_metric_is_safe(self):
+        metrics = []
+        executor = PlanExecutor(BotDomainServices(bot), bot.conn, metric_recorder=lambda name, value: metrics.append((name, value)))
+        plan = SemanticPlan("finance", "read", reads=[ReadRequest("finance", "summary", read_id="finance")])
+        executor.execute(self.validate(plan, request="metric"), timezone_name="Europe/Moscow")
+        self.assertEqual("plan_execution_ms", metrics[0][0])

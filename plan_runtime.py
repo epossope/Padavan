@@ -15,7 +15,7 @@ from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticP
 EXACT_ID_KEYS = frozenset({"id", "person_id", "event_id", "task_id", "reminder_id", "transaction_id", "note_id", "file_id", "project_id", "source_turn_id", "resolved_id"})
 WRITE_OPS = frozenset({"create", "upsert", "update", "delete", "cancel", "overwrite", "replace", "resolve_or_create"})
 DESTRUCTIVE = frozenset({"delete", "cancel", "overwrite", "replace", "update"})
-READ_OPERATIONS = {"person": {"resolve"}, "event": {"list", "search", "get"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
+READ_OPERATIONS = {"person": {"resolve"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
 WRITE_OPERATIONS = {"person": {"upsert", "resolve_or_create"}, "event": {"create", "update", "delete", "cancel"}, "reminder": {"create"}, "transaction": {"create"}, "note": {"create"}, "task": {"create"}}
 
 
@@ -99,7 +99,7 @@ def _time_fields(fields: dict[str, Any], zone_name: str, *, event: bool) -> dict
         try: datetime.fromisoformat(str(local_date))
         except ValueError: raise PlanValidationError("invalid_date") from None
         result["starts_at"] = str(local_date) + "T00:00:00"; result["all_day"] = True
-    elif event:
+    else:
         raise PlanValidationError("missing_time", "Укажи дату или время события.")
     return result
 
@@ -129,6 +129,7 @@ class PlanValidator:
             raise PlanValidationError("clarification_required", plan.clarification)
         if plan.disposition == "read" and plan.actions: raise PlanValidationError("disposition_content")
         if plan.disposition == "commit" and not plan.actions: raise PlanValidationError("commit_without_actions")
+        if any(_has_exact_id(reference.attributes) for reference in plan.entities): raise PlanValidationError("model_exact_id")
         namespace: set[str] = set(); reads: list[ValidatedRead] = []; actions: list[ValidatedAction] = []
         ref_cache: dict[str, EntityReference] = {}
 
@@ -151,7 +152,6 @@ class PlanValidator:
             if _has_exact_id(item.filters): raise PlanValidationError("model_exact_id")
             if item.domain not in READ_OPERATIONS or item.operation not in READ_OPERATIONS[item.domain]: raise PlanValidationError("unsupported_read")
             if any(_has_exact_id(ref.attributes) for ref in item.entity_refs): raise PlanValidationError("model_exact_id")
-            if item.domain == "event" and item.operation == "get": raise PlanValidationError("event_get_requires_trusted_target")
             namespace.add(item.read_id)
             reads.append(ValidatedRead(item.read_id, item.domain, item.operation, dict(item.filters), [resolve(r, False) for r in item.entity_refs]))
         for index, item in enumerate(plan.actions):
@@ -224,18 +224,20 @@ class BotDomainServices:
             targets = [x for result in dependency_results.values() if result.get("domain") == "event" for x in result.get("result", {}).get("events", [])]
             if len(targets) != 1: raise PlanValidationError("ambiguous_target" if targets else "target_not_found")
             event_id = targets[0]["id"]
-            return self.bot.event_delete(owner, event_id) if item.operation == "delete" else self.bot.event_update(owner, event_id, status="cancelled" if item.operation == "cancel" else fields.get("status", "scheduled"))
+            result = self.bot.event_delete(owner, event_id) if item.operation == "delete" else self.bot.event_update(owner, event_id, status="cancelled" if item.operation == "cancel" else fields.get("status", "scheduled"))
+            result["_semantic_target_id"] = event_id
+            return result
         raise PlanValidationError("unsupported_action")
 
 
 class PlanExecutor:
-    def __init__(self, services: BotDomainServices, connection_factory: Callable[[], Any], *, observer: Callable[..., Any] | None = None): self.services, self.connection_factory, self.observer = services, connection_factory, observer
+    def __init__(self, services: BotDomainServices, connection_factory: Callable[[], Any], *, observer: Callable[..., Any] | None = None, metric_recorder=None): self.services, self.connection_factory, self.observer, self.metric_recorder = services, connection_factory, observer, metric_recorder
     def _emit(self, event: str, **fields: Any) -> None:
         try:
             if self.observer: self.observer(event, **fields)
         except Exception: pass
     def execute(self, plan: ValidatedPlan, *, timezone_name: str) -> ExecutionResult:
-        fingerprint = hashlib.sha256(repr(plan).encode()).hexdigest(); now = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter(); fingerprint = hashlib.sha256(repr(plan).encode()).hexdigest(); now = datetime.now(timezone.utc).isoformat()
         with self.connection_factory() as c:
             c.execute("BEGIN IMMEDIATE")
             prior = c.execute("SELECT plan_fingerprint,status,result_json FROM semantic_executions WHERE chat_id=? AND request_id=?", (plan.owner, plan.request_id)).fetchone()
@@ -253,12 +255,13 @@ class PlanExecutor:
             for item in plan.reads:
                 value = self.services.read(plan.owner, item); deps[item.read_id] = {"domain": item.domain, "operation": item.operation, "result": value}; result.reads.append(ExecutionStep(item.read_id, "read", "EXECUTED", value))
             for item in plan.actions:
-                value = self.services.write(plan.owner, item, deps, timezone_name); deps[item.action_id] = {"domain": item.domain, "operation": item.operation, "result": value}
+                value = self.services.write(plan.owner, item, deps, timezone_name); trusted_target_id = value.pop("_semantic_target_id", None); deps[item.action_id] = {"domain": item.domain, "operation": item.operation, "result": value}
                 if not value.get("ok"): raise PlanValidationError("domain_failure")
                 result.actions.append(ExecutionStep(item.action_id, "action", "EXECUTED", value)); self._emit("semantic_execution_step", operation=item.operation)
-                if value.get("id") is not None:
+                affected_id = trusted_target_id if item.operation in {"delete", "update", "cancel"} else value.get("id")
+                if affected_id is not None:
                     target = result.deleted_entities if item.operation == "delete" else result.updated_entities if item.operation in {"update", "cancel"} else result.created_entities
-                    target.append({"domain": item.domain, "id": value["id"]})
+                    target.append({"domain": item.domain, "id": affected_id})
             with self.connection_factory() as c: c.execute("UPDATE semantic_executions SET status=?,result_json=?,completed_at=? WHERE chat_id=? AND request_id=?", ("EXECUTED", json.dumps(result.to_dict()), datetime.now(timezone.utc).isoformat(), plan.owner, plan.request_id))
             self._emit("semantic_execution_completed"); return result
         except Exception as exc:
@@ -267,3 +270,7 @@ class PlanExecutor:
             with self.connection_factory() as c:
                 c.execute("UPDATE semantic_executions SET status=?,result_json=?,completed_at=? WHERE chat_id=? AND request_id=?", ("FAILED", json.dumps(result.to_dict()), datetime.now(timezone.utc).isoformat(), plan.owner, plan.request_id))
             self._emit("semantic_execution_failed", failure_category=exc.category); return result
+        finally:
+            if self.metric_recorder:
+                try: self.metric_recorder("plan_execution_ms", (time.perf_counter() - started) * 1000)
+                except Exception: pass
