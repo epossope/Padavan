@@ -67,10 +67,8 @@ class PlanRuntimeTests(unittest.TestCase):
         self.assertEqual("EXECUTED", result.status)
         self.assertEqual(("дизайнер", "Казань"), (person["relationship"], person["home_city"]))
 
-    def test_failed_execution_is_journaled_and_not_replayed(self):
+    def test_invalid_second_action_is_rejected_before_any_write(self):
         plan = SemanticPlan("bad", "commit", actions=[ActionRequest("transaction", "create", fields={}, action_id="bad")])
-        validated = self.validate(plan, request="failed-1")
-        result = self.executor.execute(validated, timezone_name="Europe/Moscow")
-        self.assertEqual("FAILED", result.status)
-        self.assertEqual("REJECTED", self.executor.execute(validated, timezone_name="Europe/Moscow").status)
-        with bot.conn() as c: self.assertEqual("FAILED", c.execute("SELECT status FROM semantic_executions WHERE chat_id=? AND request_id=?", (self.owner, "failed-1")).fetchone()["status"])
+        with self.assertRaisesRegex(PlanValidationError, "invalid_transaction_amount"):
+            self.validate(plan, request="failed-1")
+        self.assertEqual([], bot.get_people(self.owner)["people"])

@@ -15,6 +15,8 @@ from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticP
 EXACT_ID_KEYS = frozenset({"id", "person_id", "event_id", "task_id", "reminder_id", "transaction_id", "note_id", "file_id", "project_id", "source_turn_id", "resolved_id"})
 WRITE_OPS = frozenset({"create", "upsert", "update", "delete", "cancel", "overwrite", "replace", "resolve_or_create"})
 DESTRUCTIVE = frozenset({"delete", "cancel", "overwrite", "replace", "update"})
+READ_OPERATIONS = {"person": {"resolve"}, "event": {"list", "search", "get"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
+WRITE_OPERATIONS = {"person": {"upsert", "resolve_or_create"}, "event": {"create", "update", "delete", "cancel"}, "reminder": {"create"}, "transaction": {"create"}, "note": {"create"}, "task": {"create"}}
 
 
 @dataclass(slots=True)
@@ -103,9 +105,24 @@ def _time_fields(fields: dict[str, Any], zone_name: str, *, event: bool) -> dict
 
 
 class PlanValidator:
-    def __init__(self, resolver: EntityResolver): self.resolver = resolver
+    def __init__(self, resolver: EntityResolver, *, observer=None, metric_recorder=None): self.resolver, self.observer, self.metric_recorder = resolver, observer, metric_recorder
+    def _emit(self, event, **fields):
+        try:
+            if self.observer: self.observer(event, **fields)
+        except Exception: pass
 
     def validate(self, trusted_owner: int, plan: SemanticPlan, *, conversation_context: dict | None, now: Any, timezone: str, request_id: str) -> ValidatedPlan:
+        started = time.perf_counter(); self._emit("semantic_plan_validation_started")
+        try:
+            return self._validate(trusted_owner, plan, conversation_context=conversation_context, now=now, timezone=timezone, request_id=request_id)
+        except PlanValidationError as exc:
+            self._emit("semantic_plan_rejected", failure_category=exc.category); raise
+        finally:
+            if self.metric_recorder:
+                try: self.metric_recorder("plan_validation_ms", (time.perf_counter() - started) * 1000)
+                except Exception: pass
+
+    def _validate(self, trusted_owner: int, plan: SemanticPlan, *, conversation_context: dict | None, now: Any, timezone: str, request_id: str) -> ValidatedPlan:
         if not request_id or not isinstance(request_id, str): raise PlanValidationError("invalid_request_id")
         if plan.disposition in {"answer", "clarify"}:
             if plan.reads or plan.actions: raise PlanValidationError("disposition_content")
@@ -132,6 +149,9 @@ class PlanValidator:
         for item in plan.reads:
             if not item.read_id or item.read_id in namespace: raise PlanValidationError("invalid_read_id")
             if _has_exact_id(item.filters): raise PlanValidationError("model_exact_id")
+            if item.domain not in READ_OPERATIONS or item.operation not in READ_OPERATIONS[item.domain]: raise PlanValidationError("unsupported_read")
+            if any(_has_exact_id(ref.attributes) for ref in item.entity_refs): raise PlanValidationError("model_exact_id")
+            if item.domain == "event" and item.operation == "get": raise PlanValidationError("event_get_requires_trusted_target")
             namespace.add(item.read_id)
             reads.append(ValidatedRead(item.read_id, item.domain, item.operation, dict(item.filters), [resolve(r, False) for r in item.entity_refs]))
         for index, item in enumerate(plan.actions):
@@ -142,14 +162,22 @@ class PlanValidator:
             namespace.add(item.action_id)
             fields = dict(item.fields)
             if item.domain not in {"person", "event", "reminder", "transaction", "note", "task"}: raise PlanValidationError("unsupported_action")
+            if item.operation not in WRITE_OPERATIONS.get(item.domain, set()): raise PlanValidationError("unsupported_action")
             if item.domain == "person" and item.operation in {"upsert", "resolve_or_create"}:
                 allowed = {"name","relationship","birthday","age","home_city","current_location","projects","notes","aliases","groups","tags"}
                 if set(fields) - allowed: raise PlanValidationError("unsupported_person_field")
             refs = [resolve(r, r.mention.casefold().strip() in create_mentions) for r in item.entity_refs]
             if item.domain == "event" and item.operation == "create": fields = _time_fields(fields, timezone, event=True)
             if item.domain == "reminder" and item.operation == "create": fields = _time_fields(fields, timezone, event=False)
+            if item.domain == "event" and item.operation == "create" and (not str(fields.get("title") or "").strip() or fields.get("kind", "other") not in {"meeting", "call", "appointment", "lesson", "travel", "personal", "other"}): raise PlanValidationError("invalid_event_fields")
+            if item.domain == "transaction" and item.operation == "create":
+                try: amount = float(fields.get("amount"))
+                except (TypeError, ValueError): raise PlanValidationError("invalid_transaction_amount")
+                if amount <= 0 or not str(fields.get("currency", "RUB")).isalpha() or len(str(fields.get("currency", "RUB"))) not in {3}: raise PlanValidationError("invalid_transaction_amount")
+            if item.domain in {"note", "task"} and item.operation == "create" and not str(fields.get("text") or "").strip(): raise PlanValidationError("missing_text")
+            if item.domain == "reminder" and item.operation == "create" and not str(fields.get("title", fields.get("text", "")) or "").strip(): raise PlanValidationError("missing_reminder_text")
             actions.append(ValidatedAction(item.action_id, item.domain, item.operation, fields, refs, list(item.depends_on)))
-        return ValidatedPlan(int(trusted_owner), request_id, plan.intent, reads, actions)
+        result = ValidatedPlan(int(trusted_owner), request_id, plan.intent, reads, actions); self._emit("semantic_plan_validated", read_count=len(reads), action_count=len(actions)); return result
 
 
 class BotDomainServices:
@@ -158,7 +186,8 @@ class BotDomainServices:
     def read(self, owner: int, item: ValidatedRead) -> dict[str, Any]:
         person = next((r.resolved_id for r in item.entity_refs if r.type == "person"), None)
         if item.domain == "person" and item.operation == "resolve": return {"ok": True, "person_id": person}
-        if item.domain == "event": return getattr(self.bot, f"event_{item.operation}")(owner, person_id=person, **item.filters)
+        if item.domain == "event" and item.operation == "list": return self.bot.event_list(owner, person_id=person, **item.filters)
+        if item.domain == "event" and item.operation == "search": return self.bot.event_search(owner, person_id=person, **item.filters)
         if item.domain == "finance": return self.bot.finance_summary(owner, **item.filters)
         if item.domain == "transaction": return self.bot.finance_list_transactions(owner, **item.filters)
         if item.domain == "task": return self.bot.task_list(owner, **item.filters)
@@ -208,6 +237,7 @@ class PlanExecutor:
     def execute(self, plan: ValidatedPlan, *, timezone_name: str) -> ExecutionResult:
         fingerprint = hashlib.sha256(repr(plan).encode()).hexdigest(); now = datetime.now(timezone.utc).isoformat()
         with self.connection_factory() as c:
+            c.execute("BEGIN IMMEDIATE")
             prior = c.execute("SELECT plan_fingerprint,status,result_json FROM semantic_executions WHERE chat_id=? AND request_id=?", (plan.owner, plan.request_id)).fetchone()
             if prior and prior["plan_fingerprint"] != fingerprint:
                 return ExecutionResult("REJECTED", plan.request_id, failure_category="idempotency_conflict")
@@ -215,7 +245,9 @@ class PlanExecutor:
                 result = ExecutionResult(**json.loads(prior["result_json"])); result.status = "REPLAYED"; self._emit("semantic_execution_replayed"); return result
             if prior:
                 return ExecutionResult("REJECTED", plan.request_id, failure_category="request_not_replayable")
-            c.execute("INSERT OR IGNORE INTO semantic_executions(chat_id,request_id,plan_fingerprint,status,result_json,created_at) VALUES(?,?,?,?,?,?)", (plan.owner, plan.request_id, fingerprint, "RUNNING", "", now))
+            claimed = c.execute("INSERT OR IGNORE INTO semantic_executions(chat_id,request_id,plan_fingerprint,status,result_json,created_at) VALUES(?,?,?,?,?,?)", (plan.owner, plan.request_id, fingerprint, "RUNNING", "", now))
+            if claimed.rowcount != 1:
+                return ExecutionResult("REJECTED", plan.request_id, failure_category="request_running")
         self._emit("semantic_execution_started"); result = ExecutionResult("EXECUTED", plan.request_id); deps: dict[str, dict[str, Any]] = {}
         try:
             for item in plan.reads:
