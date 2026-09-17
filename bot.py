@@ -1931,7 +1931,7 @@ def init_db():
             updated_at TEXT NOT NULL DEFAULT ''
         );
 
-        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0,
+        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,event_id INTEGER,sent INTEGER DEFAULT 0,
             acknowledged INTEGER NOT NULL DEFAULT 0, followup_count INTEGER NOT NULL DEFAULT 0,
             next_followup_at TEXT NOT NULL DEFAULT '', last_sent_message_id INTEGER);
 
@@ -2107,6 +2107,7 @@ def init_db():
             ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
+            ("reminders","event_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
             ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
             ("app_settings","updated_by","INTEGER"),
@@ -2127,6 +2128,11 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events(chat_id,starts_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_status ON events(chat_id,status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id,event_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS semantic_executions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,request_id TEXT NOT NULL,
+            plan_fingerprint TEXT NOT NULL,status TEXT NOT NULL,result_json TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,completed_at TEXT NOT NULL DEFAULT '',UNIQUE(chat_id,request_id))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_semantic_executions_owner_request ON semantic_executions(chat_id,request_id)")
         _migrate_legacy_interaction_person_ids(c)
 
     KnowledgeStore(DB).init_schema()

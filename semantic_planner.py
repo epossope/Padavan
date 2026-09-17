@@ -111,7 +111,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
             "required": ["domain", "operation"],
             "properties": {
-                "domain": {"enum": sorted(DOMAIN_OPERATIONS)},
+                "domain": {"enum": sorted(DOMAIN_OPERATIONS)}, "read_id": {"type": "string"},
                 "operation": {"type": "string"},
                 "filters": {"type": "object"},
                 "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
@@ -241,7 +241,7 @@ def _validate_domain_operation(domain_value: Any, operation_value: Any, *, read:
 def _read(value: Any) -> ReadRequest:
     data = _object(
         value,
-        allowed={"domain", "operation", "filters", "entity_refs"},
+        allowed={"domain", "operation", "read_id", "filters", "entity_refs"},
         required={"domain", "operation"},
         label="read",
     )
@@ -252,6 +252,7 @@ def _read(value: Any) -> ReadRequest:
     return ReadRequest(
         domain=domain,
         operation=operation,
+        read_id=_string(data.get("read_id", ""), label="read_id", allow_empty=True),
         filters=filters,
         entity_refs=_entity_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS),
     )

@@ -29,6 +29,7 @@ class EntityReference:
 class ReadRequest:
     domain: str
     operation: str
+    read_id: str = ""
     filters: dict[str, Any] = field(default_factory=dict)
     entity_refs: list[EntityReference] = field(default_factory=list)
 
