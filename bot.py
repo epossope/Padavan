@@ -3066,7 +3066,12 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
 
     with conn() as c:
 
-        old=c.execute("SELECT * FROM people WHERE chat_id=? AND lower(name)=lower(?)",(chat_id,name)).fetchone()
+        # SQLite's built-in lower() is ASCII-oriented in common deployments.
+        # Compare Unicode names in Python so Cyrillic case variants do not
+        # create duplicate owner-scoped person profiles.
+        normalized_name = str(name or "").strip().casefold()
+        old = next((row for row in c.execute("SELECT * FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+                    if str(row["name"] or "").strip().casefold() == normalized_name), None)
 
         if old:
 
@@ -4220,9 +4225,9 @@ def system_prompt(chat_id):
 
         "Людей сохраняй структурированно через person_upsert: отношение, возраст, ДР, город, текущее место, проекты, заметки. "
 
-        "Если в одном сообщении человек + созвон/задача/напоминание — вызови несколько tools. "
+        "Если пользователь явно создаёт встречу или созвон с названным человеком, веди это только во внутренних системах Noema: сначала person_upsert, затем person_interaction. При точном времени или явном ожидании уведомления также вызови set_reminder; если есть только дата — add_task с due_date. Не сохраняй такую встречу только как interaction и не сохраняй её только как задачу или напоминание. "
 
-        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, reminder_list для существующих напоминаний, task_list для задач, get_people для контактов, note_list для заметок и get_files для сохранённых файлов. Если exact tool вернул 0 строк, не выдумывай запись из памяти или истории. Calendar integration отсутствует: не притворяйся, что существуют точные calendar events. "
+        "Для точного состояния всегда используй соответствующую систему, а не историю: finance_summary/finance_list_transactions для финансов, reminder_list для существующих напоминаний, task_list для задач, get_people для контактов, note_list для заметок и get_files для сохранённых файлов. Если exact tool вернул 0 строк, не выдумывай запись из памяти или истории. Внешней Calendar integration не существует: не притворяйся, что создаются точные external calendar events. Внутренний контракт встречи с человеком: профиль человека + interaction + task/reminder в плане дня. "
 
         "Личные заметки принадлежат пользователю. Не сохраняй в них внутренние правила поведения бота, стиль общения или служебные напоминания. Когда пользователь явно задаёт такое правило, сохраняй его через save_behavior_rule: оно отображается отдельно в настройках «Правила». "
 
