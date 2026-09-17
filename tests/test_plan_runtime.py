@@ -55,3 +55,22 @@ class PlanRuntimeTests(unittest.TestCase):
         plan = SemanticPlan("finance", "read", reads=[ReadRequest("finance", "summary", read_id="finance")])
         result = self.executor.execute(self.validate(plan), timezone_name="Europe/Moscow")
         self.assertEqual("EXECUTED", result.status); self.assertEqual(1, len(result.reads)); self.assertFalse(result.actions)
+
+    def test_new_person_validation_is_pure_and_fields_persist_on_execution(self):
+        plan = SemanticPlan("person", "commit", actions=[ActionRequest(
+            "person", "upsert", fields={"name": "Артём", "relationship": "дизайнер", "home_city": "Казань"},
+            entity_refs=[EntityReference("person", "Артём")], action_id="person")])
+        validated = self.validate(plan)
+        self.assertEqual([], bot.get_people(self.owner)["people"])
+        result = self.executor.execute(validated, timezone_name="Europe/Moscow")
+        person = bot.get_people(self.owner)["people"][0]
+        self.assertEqual("EXECUTED", result.status)
+        self.assertEqual(("дизайнер", "Казань"), (person["relationship"], person["home_city"]))
+
+    def test_failed_execution_is_journaled_and_not_replayed(self):
+        plan = SemanticPlan("bad", "commit", actions=[ActionRequest("transaction", "create", fields={}, action_id="bad")])
+        validated = self.validate(plan, request="failed-1")
+        result = self.executor.execute(validated, timezone_name="Europe/Moscow")
+        self.assertEqual("FAILED", result.status)
+        self.assertEqual("REJECTED", self.executor.execute(validated, timezone_name="Europe/Moscow").status)
+        with bot.conn() as c: self.assertEqual("FAILED", c.execute("SELECT status FROM semantic_executions WHERE chat_id=? AND request_id=?", (self.owner, "failed-1")).fetchone()["status"])
