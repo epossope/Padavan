@@ -91,7 +91,7 @@ load_dotenv(BASE / ".env")
 
 
 
-BUILD_ID = "0.4-device-fix"
+BUILD_ID = "1.0.0-rc1"
 
 TG = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 QUICK_ACTIONS_BASE_URL = (os.getenv("QUICK_ACTIONS_BASE_URL") or "").strip().rstrip("/")
