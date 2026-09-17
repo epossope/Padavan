@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,13 +13,21 @@ class ReminderOwnershipTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_patch = patch.object(bot, "DB", Path(self.temp.name) / "noema.db")
         self.db_patch.start()
+        self.fixed_now = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return self.fixed_now.astimezone(tz) if tz else self.fixed_now.replace(tzinfo=None)
+        self.clock_patch = patch.object(bot, "datetime", FrozenDateTime)
+        self.clock_patch.start()
         bot.init_db()
         bot.set_user_timezone(101, "Europe/Moscow")
         bot.set_user_timezone(202, "Asia/Vladivostok")
-        self.a = bot.save_reminder(101, "Позвонить Саше завтра", (datetime.now(bot.timezone_for(101)) + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat())
-        self.b = bot.save_reminder(202, "Купить корм сегодня", (datetime.now(bot.timezone_for(202)) + timedelta(hours=1)).isoformat())
+        self.a = bot.save_reminder(101, "Позвонить Саше завтра", (self.fixed_now.astimezone(bot.timezone_for(101)) + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat())
+        self.b = bot.save_reminder(202, "Купить корм сегодня", (self.fixed_now.astimezone(bot.timezone_for(202)) + timedelta(hours=1)).isoformat())
 
     def tearDown(self):
+        self.clock_patch.stop()
         self.db_patch.stop()
         self.temp.cleanup()
 
@@ -55,4 +63,3 @@ class ReminderOwnershipTests(unittest.TestCase):
             self.assertEqual("reminder_list", choice["function"]["name"])
             names = {tool["function"]["name"] for tool in router.resolve(bot.TOOLS, text)}
             self.assertIn("reminder_list", names)
-
