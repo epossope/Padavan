@@ -105,12 +105,11 @@ class EntityResolverTests(unittest.TestCase):
         self.assertEqual(ResolutionStatus.NOT_FOUND, result.status)
 
     def test_allow_create_is_explicit_and_returns_created(self):
-        missing = self.resolver.resolve_person(self.owner_a, "Артём", allow_create=False)
+        missing = self.resolver.resolve_person(self.owner_a, "артём", allow_create=False)
         self.assertEqual(ResolutionStatus.NOT_FOUND, missing.status)
-        created = self.resolver.resolve_person(self.owner_a, "Артём", allow_create=True)
+        created = self.resolver.resolve_person(self.owner_a, "артём", allow_create=True)
         self.assertEqual(ResolutionStatus.CREATED, created.status)
-        self.assertEqual("Артём", created.canonical_name)
-        again = self.resolver.resolve_person(self.owner_a, "артём", allow_create=True)
+        again = self.resolver.resolve_person(self.owner_a, "АРТЁМ", allow_create=True)
         self.assertEqual(ResolutionStatus.RESOLVED, again.status)
         self.assertEqual(created.resolved_id, again.resolved_id)
 

@@ -76,7 +76,8 @@ from model_router import ModelRouter
 from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from diagnostics import DiagnosticsJournal
-from entity_resolver import EntityResolver, normalize_person_identity, plausible_person_name
+from entity_resolver import (EntityResolver, ResolutionStatus,
+                             normalize_person_identity, plausible_person_name)
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
                                SentenceChunker, SpeechTextPolicy, SpeechTextStream,
                                artifact_request_instruction, enforce_artifact_request,
@@ -517,11 +518,11 @@ TOOLS = [
 
         "parameters":{"type":"object","properties":{
 
-            "name":{"type":"string"},"interaction":{"type":"string"},
+            "name":{"type":"string"},"person_id":{"type":"integer"},"interaction":{"type":"string"},
 
             "interaction_date":{"type":"string"},"interaction_type":{"type":"string"}
 
-        },"required":["name","interaction"]}
+        },"required":["interaction"]}
 
     }},
 
@@ -1872,6 +1873,27 @@ def ensure_column(c, table, column, sql_type):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
+def _migrate_legacy_interaction_person_ids(c):
+    """Backfill only unambiguous canonical owner/name matches; safe to rerun."""
+    people_by_owner = {}
+    for row in c.execute("SELECT id,chat_id,name FROM people ORDER BY id").fetchall():
+        owner = people_by_owner.setdefault(row["chat_id"], {})
+        owner.setdefault(normalize_person_identity(row["name"]), []).append(row["id"])
+    for row in c.execute(
+        """SELECT id,chat_id,person_name FROM interactions
+           WHERE person_id IS NULL AND identity_detached=0 ORDER BY id"""
+    ).fetchall():
+        normalized_name = normalize_person_identity(row["person_name"])
+        if not normalized_name:
+            continue
+        candidates = people_by_owner.get(row["chat_id"], {}).get(normalized_name, [])
+        if len(candidates) == 1:
+            c.execute(
+                "UPDATE interactions SET person_id=? WHERE id=? AND chat_id=? AND person_id IS NULL",
+                (candidates[0], row["id"], row["chat_id"]),
+            )
+
+
 
 def init_db():
 
@@ -1946,7 +1968,8 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS interactions(
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,person_name TEXT,interaction TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,person_id INTEGER,
+            identity_detached INTEGER NOT NULL DEFAULT 0,person_name TEXT,interaction TEXT,
 
             interaction_date TEXT,interaction_type TEXT,created_at TEXT
 
@@ -2079,6 +2102,8 @@ def init_db():
             ("people","groups_json","TEXT NOT NULL DEFAULT '[]'"),("people","tags_json","TEXT NOT NULL DEFAULT '[]'"),
             ("files","description","TEXT NOT NULL DEFAULT ''"),
             ("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
+            ("interactions","person_id","INTEGER"),
+            ("interactions","identity_detached","INTEGER NOT NULL DEFAULT 0"),
             ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
@@ -2098,9 +2123,11 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_file ON person_media(chat_id,file_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_owner_normalized ON person_aliases(chat_id,normalized_alias)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_person ON person_aliases(person_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_interactions_owner_person_date ON interactions(chat_id,person_id,interaction_date)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events(chat_id,starts_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_status ON events(chat_id,status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id,event_id)")
+        _migrate_legacy_interaction_person_ids(c)
 
     KnowledgeStore(DB).init_schema()
 
@@ -3270,21 +3297,46 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
 
 
 
-def person_interaction(chat_id,name,interaction,interaction_date="",interaction_type="other"):
-
+def person_interaction(chat_id, name="", interaction="", interaction_date="",
+                       interaction_type="other", person_id=None):
+    interaction = str(interaction or "").strip()[:4000]
+    if not interaction:
+        return {"ok": False, "tool": "person_interaction", "error": "empty_interaction"}
     if not interaction_date:
+        interaction_date = datetime.now(TZ).date().isoformat()
 
-        interaction_date=datetime.now(TZ).date().isoformat()
-
-    person_upsert(chat_id,name)
+    if person_id is not None:
+        try:
+            person_id = int(person_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "tool": "person_interaction", "error": "invalid_person_id"}
+        with conn() as c:
+            person = c.execute("SELECT id,name FROM people WHERE id=? AND chat_id=?",
+                               (person_id, chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "person_interaction", "error": "person_not_found"}
+        canonical_name = person["name"]
+    else:
+        if not str(name or "").strip():
+            return {"ok": False, "tool": "person_interaction", "error": "person_required"}
+        resolution = person_entity_resolver().resolve_person(chat_id, str(name), allow_create=True)
+        if resolution.status == ResolutionStatus.AMBIGUOUS:
+            return {"ok": False, "tool": "person_interaction", "error": "person_ambiguous",
+                    "candidates": [{"id": candidate.id, "name": candidate.name}
+                                   for candidate in resolution.candidates]}
+        if resolution.status not in {ResolutionStatus.RESOLVED, ResolutionStatus.CREATED}:
+            return {"ok": False, "tool": "person_interaction", "error": "person_not_found"}
+        person_id, canonical_name = resolution.resolved_id, resolution.canonical_name
 
     with conn() as c:
-
-        cur=c.execute("""INSERT INTO interactions(chat_id,person_name,interaction,interaction_date,interaction_type,created_at)
-
-        VALUES(?,?,?,?,?,?)""",(chat_id,name,interaction,interaction_date,interaction_type or "other",datetime.now(timezone.utc).isoformat()))
-
-    return {"ok":True,"tool":"person_interaction","id":cur.lastrowid,"name":name,"interaction":interaction}
+        cur = c.execute(
+            """INSERT INTO interactions(chat_id,person_id,person_name,interaction,interaction_date,interaction_type,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (chat_id, person_id, canonical_name, interaction, str(interaction_date)[:32],
+             str(interaction_type or "other")[:80], datetime.now(timezone.utc).isoformat()),
+        )
+    return {"ok": True, "tool": "person_interaction", "id": cur.lastrowid,
+            "person_id": person_id, "name": canonical_name, "interaction": interaction}
 
 
 
@@ -3846,6 +3898,11 @@ def get_people(chat_id,query=""):
 
     with conn() as c:
 
+        owner_people = c.execute("SELECT id,name FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+        normalized_people = {}
+        for person_row in owner_people:
+            normalized_people.setdefault(normalize_person_identity(person_row["name"]), []).append(person_row["id"])
+
         if query:
 
             p=f"%{query}%"
@@ -3868,11 +3925,23 @@ def get_people(chat_id,query=""):
             d["groups"] = classify_person_groups(d.get("relationship"), d.get("projects"), d.get("notes"), d.pop("groups_json", "[]"))
             d["tags"] = _person_list(d.pop("tags_json", "[]"))
 
-            ints=c.execute("""SELECT interaction,interaction_date,interaction_type FROM interactions
-
-            WHERE chat_id=? AND lower(person_name)=lower(?) ORDER BY id DESC LIMIT 8""",(chat_id,r["name"])).fetchall()
-
-            d["recent_interactions"]=[dict(x) for x in ints]
+            interaction_rows = c.execute(
+                """SELECT id,person_id,identity_detached,person_name,interaction,interaction_date,interaction_type
+                   FROM interactions WHERE chat_id=? AND (person_id=? OR person_id IS NULL)
+                   ORDER BY id DESC""", (chat_id, r["id"])
+            ).fetchall()
+            normalized_name = normalize_person_identity(r["name"])
+            safe_legacy_owner = normalized_people.get(normalized_name, []) == [r["id"]]
+            interactions = []
+            for item in interaction_rows:
+                if item["person_id"] == r["id"] or (
+                    item["person_id"] is None and not item["identity_detached"] and safe_legacy_owner and
+                    normalize_person_identity(item["person_name"]) == normalized_name
+                ):
+                    interactions.append(dict(item))
+                if len(interactions) >= 8:
+                    break
+            d["recent_interactions"] = interactions
 
             media_rows = c.execute("""SELECT pm.file_id,pm.relation_type,pm.is_current,
                 f.mime_type,f.created_at FROM person_media pm JOIN files f ON f.id=pm.file_id
@@ -3978,6 +4047,11 @@ def delete_task(chat_id,task_id):
 def delete_person(chat_id,person_id):
 
     with conn() as c:
+        # Preserve the historical interaction text/display snapshot while
+        # removing the live identity link, matching the pre-person_id product
+        # behavior where interactions outlived a deleted profile.
+        c.execute("UPDATE interactions SET person_id=NULL,identity_detached=1 WHERE chat_id=? AND person_id=?",
+                  (chat_id, person_id))
         c.execute("DELETE FROM person_aliases WHERE chat_id=? AND person_id=?", (chat_id, person_id))
         c.execute("""DELETE FROM event_participants WHERE person_id=?
                      AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",

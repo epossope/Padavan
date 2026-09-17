@@ -44,6 +44,10 @@ _WHITESPACE = re.compile(r"\s+")
 _CONTEXT_REFERENCES = {
     "он", "она", "с ним", "с ней", "ему", "ей", "его", "её", "ее",
 }
+_NON_NAME_WORDS = {
+    "возможно", "может", "быть", "какой-то", "какая-то", "каким-то",
+    "каким", "кто", "такой", "такая", "поговорю", "встречусь",
+}
 
 
 def normalize_person_identity(value: str) -> str:
@@ -66,7 +70,8 @@ def plausible_person_name(value: str) -> bool:
 def plausible_creation_mention(value: str) -> bool:
     """Conservative create gate; intent commitment still belongs to the caller."""
     display = _WHITESPACE.sub(" ", unicodedata.normalize("NFKC", str(value or "")).strip())
-    return plausible_person_name(display) and bool(display) and display[0].isupper()
+    words = {normalize_person_identity(part) for part in display.split(" ")}
+    return plausible_person_name(display) and not (words & _NON_NAME_WORDS)
 
 
 class EntityResolver:
