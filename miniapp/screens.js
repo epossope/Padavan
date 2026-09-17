@@ -146,7 +146,7 @@ document.addEventListener('drop',e=>{const row=e.target.closest('.layout-row');i
 document.addEventListener('change',e=>{if(e.target.dataset.replace!==undefined){layoutDraft[Number(e.target.dataset.replace)]=e.target.value;drawLayout()}});
 document.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.matches('[role=button][data-page]')){e.preventDefault();e.target.click()}});
 document.addEventListener('click',async e=>{
- const donutSegment=e.target.closest?.('circle[data-budget-category]');if(donutSegment){budgetCategorySelected=budgetCategorySelected===donutSegment.dataset.budgetCategory?'':donutSegment.dataset.budgetCategory;render();return}
+ const donutSegment=e.target.closest?.('circle[data-budget-category]');if(donutSegment){budgetCategorySelected=budgetCategorySelected===donutSegment.dataset.budgetCategory?'':donutSegment.dataset.budgetCategory;window.NoemaHaptics?.selection();render();return}
  const b=e.target.closest('button,[role=button]');if(!b)return;
  if(b.hasAttribute('data-back'))back();
  if(b.hasAttribute('data-keyboard'))go('chat');
@@ -162,19 +162,19 @@ document.addEventListener('click',async e=>{
  if(b.dataset.homeHide){await saveHomeWidgets((data.settings.home_widgets||defaultWidgets).filter(type=>type!==b.dataset.homeHide))}
  if(b.dataset.homeShow){await saveHomeWidgets([...(data.settings.home_widgets||defaultWidgets),b.dataset.homeShow])}
  if(b.hasAttribute('data-home-done'))window.NoemaHomeEdit?.exit?.()
- if(b.dataset.taskTab){taskTab=b.dataset.taskTab;taskFilter='all';render()}
- if(b.dataset.taskFilter){taskFilter=b.dataset.taskFilter;render()}
- if(b.dataset.noteFilter){noteFilter=b.dataset.noteFilter;render()}
- if(b.dataset.peopleFilter){peopleFilter=b.dataset.peopleFilter;render()}
- if(b.dataset.budgetPeriod){budgetPeriod=b.dataset.budgetPeriod;budgetChartSelected='';loadBudget()}
+ if(b.dataset.taskTab){const changed=taskTab!==b.dataset.taskTab;taskTab=b.dataset.taskTab;taskFilter='all';if(changed)window.NoemaHaptics?.selection();render()}
+ if(b.dataset.taskFilter){const changed=taskFilter!==b.dataset.taskFilter;taskFilter=b.dataset.taskFilter;if(changed)window.NoemaHaptics?.selection();render()}
+ if(b.dataset.noteFilter){const changed=noteFilter!==b.dataset.noteFilter;noteFilter=b.dataset.noteFilter;if(changed)window.NoemaHaptics?.selection();render()}
+ if(b.dataset.peopleFilter){const changed=peopleFilter!==b.dataset.peopleFilter;peopleFilter=b.dataset.peopleFilter;if(changed)window.NoemaHaptics?.selection();render()}
+ if(b.dataset.budgetPeriod){const changed=budgetPeriod!==b.dataset.budgetPeriod;budgetPeriod=b.dataset.budgetPeriod;budgetChartSelected='';if(changed)window.NoemaHaptics?.selection();loadBudget()}
  if(b.dataset.budgetShift)shiftBudgetPeriod(Number(b.dataset.budgetShift))
  if(b.dataset.budgetBar){budgetChartSelected=b.dataset.budgetBar;render()}
- if(b.dataset.budgetCategory){budgetCategorySelected=budgetCategorySelected===b.dataset.budgetCategory?'':b.dataset.budgetCategory;render()}
- if(b.hasAttribute('data-budget-category-total')){budgetCategorySelected='';render()}
+ if(b.dataset.budgetCategory){budgetCategorySelected=budgetCategorySelected===b.dataset.budgetCategory?'':b.dataset.budgetCategory;window.NoemaHaptics?.selection();render()}
+ if(b.hasAttribute('data-budget-category-total')){if(budgetCategorySelected)window.NoemaHaptics?.selection();budgetCategorySelected='';render()}
  if(b.hasAttribute('data-budget-categories-toggle')){budgetCategoryExpanded=!budgetCategoryExpanded;render()}
  if(b.hasAttribute('data-currency-toggle')){budgetCurrencyOpen=!budgetCurrencyOpen;render();if(budgetCurrencyOpen)await loadBudgetConversion()}
- if(b.dataset.budgetCurrency){budgetCurrency=b.dataset.budgetCurrency;budgetConversion=null;render();await loadBudgetConversion()}
- if(b.dataset.convertCurrency){budgetConversionCurrency=b.dataset.convertCurrency;budgetConversion=null;render();await loadBudgetConversion()}
+ if(b.dataset.budgetCurrency){const changed=budgetCurrency!==b.dataset.budgetCurrency;budgetCurrency=b.dataset.budgetCurrency;budgetConversion=null;if(changed)window.NoemaHaptics?.selection();render();await loadBudgetConversion()}
+ if(b.dataset.convertCurrency){const changed=budgetConversionCurrency!==b.dataset.convertCurrency;budgetConversionCurrency=b.dataset.convertCurrency;budgetConversion=null;if(changed)window.NoemaHaptics?.selection();render();await loadBudgetConversion()}
  if(b.hasAttribute('data-memory-search')){if(!search.trim()){say('Введи запрос в строку поиска.');return}try{archiveResults=await api('archive_search',{query:search});render()}catch(err){say(err.message)}}
 });
 document.addEventListener('change',e=>{if(e.target.id==='budget-month'){budgetMonth=e.target.value;budgetAnchorDate=`${budgetMonth}-01`;budgetChartSelected='';loadBudget()}});
