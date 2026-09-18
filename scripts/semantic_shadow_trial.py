@@ -37,6 +37,7 @@ SYNTHETIC_OWNER = 970_001
 MUTABLE_TABLES = (
     "people", "interactions", "events", "event_participants", "tasks", "reminders",
     "expenses", "notes", "semantic_executions", "usage_events", "messages", "settings",
+    "managed_api_keys", "managed_key_events", "user_api_keys",
 )
 
 
@@ -120,19 +121,25 @@ def seed_fixture(path: Path) -> None:
 
 def ensure_live_model_is_configured() -> None:
     """Fail before a trial rather than leaking a missing-key provider error."""
-    values = (getattr(bot, "OR_KEY", ""), getattr(bot, "OR_MANAGEMENT_KEY", ""))
-    if not any(str(value).strip() and "PASTE_" not in str(value) for value in values):
+    shared_key = str(getattr(bot, "OR_KEY", "")).strip()
+    if not shared_key or "PASTE_" in shared_key:
         raise RuntimeError("LIVE_MODEL_NOT_CONFIGURED")
 
 
 def prepare_fixture(base_db: Path) -> None:
     seed_fixture(base_db)
-    # Provisioning/key lookup, if configured, happens before snapshots and is
-    # copied into every case.  No production database is ever selected.
-    with _with_database(base_db):
-        key, _source = bot.api_key_for_chat(SYNTHETIC_OWNER)
-    if not str(key or "").strip():
-        raise RuntimeError("LIVE_MODEL_NOT_CONFIGURED")
+
+
+@contextlib.contextmanager
+def trial_credential_context():
+    """Force the existing request path to use only the configured shared key.
+
+    This is intentionally scoped to the trial.  Production
+    ``api_key_for_chat`` and managed-key recovery behavior are unchanged.
+    """
+    with patch.object(bot, "provision_managed_api_key", return_value=None), \
+         patch.object(bot, "recover_missing_managed_key", return_value=False):
+        yield
 
 
 def copy_case_databases(base_db: Path, directory: Path, number: int) -> tuple[Path, Path]:
@@ -173,7 +180,7 @@ def plan_summary(plan: Any) -> dict[str, Any]:
 
 def run_semantic_case(case: TrialCase, database: Path, *, backend_factory=None) -> dict[str, Any]:
     """Run the real planner/backend/orchestrator while asserting no DB mutation."""
-    with _with_database(database):
+    with _with_database(database), trial_credential_context():
         before = _table_snapshot(database)
         backend = (backend_factory or bot._SemanticRuntimeBackend)(SYNTHETIC_OWNER)
         planner = SemanticPlanner(backend)
@@ -205,7 +212,7 @@ def run_semantic_case(case: TrialCase, database: Path, *, backend_factory=None) 
 def run_legacy_case(case: TrialCase, database: Path) -> dict[str, Any]:
     """Run the unchanged legacy stream in its own copy; only compact trace is retained."""
     trace = LegacyExecutionTrace()
-    with _with_database(database), patch.dict(os.environ, {"SEMANTIC_SHADOW_ENABLED": "0"}):
+    with _with_database(database), trial_credential_context(), patch.dict(os.environ, {"SEMANTIC_SHADOW_ENABLED": "0"}):
         bot._SEMANTIC_SHADOWS.clear()
         original = bot.execute_tool
         def traced(owner, name, args):

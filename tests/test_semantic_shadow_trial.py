@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import semantic_shadow_trial as trial
 
@@ -16,6 +17,28 @@ def _semantic(*, zero_write=True, disposition="commit", operations=None, status=
 
 
 class SemanticShadowTrialTests(unittest.TestCase):
+    def test_shared_trial_credentials_never_provision_managed_key(self):
+        with patch.object(trial.bot, "OR_KEY", "shared-test-key"), \
+             patch.object(trial.bot, "OR_MANAGEMENT_KEY", "management-test-key"), \
+             patch.object(trial.bot, "provision_managed_api_key", side_effect=AssertionError("must not provision")):
+            trial.ensure_live_model_is_configured()
+            with trial.trial_credential_context():
+                key, source = trial.bot.api_key_for_chat(trial.SYNTHETIC_OWNER)
+        self.assertEqual(("shared-test-key", "shared"), (key, source))
+
+    def test_fixture_setup_does_not_call_provider_credential_provisioning(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory, \
+             patch.object(trial.bot, "provision_managed_api_key", side_effect=AssertionError("must not provision")) as provision:
+            trial.prepare_fixture(Path(directory) / "fixture.db")
+        provision.assert_not_called()
+
+    def test_management_key_without_shared_key_is_not_live_trial_configuration(self):
+        with patch.object(trial.bot, "OR_KEY", ""), \
+             patch.object(trial.bot, "OR_MANAGEMENT_KEY", "management-test-key"), \
+             patch.object(trial.bot, "provision_managed_api_key", side_effect=AssertionError("must not provision")):
+            with self.assertRaisesRegex(RuntimeError, "LIVE_MODEL_NOT_CONFIGURED"):
+                trial.ensure_live_model_is_configured()
+
     def test_fixture_copies_are_isolated_and_snapshot_detects_mutation(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
