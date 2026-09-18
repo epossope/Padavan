@@ -4793,7 +4793,7 @@ def system_prompt(chat_id):
 
 
 
-def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, stream=False):
+def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, stream=False, response_format=None):
     """Build the single production-visible chat contract for every transport."""
     payload = {
         "model": model,
@@ -4810,14 +4810,16 @@ def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, strea
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
+    if response_format is not None:
+        payload["response_format"] = response_format
     if provider := provider_preferences_for(model):
         payload["provider"] = provider
     return payload
 
 
-def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
+def request_chat(chat_id, model, messages, tools=None, tool_choice="auto", *, response_format=None):
 
-    payload = build_chat_payload(model, messages, tools, tool_choice)
+    payload = build_chat_payload(model, messages, tools, tool_choice, response_format=response_format)
 
     key, source = api_key_for_chat(chat_id)
     response = requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
@@ -4838,7 +4840,7 @@ def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"
 class _SemanticRuntimeBackend:
     """App adapter: semantic core stays provider-neutral and uses normal routing."""
     def __init__(self, chat_id): self.chat_id = chat_id
-    async def _generate(self, system_prompt, payload):
+    async def _generate(self, system_prompt, payload, *, response_format=None):
         models = chat_model_candidates(self.chat_id)
         if not models: raise RuntimeError("no_model")
         def call():
@@ -4851,7 +4853,7 @@ class _SemanticRuntimeBackend:
                         response = request_chat(self.chat_id, model, [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                        ], tools=None, tool_choice="none")
+                        ], tools=None, tool_choice="none", response_format=response_format)
                         if response.ok:
                             data = response.json()
                             record_usage(self.chat_id, response_key_source(response, self.chat_id), model, data)
@@ -4877,7 +4879,12 @@ class _SemanticRuntimeBackend:
             raise RuntimeError("provider_error") from last_error
         return await asyncio.to_thread(call)
     async def generate_structured(self, *, system_prompt, input_payload, output_schema):
-        return await self._generate(system_prompt, {"input": input_payload, "schema": output_schema})
+        payload = {"input": input_payload, "schema": output_schema}
+        structured = {"type": "json_schema", "json_schema": {"name": "semantic_plan", "strict": True, "schema": output_schema}}
+        try:
+            return await self._generate(system_prompt, payload, response_format=structured)
+        except Exception:
+            return await self._generate(system_prompt, payload)
     async def generate_grounded(self, *, system_prompt, question, evidence):
         return await self._generate(system_prompt, {"question": question, "evidence": evidence})
 

@@ -384,6 +384,17 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ValueError, "unsafe_destructive_action"):
                     parse_semantic_plan(unsafe)
 
+class SemanticPlannerTransportTests(unittest.TestCase):
+    def test_missing_local_ids_are_normalized_and_fenced_json_is_accepted(self):
+        parsed = parse_semantic_plan("```json\n{\"intent\":\"meeting\",\"disposition\":\"commit\",\"reads\":[{\"domain\":\"event\",\"operation\":\"search\"}],\"actions\":[{\"domain\":\"event\",\"operation\":\"create\",\"fields\":{\"title\":\"x\",\"local_datetime\":\"2026-09-20T15:00:00\"}}]}\n```")
+        self.assertEqual(("r1", "a1"), (parsed.reads[0].read_id, parsed.actions[0].action_id))
+
+    def test_duplicate_local_ids_and_prose_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "duplicate_local_id"):
+            parse_semantic_plan({"intent": "x", "disposition": "read", "reads": [{"domain": "event", "operation": "search", "read_id": "r1"}, {"domain": "event", "operation": "list", "read_id": "r1"}]})
+        with self.assertRaisesRegex(ValueError, "malformed_json"):
+            parse_semantic_plan("Here is JSON: {\"intent\":\"x\"}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -76,9 +76,29 @@ PLANNER_PROMPT = """You are Noema's semantic planner. Understand the user's inte
 Return only JSON matching the supplied schema. Plan exact reads and semantic actions, but never invent or copy database IDs or owner identifiers.
 User-specific facts require exact reads; current exact state outranks memory and conversation. Never invent missing personal facts.
 Only explicit committed requests may produce actions. Uncertainty or missing required meaning must produce disposition=clarify with a useful question.
+Explicit create/update/delete/save/remind/spend requests are commit. Questions about user state are read. General/world knowledge without personal state is answer. Missing required execution data is clarify. A deletion is commit, with event.search and a dependency before its destructive action.
 Keep relative/fuzzy time as semantic fields when it cannot be normalized without guessing. Use now and timezone supplied in input.
 Pronouns remain mention text (for example "с ним"); a later trusted resolver handles identity.
 Deletion/cancellation must first plan a target read and make the destructive action depend on that resolution. JSON only."""
+
+# One model-visible contract, deliberately independent of user phrasing.
+OPERATION_CONTRACT = {
+    "reads": {
+        "person.resolve": {"entity_refs": ["person"]}, "person.interactions_list": {"entity_refs": ["person"]},
+        "event.list": {"filters": ["date_from", "date_to", "status"], "person_via": "entity_refs"},
+        "event.search": {"filters": ["query", "date_from", "date_to"], "person_via": "entity_refs"},
+        "finance.summary": {"filters": ["period", "date_from", "date_to"]}, "transaction.list": {"filters": ["period", "date_from", "date_to"]},
+        "task.list": {"filters": ["date", "status"]}, "reminder.list": {"filters": ["date_from", "date_to"]},
+        "note.list": {"filters": ["query", "date"]}, "note.search": {"filters": ["query"]},
+    },
+    "actions": {
+        "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"]},
+        "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs"},
+        "transaction.create": {"required": ["amount"], "optional": ["currency", "category", "description", "merchant", "kind", "spent_at"]},
+        "reminder.create": {"required": ["title/text", "local_datetime"]}, "task.create": {}, "note.create": {},
+        "event.delete": {"requires": ["event.search", "depends_on read_id"]}, "event.cancel": {"requires": ["event.search", "depends_on read_id"]}, "event.update": {"requires": ["event.search", "depends_on read_id"]},
+    },
+}
 
 
 OUTPUT_SCHEMA: dict[str, Any] = {
@@ -290,8 +310,11 @@ def parse_semantic_plan(payload: str | Mapping[str, Any]) -> SemanticPlan:
             raise _invalid("empty")
         if len(payload.encode("utf-8")) > MAX_RESPONSE_BYTES:
             raise _invalid("oversized")
+        candidate = payload.strip()
+        if candidate.startswith("```json") and candidate.endswith("```"):
+            candidate = candidate[7:-3].strip()
         try:
-            raw = json.loads(payload)
+            raw = json.loads(candidate)
         except (json.JSONDecodeError, UnicodeError):
             raise _invalid("malformed_json") from None
     elif isinstance(payload, Mapping):
@@ -322,6 +345,25 @@ def parse_semantic_plan(payload: str | Mapping[str, Any]) -> SemanticPlan:
     entities = _entity_list(data.get("entities", []), maximum=MAX_ENTITIES)
     reads = [_read(item) for item in data.get("reads", [])]
     actions = [_action(item) for item in data.get("actions", [])]
+    used: set[str] = set()
+    for item in [*reads, *actions]:
+        identifier = item.read_id if isinstance(item, ReadRequest) else item.action_id
+        if identifier:
+            if identifier in used:
+                raise _invalid("duplicate_local_id")
+            used.add(identifier)
+    for index, item in enumerate(reads, 1):
+        if not item.read_id:
+            candidate = f"r{index}"
+            while candidate in used:
+                index += 1; candidate = f"r{index}"
+            item.read_id = candidate; used.add(candidate)
+    for index, item in enumerate(actions, 1):
+        if not item.action_id:
+            candidate = f"a{index}"
+            while candidate in used:
+                index += 1; candidate = f"a{index}"
+            item.action_id = candidate; used.add(candidate)
     clarification = _string(
         data.get("clarification", ""), label="clarification", maximum=MAX_CLARIFICATION, allow_empty=True
     )
@@ -374,12 +416,13 @@ def _sanitize_context(value: Any, *, depth: int = 0) -> Any:
     return str(value)[:MAX_VALUE_STRING]
 
 
-def _safe_failure_plan() -> SemanticPlan:
+def _safe_failure_plan(category: str = "provider_error") -> SemanticPlan:
     return SemanticPlan(
         intent="planner_failure",
         disposition="clarify",
         clarification="Не удалось надёжно понять запрос. Пожалуйста, уточни его.",
         confidence=0.0,
+        planner_failure_category=category,
     )
 
 
@@ -457,6 +500,7 @@ class SemanticPlanner:
                         "timezone": clean_timezone,
                         "conversation_context": _sanitize_context(conversation_context),
                         "memory_context": _sanitize_context(memory_context),
+                        "operation_contract": OPERATION_CONTRACT,
                     },
                     output_schema=OUTPUT_SCHEMA,
                 ),
@@ -474,13 +518,13 @@ class SemanticPlanner:
             return result
         except SemanticPlanValidationError as exc:
             self._observe("semantic_planner_invalid_output", failure_category=exc.category)
-            return _safe_failure_plan()
+            return _safe_failure_plan(exc.category)
         except asyncio.TimeoutError:
             self._observe("semantic_planner_failed", failure_category="timeout")
-            return _safe_failure_plan()
+            return _safe_failure_plan("timeout")
         except Exception:
             self._observe("semantic_planner_failed", failure_category="provider_error")
-            return _safe_failure_plan()
+            return _safe_failure_plan("provider_error")
         finally:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self._metric("planner_latency_ms", elapsed_ms)
@@ -488,6 +532,7 @@ class SemanticPlanner:
 
 __all__ = [
     "DOMAIN_OPERATIONS",
+    "OPERATION_CONTRACT",
     "OUTPUT_SCHEMA",
     "PLANNER_PROMPT",
     "PlannerBackend",

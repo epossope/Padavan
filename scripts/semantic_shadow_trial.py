@@ -203,6 +203,13 @@ def plan_summary(plan: Any) -> dict[str, Any]:
     }
 
 
+def effective_model_route() -> dict[str, Any]:
+    selected = bot.resolved_chat_models(SYNTHETIC_OWNER)
+    return {"primary_model": selected["primary"], "fallback_model": selected["fallback"],
+            "primary_source": selected["source"], "fallback_source": selected["fallback_source"],
+            "provider_preferences": {model: bot.provider_preferences_for(model) for model in bot.chat_model_candidates(SYNTHETIC_OWNER)}}
+
+
 def run_semantic_case(case: TrialCase, database: Path, *, backend_factory=None) -> dict[str, Any]:
     """Run the real planner/backend/orchestrator while asserting no DB mutation."""
     with _with_database(database), trial_credential_context():
@@ -228,7 +235,7 @@ def run_semantic_case(case: TrialCase, database: Path, *, backend_factory=None) 
         "status": result.status, "disposition": result.disposition, "intent": getattr(result.plan, "intent", ""),
         "read_count": result.read_count, "action_count": result.action_count,
         "operations": list(result.proposed_operations), "grounding_status": result.grounding_status,
-        "failure_category": result.failure_category, "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        "failure_category": result.failure_category, "planner_failure_category": getattr(result.plan, "planner_failure_category", ""), "latency_ms": round((time.perf_counter() - started) * 1000, 1),
         "plan": plan_summary(result.plan), "exact_evidence": any(item.source.startswith("exact_") for item in evidence_items),
         "zero_write": semantic_zero_write(before, after),
     }
@@ -307,7 +314,7 @@ def acceptance(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def markdown_report(report: dict[str, Any]) -> str:
-    lines = ["# Semantic shadow local trial", "", "| # | Phrase | Legacy tools | Semantic status | Semantic operations | Match | Zero-write | Verdict | Latency |", "|---:|---|---|---|---|---|---|---|---|"]
+    lines = ["# Semantic shadow local trial", "", f"MODEL_ROUTE: {json.dumps(report.get('model_route', {}), ensure_ascii=False)}", "", "| # | Phrase | Legacy tools | Semantic status | Semantic operations | Match | Zero-write | Verdict | Latency |", "|---:|---|---|---|---|---|---|---|---|"]
     for item in report["cases"]:
         semantic, legacy = item["semantic"], item["legacy"]
         lines.append(f"| {item['number']} | {item['phrase']} | {', '.join(legacy['tool_names']) or '—'} | {semantic['status']} | {', '.join(semantic['operations']) or '—'} | {item['comparison']} | {'PASS' if semantic['zero_write'] else 'FAIL'} | {item['verdict']} | {semantic['latency_ms']:.1f}/{legacy['latency_ms']:.1f} ms |")
@@ -334,7 +341,7 @@ def run_trial(*, case_numbers: set[int] | None = None, include_legacy: bool = Tr
             comparison = comparison_for(semantic, legacy) if include_legacy else "NOT_COMPARABLE"
             verdict, notes = verdict_for(case, semantic, comparison)
             entries.append({"number": case.number, "phrase": case.phrase, "expected": case.expected, "legacy": legacy, "semantic": semantic, "comparison": comparison, "verdict": verdict, "notes": notes})
-    report = {"trial": "local_synthetic_shadow", "cases": entries}
+    report = {"trial": "local_synthetic_shadow", "model_route": effective_model_route(), "cases": entries}
     report["summary"] = acceptance(report)
     return report
 

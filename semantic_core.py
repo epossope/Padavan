@@ -54,6 +54,7 @@ class SemanticPlan:
     actions: list[ActionRequest] = field(default_factory=list)
     clarification: str = ""
     confidence: float = 1.0
+    planner_failure_category: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

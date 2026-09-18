@@ -120,7 +120,7 @@ class SemanticShadowOrchestrator:
         return compare_shadow(result.proposed_operations, legacy_trace)
     async def _run(self, owner, request_id, utterance, now, timezone, context, memory, legacy):
         plan=await self.planner.plan(utterance,now=now,timezone=timezone,conversation_context=context,memory_context=memory)
-        if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category="planner")
+        if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category=plan.planner_failure_category or "planner")
         # This list is diagnostic-only.  Reads must be represented too: the
         # legacy path often executes exactly one canonical read tool.
         operations=[f"{r.domain}.{r.operation}" for r in plan.reads]
