@@ -320,7 +320,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         lines.append(f"| {item['number']} | {item['phrase']} | {', '.join(legacy['tool_names']) or '—'} | {semantic['status']} | {', '.join(semantic['operations']) or '—'} | {item['comparison']} | {'PASS' if semantic['zero_write'] else 'FAIL'} | {item['verdict']} | {semantic['latency_ms']:.1f}/{legacy['latency_ms']:.1f} ms |")
     for item in report["cases"]:
         semantic, legacy = item["semantic"], item["legacy"]
-        lines += ["", f"## {item['number']}. {item['phrase']}", "", f"EXPECTED: {item['expected']}", "", f"LEGACY: tools={legacy['tool_names']}; success={legacy['success_count']}; failure={legacy['failure_count']}", "", f"SEMANTIC: status={semantic['status']}; disposition={semantic['disposition']}; plan={semantic['plan']}", "", f"GROUNDING: {semantic['grounding_status'] or 'n/a'}; exact_evidence={semantic['exact_evidence']}", "", f"COMPARISON: {item['comparison']}", "", f"ZERO_WRITE: {'PASS' if semantic['zero_write'] else 'FAIL'}", "", f"VERDICT: {item['verdict']}", "", f"NOTES: {', '.join(item['notes']) or '—'}"]
+        lines += ["", f"## {item['number']}. {item['phrase']}", "", f"EXPECTED: {item['expected']}", "", f"LEGACY: tools={legacy['tool_names']}; success={legacy['success_count']}; failure={legacy['failure_count']}", "", f"SEMANTIC: status={semantic['status']}; disposition={semantic['disposition']}; failure_category={semantic['failure_category']}; plan={semantic['plan']}", "", f"GROUNDING: {semantic['grounding_status'] or 'n/a'}; exact_evidence={semantic['exact_evidence']}", "", f"COMPARISON: {item['comparison']}", "", f"ZERO_WRITE: {'PASS' if semantic['zero_write'] else 'FAIL'}", "", f"VERDICT: {item['verdict']}", "", f"NOTES: {', '.join(item['notes']) or '—'}"]
     lines += ["", "## TOTAL", ""]
     for key, value in report["summary"].items():
         lines.append(f"{key}: {value}")
@@ -333,6 +333,8 @@ def run_trial(*, case_numbers: set[int] | None = None, include_legacy: bool = Tr
     with trial_temp_directory() as directory:
         base = directory / "fixture.db"
         prepare_fixture(base)
+        with _with_database(base):
+            model_route = effective_model_route()
         entries = []
         for case in selected:
             semantic_db, legacy_db = copy_case_databases(base, directory, case.number)
@@ -341,7 +343,7 @@ def run_trial(*, case_numbers: set[int] | None = None, include_legacy: bool = Tr
             comparison = comparison_for(semantic, legacy) if include_legacy else "NOT_COMPARABLE"
             verdict, notes = verdict_for(case, semantic, comparison)
             entries.append({"number": case.number, "phrase": case.phrase, "expected": case.expected, "legacy": legacy, "semantic": semantic, "comparison": comparison, "verdict": verdict, "notes": notes})
-    report = {"trial": "local_synthetic_shadow", "model_route": effective_model_route(), "cases": entries}
+    report = {"trial": "local_synthetic_shadow", "model_route": model_route, "cases": entries}
     report["summary"] = acceptance(report)
     return report
 

@@ -85,18 +85,20 @@ Deletion/cancellation must first plan a target read and make the destructive act
 OPERATION_CONTRACT = {
     "reads": {
         "person.resolve": {"entity_refs": ["person"]}, "person.interactions_list": {"entity_refs": ["person"]},
-        "event.list": {"filters": ["date_from", "date_to", "status"], "person_via": "entity_refs"},
-        "event.search": {"filters": ["query", "date_from", "date_to"], "person_via": "entity_refs"},
-        "finance.summary": {"filters": ["period", "date_from", "date_to"]}, "transaction.list": {"filters": ["period", "date_from", "date_to"]},
-        "task.list": {"filters": ["date", "status"]}, "reminder.list": {"filters": ["date_from", "date_to"]},
-        "note.list": {"filters": ["query", "date"]}, "note.search": {"filters": ["query"]},
+        "event.list": {"filters": ["date_from", "date_to", "status", "limit"], "person_via": "entity_refs"},
+        "event.search": {"filters": ["query", "date_from", "date_to", "limit"], "person_via": "entity_refs"},
+        "finance.summary": {"period": ["today", "yesterday", "7_days", "current_month", "custom"], "filters": ["period", "date_from", "date_to"]},
+        "transaction.list": {"period": ["today", "yesterday", "7_days", "current_month", "custom"], "filters": ["period", "date_from", "date_to", "kind", "query", "limit", "offset"]},
+        "task.list": {"scope": ["open", "done", "overdue", "today", "all"], "filters": ["scope", "query", "limit"]},
+        "reminder.list": {"scope": ["today", "tomorrow", "overdue", "upcoming", "all", "custom"], "filters": ["scope", "date_from", "date_to", "query", "include_acknowledged", "limit"]},
+        "note.list": {"filters": ["query", "date", "limit"]}, "note.search": {"filters": ["query"]},
     },
     "actions": {
         "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"]},
         "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs"},
         "transaction.create": {"required": ["amount"], "optional": ["currency", "category", "description", "merchant", "kind", "spent_at"]},
         "reminder.create": {"required": ["title/text", "local_datetime"]}, "task.create": {}, "note.create": {},
-        "event.delete": {"requires": ["event.search", "depends_on read_id"]}, "event.cancel": {"requires": ["event.search", "depends_on read_id"]}, "event.update": {"requires": ["event.search", "depends_on read_id"]},
+        "event.delete": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.cancel": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.update": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]},
     },
 }
 
