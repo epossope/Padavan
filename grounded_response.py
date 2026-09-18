@@ -58,6 +58,12 @@ class EvidenceAssembler:
                 for step in execution_result.actions:
                     ident=step.result.get("id")
                     if ident is not None: packet.add(EvidenceItem("exact_historical" if step.operation in {"delete","cancel"} else "exact_current",step.domain,ident,_safe(step.result),confidence=1,domain=step.domain))
+                # Delete/update services may not return the affected id.  The
+                # executor's owner-scoped result lists are the trusted receipt.
+                for item in execution_result.deleted_entities:
+                    packet.add(EvidenceItem("exact_historical", str(item.get("domain") or ""), item.get("id"), {"operation":"delete", "ok":True}, confidence=1, domain=str(item.get("domain") or "")))
+                for item in execution_result.updated_entities:
+                    packet.add(EvidenceItem("exact_current", str(item.get("domain") or ""), item.get("id"), {"operation":"update", "ok":True}, confidence=1, domain=str(item.get("domain") or "")))
             for source, items in (("semantic_memory", semantic_memory), ("conversation", conversation_evidence)):
                 for item in (items or [])[:16]:
                     item = item if isinstance(item, dict) else {"text": item}
@@ -70,7 +76,7 @@ class EvidenceAssembler:
                 except Exception:pass
 
 def model_packet(packet: EvidencePacket) -> dict:
-    exact_domains={x.domain for x in packet.items if x.source=="exact_current" and x.domain}
+    exact_domains={x.domain for x in packet.items if x.source in {"exact_current", "exact_historical"} and x.domain}
     blocked=set(packet.exact_empty_domains) | exact_domains
     effective=[x for x in packet.items if not (x.source in {"semantic_memory","conversation"} and x.domain in blocked)]
     return {"items":[{"evidence_id":x.evidence_id,"source":x.source,"entity_type":x.entity_type,"domain":x.domain,"fields":_safe(x.fields),"confidence":x.confidence} for x in effective],"exact_empty_domains":packet.exact_empty_domains}
@@ -85,8 +91,15 @@ class GroundedResponder:
         started=time.perf_counter(); self._emit("grounded_response_started")
         try:
             raw=await asyncio.wait_for(self.backend.generate_grounded(system_prompt=PROMPT,question=str(question)[:MAX_TEXT],evidence=model_packet(packet)),self.timeout)
-            if isinstance(raw, str) and len(raw.encode("utf-8")) > MAX_RESPONSE: raise GroundingError("oversized")
-            data=json.loads(raw) if isinstance(raw,str) else dict(raw)
+            if isinstance(raw, str):
+                encoded = raw.encode("utf-8")
+                if len(encoded) > MAX_RESPONSE: raise GroundingError("oversized")
+                data=json.loads(raw)
+            else:
+                try: encoded=json.dumps(raw, ensure_ascii=False).encode("utf-8")
+                except (TypeError, ValueError, OverflowError): raise GroundingError("invalid_mapping") from None
+                if len(encoded) > MAX_RESPONSE: raise GroundingError("oversized")
+                data=dict(raw)
             claims=[]; ids={x["evidence_id"] for x in model_packet(packet)["items"]}
             if set(data) - {"claims","confidence","clarification"} or not isinstance(data.get("claims"),list) or len(data["claims"])>16: raise GroundingError("invalid_claims")
             for item in data["claims"]:

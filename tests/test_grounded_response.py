@@ -29,6 +29,22 @@ class GroundingTests(unittest.TestCase):
         self.assertNotIn("chat_id",str(backend.calls[0]["evidence"]))
         self.assertNotIn("entity_id",str(backend.calls[0]["evidence"]))
 
+    def test_historical_suppresses_competing_memory_and_delete_receipt_is_safe(self):
+        result=ExecutionResult("EXECUTED","r",reads=[ExecutionStep("i","read","EXECUTED",{"ok":True,"items":[{"id":4,"interaction":"Noema"}]},"person","interactions_list")],deleted_entities=[{"domain":"event","id":52}])
+        packet=EvidenceAssembler().build(None,result,semantic_memory=[{"domain":"person","interaction":"другой проект"}],conversation_evidence=[{"domain":"person","interaction":"друг"}])
+        visible=asyncio.run(_packet_items(packet))
+        self.assertFalse([x for x in visible if x["source"] in {"semantic_memory","conversation"} and x["domain"]=="person"])
+        receipt=next(x for x in visible if x["domain"]=="event")
+        self.assertEqual("exact_historical",receipt["source"])
+        self.assertNotIn("52",str(receipt))
+        failed=EvidenceAssembler().build(None,ExecutionResult("FAILED","r",deleted_entities=[{"domain":"event","id":52}]))
+        self.assertFalse(failed.items)
+
+    def test_oversized_mapping_fails_closed(self):
+        packet=EvidenceAssembler().build(None,ExecutionResult("EXECUTED","r",reads=[ExecutionStep("f","read","EXECUTED",{"ok":True,"total":0},"finance","summary")]))
+        response=asyncio.run(GroundedResponder(FakeBackend({"claims":[],"clarification":"x"*70000})).respond("x",packet))
+        self.assertEqual("NO_DATA",response.status)
+
 async def _packet_items(packet):
     from grounded_response import model_packet
     return model_packet(packet)["items"]
