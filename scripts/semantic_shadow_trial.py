@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import gc
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -34,6 +36,7 @@ from semantic_orchestrator import LegacyExecutionTrace, SemanticShadowOrchestrat
 from semantic_planner import SemanticPlanner
 
 SYNTHETIC_OWNER = 970_001
+LOGGER = logging.getLogger(__name__)
 MUTABLE_TABLES = (
     "people", "interactions", "events", "event_participants", "tasks", "reminders",
     "expenses", "notes", "semantic_executions", "usage_events", "messages", "settings",
@@ -76,7 +79,7 @@ def _now() -> datetime:
 def _table_snapshot(path: Path) -> dict[str, dict[str, Any]]:
     """Fingerprint all relevant mutable state without serializing its contents."""
     result: dict[str, dict[str, Any]] = {}
-    with sqlite3.connect(path) as connection:
+    with contextlib.closing(sqlite3.connect(path)) as connection:
         for table in MUTABLE_TABLES:
             exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -150,6 +153,28 @@ def copy_case_databases(base_db: Path, directory: Path, number: int) -> tuple[Pa
     return semantic_db, legacy_db
 
 
+@contextlib.contextmanager
+def trial_temp_directory():
+    """Best-effort cleanup for Windows SQLite locks in this harness only."""
+    directory = Path(tempfile.mkdtemp(prefix="noema-semantic-shadow-"))
+    try:
+        yield directory
+    finally:
+        gc.collect()
+        for attempt in range(4):
+            try:
+                shutil.rmtree(directory)
+                break
+            except PermissionError:
+                if attempt < 3:
+                    time.sleep(0.1 * (attempt + 1))
+            except OSError:
+                break
+        if directory.exists():
+            # Never include a path, DB contents, credentials, or owner data.
+            LOGGER.warning("TEMP_CLEANUP_DEFERRED")
+
+
 def trusted_context(case: TrialCase, person_id: int | None = None) -> dict[str, Any]:
     # The model receives no ID: SemanticPlanner strips it.  Validator gets the
     # same owner-scoped trusted referent only after planning.
@@ -162,7 +187,7 @@ def trusted_context(case: TrialCase, person_id: int | None = None) -> dict[str, 
 
 
 def _person_id(path: Path) -> int | None:
-    with sqlite3.connect(path) as connection:
+    with contextlib.closing(sqlite3.connect(path)) as connection:
         row = connection.execute("SELECT id FROM people WHERE chat_id=? AND name='Иван'", (SYNTHETIC_OWNER,)).fetchone()
     return int(row[0]) if row else None
 
@@ -298,8 +323,7 @@ def markdown_report(report: dict[str, Any]) -> str:
 def run_trial(*, case_numbers: set[int] | None = None, include_legacy: bool = True) -> dict[str, Any]:
     ensure_live_model_is_configured()
     selected = [case for case in CASES if case_numbers is None or case.number in case_numbers]
-    with tempfile.TemporaryDirectory(prefix="noema-semantic-shadow-") as temp:
-        directory = Path(temp)
+    with trial_temp_directory() as directory:
         base = directory / "fixture.db"
         prepare_fixture(base)
         entries = []

@@ -39,6 +39,34 @@ class SemanticShadowTrialTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "LIVE_MODEL_NOT_CONFIGURED"):
                 trial.ensure_live_model_is_configured()
 
+    def test_trial_temp_directory_retries_windows_lock_and_keeps_result(self):
+        original_rmtree = trial.shutil.rmtree
+        calls = []
+        def flaky_rmtree(path):
+            calls.append(Path(path))
+            if len(calls) == 1:
+                raise PermissionError(32, "locked")
+            original_rmtree(path)
+        with patch.object(trial.shutil, "rmtree", side_effect=flaky_rmtree), \
+             patch.object(trial.time, "sleep"):
+            with trial.trial_temp_directory() as directory:
+                (directory / "legacy_case_10.db").write_text("synthetic", encoding="utf-8")
+                completed_result = {"report": "complete"}
+        self.assertEqual({"report": "complete"}, completed_result)
+        self.assertEqual(2, len(calls))
+        self.assertFalse(directory.exists())
+
+    def test_trial_temp_directory_defers_unremovable_lock_without_private_warning(self):
+        original_rmtree = trial.shutil.rmtree
+        with patch.object(trial.shutil, "rmtree", side_effect=PermissionError(32, "locked")), \
+             patch.object(trial.time, "sleep"), \
+             self.assertLogs(trial.LOGGER, "WARNING") as logs:
+            with trial.trial_temp_directory() as directory:
+                (directory / "legacy_case_10.db").write_text("synthetic", encoding="utf-8")
+        self.assertIn("TEMP_CLEANUP_DEFERRED", "\n".join(logs.output))
+        self.assertNotIn("legacy_case_10.db", "\n".join(logs.output))
+        original_rmtree(directory, ignore_errors=True)
+
     def test_fixture_copies_are_isolated_and_snapshot_detects_mutation(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
