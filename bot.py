@@ -4821,6 +4821,62 @@ def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"
     return response
 
 
+class _SemanticRuntimeBackend:
+    """App adapter: semantic core stays provider-neutral and uses normal routing."""
+    def __init__(self, chat_id): self.chat_id = chat_id
+    async def _generate(self, system_prompt, payload):
+        models = chat_model_candidates(self.chat_id)
+        if not models: raise RuntimeError("no_model")
+        def call():
+            response = request_chat(self.chat_id, models[0], [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ], tools=None, tool_choice="none")
+            if not response.ok: raise RuntimeError("provider_error")
+            data = response.json(); return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return await asyncio.to_thread(call)
+    async def generate_structured(self, *, system_prompt, input_payload, output_schema):
+        return await self._generate(system_prompt, {"input": input_payload, "schema": output_schema})
+    async def generate_grounded(self, *, system_prompt, question, evidence):
+        return await self._generate(system_prompt, {"question": question, "evidence": evidence})
+
+
+_SEMANTIC_SHADOWS = {}
+def get_semantic_shadow_orchestrator(chat_id):
+    """Lazy default-off factory; never changes a legacy answer or tool path."""
+    if not bool_env("SEMANTIC_SHADOW_ENABLED", False): return None
+    if chat_id not in _SEMANTIC_SHADOWS:
+        from semantic_planner import SemanticPlanner
+        from plan_runtime import PlanValidator, BotDomainServices
+        from grounded_response import EvidenceAssembler, GroundedResponder
+        from semantic_orchestrator import SemanticShadowOrchestrator
+        backend = _SemanticRuntimeBackend(chat_id)
+        _SEMANTIC_SHADOWS[chat_id] = SemanticShadowOrchestrator(
+            SemanticPlanner(backend, observer=DIAGNOSTICS.record), person_plan_validator(),
+            BotDomainServices(__import__(__name__)), EvidenceAssembler(observer=DIAGNOSTICS.record),
+            GroundedResponder(backend, observer=DIAGNOSTICS.record), observer=DIAGNOSTICS.record,
+            metric_recorder=record_runtime_metric,
+        )
+    return _SEMANTIC_SHADOWS[chat_id]
+
+
+def person_plan_validator():
+    from plan_runtime import PlanValidator
+    return PlanValidator(person_entity_resolver(), observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric)
+
+
+def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None):
+    """Channel-neutral fire-and-forget shadow hook; all failures are isolated."""
+    try:
+        orchestrator = get_semantic_shadow_orchestrator(chat_id)
+        if orchestrator is None: return None
+        return orchestrator.schedule(trusted_owner=chat_id, request_id=request_id or uuid.uuid4().hex,
+            utterance=text, now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
+            conversation_context=conversation_context or {"recent_entities": []})
+    except Exception:
+        return None
+
+
 def _safe_model_metric_code(model):
     """Stable numeric telemetry representation; model name is not user data."""
     return int.from_bytes(hashlib.blake2s(str(model).encode("utf-8"), digest_size=4).digest(), "big")
@@ -4864,6 +4920,8 @@ def runtime_state_for_tool(name):
 
 
 def stream_agent_response(chat_id, text, cancel_event=None):
+    # Default-off and fire-and-forget: this cannot delay or replace legacy SSE.
+    schedule_semantic_shadow_turn(chat_id, text)
     """One streaming core for text and voice; yields display-safe runtime events."""
     started = time.perf_counter()
     cancel_event = cancel_event or threading.Event()
