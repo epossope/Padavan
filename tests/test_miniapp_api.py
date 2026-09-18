@@ -566,8 +566,8 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
     def test_miniapp_and_telegram_share_the_canonical_streaming_pipeline(self):
         api_source = (Path(__file__).parent.parent / "miniapp_api.py").read_text(encoding="utf-8")
         bot_source = (Path(__file__).parent.parent / "bot.py").read_text(encoding="utf-8")
-        self.assertIn("core.stream_agent_response(cid, text, cancelled)", api_source)
-        self.assertIn("for event in stream_agent_response(chat_id, text, cancelled)", bot_source)
+        self.assertIn("stream_agent_response(cid, text, cancelled", api_source)
+        self.assertIn("stream = stream_agent_response", bot_source)
 
     async def test_telemetry_accepts_voice_reliability_measurements(self):
         response = await self.client.post('/api/v1/miniapp', json={

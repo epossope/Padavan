@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from datetime import datetime
 from semantic_core import SemanticPlan, ReadRequest, ActionRequest
-from semantic_orchestrator import SemanticShadowOrchestrator, ShadowReadExecutor
+from semantic_orchestrator import LegacyExecutionTrace, SemanticShadowOrchestrator, ShadowReadExecutor
 
 class Planner:
     def __init__(self, plan): self.result=plan; self.calls=0
@@ -42,3 +42,49 @@ class ShadowTests(unittest.TestCase):
             tasks=[o.schedule(**{**self.args(),"request_id":str(i)}) for i in range(20)]
             accepted=[x for x in tasks if x]; await asyncio.gather(*accepted); return len(accepted)
         self.assertEqual(2,asyncio.run(run()))
+
+    def test_commit_executes_prerequisite_reads_but_never_actions(self):
+        services = Services()
+        plan = SemanticPlan(
+            "meeting", "commit",
+            reads=[ReadRequest("event", "search", read_id="target")],
+            actions=[ActionRequest("event", "delete", action_id="delete", depends_on=["target"])],
+        )
+        result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(plan), Validator(), services, Assembler(), Responder(), enabled=True,
+        ).run(**self.args()))
+        self.assertEqual("VALIDATED_COMMIT", result.status)
+        self.assertEqual(("OK", 1, 1), (result.read_status, result.read_count, result.action_count))
+        self.assertEqual(1, services.reads)
+
+    def test_final_trace_is_private_and_compared_only_after_finalization(self):
+        trace = LegacyExecutionTrace()
+        trace.record("finance_summary", True)
+        trace.finalize()
+        plan = SemanticPlan("finance", "commit", actions=[ActionRequest("finance", "summary")])
+        result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(plan), Validator(), Services(), Assembler(), Responder(), enabled=True,
+        ).run(**self.args(), legacy_trace=trace))
+        self.assertEqual("MATCH", result.match_class)
+        self.assertEqual(["finance_summary"], trace.tool_names)
+        self.assertEqual((1, 0, True), (trace.success_count, trace.failure_count, trace.finalized))
+        self.assertFalse(hasattr(trace, "args"))
+
+    def test_global_capacity_is_shared_between_owners(self):
+        class Slow(Planner):
+            async def plan(self, *args, **kwargs):
+                await asyncio.sleep(.02)
+                return self.result
+        old_limit, old_count = SemanticShadowOrchestrator._global_limit, SemanticShadowOrchestrator._global_in_flight
+        SemanticShadowOrchestrator._global_limit = 2
+        SemanticShadowOrchestrator._global_in_flight = 0
+        try:
+            async def run():
+                orchestrators = [SemanticShadowOrchestrator(Slow(SemanticPlan("x", "answer")), Validator(), Services(), Assembler(), Responder(), enabled=True) for _ in range(20)]
+                tasks = [item.schedule(**{**self.args(), "trusted_owner": index, "request_id": str(index)}) for index, item in enumerate(orchestrators)]
+                accepted = [item for item in tasks if item]
+                await asyncio.gather(*accepted)
+                return len(accepted)
+            self.assertEqual(2, asyncio.run(run()))
+        finally:
+            SemanticShadowOrchestrator._global_limit, SemanticShadowOrchestrator._global_in_flight = old_limit, old_count

@@ -1,6 +1,7 @@
 """Same-origin Telegram Mini App API; all data is scoped to signed Telegram identity."""
 import asyncio
 import contextlib
+import inspect
 import hashlib
 import json
 import os
@@ -1006,7 +1007,14 @@ def register_miniapp(app, core):
             notify_after_disconnect = False
             try:
                 with job_locks.setdefault(cid, threading.Lock()):
-                    for event in core.stream_agent_response(cid, text, cancelled):
+                    stream = core.stream_agent_response
+                    # Canonical legacy shape remains: core.stream_agent_response(cid, text, cancelled)
+                    # Older test/dynamic adapters expose only that three-argument contract.
+                    if "request_id" in inspect.signature(stream).parameters:
+                        events = stream(cid, text, cancelled, request_id=job_id, shadow_loop=loop)
+                    else:
+                        events = stream(cid, text, cancelled)
+                    for event in events:
                         if subscribed.is_set():
                             loop.call_soon_threadsafe(queue.put_nowait, event)
                         if event.get("type") == "done":

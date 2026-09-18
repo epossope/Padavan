@@ -13,6 +13,8 @@ import hmac
 
 import html
 
+import inspect
+
 import json
 
 import logging
@@ -84,6 +86,10 @@ from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPac
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
+
+# The visible stream executes in a worker thread.  This context contains only
+# the privacy-safe tool outcome trace shared with its background shadow task.
+_LEGACY_SHADOW_TRACE = threading.local()
 
 
 
@@ -4329,8 +4335,16 @@ def execute_tool(chat_id,name,args):
 
     kwargs={k:v for k,v in args.items() if k!="chat_id"}
     started = time.perf_counter()
+    trace = getattr(_LEGACY_SHADOW_TRACE, "trace", None)
     try:
-        return funcs[name](chat_id,**kwargs)
+        result = funcs[name](chat_id,**kwargs)
+        if trace is not None:
+            trace.record(name, bool(isinstance(result, dict) and result.get("ok")))
+        return result
+    except Exception:
+        if trace is not None:
+            trace.record(name, False)
+        raise
     finally:
         elapsed = (time.perf_counter() - started) * 1000
         record_runtime_metric("tool_execution_ms", elapsed)
@@ -4828,12 +4842,39 @@ class _SemanticRuntimeBackend:
         models = chat_model_candidates(self.chat_id)
         if not models: raise RuntimeError("no_model")
         def call():
-            response = request_chat(self.chat_id, models[0], [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ], tools=None, tool_choice="none")
-            if not response.ok: raise RuntimeError("provider_error")
-            data = response.json(); return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            last_error = None
+            for model in models:
+                recovered_key = False
+                for attempt in range(2):
+                    response = None
+                    try:
+                        response = request_chat(self.chat_id, model, [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ], tools=None, tool_choice="none")
+                        if response.ok:
+                            data = response.json()
+                            record_usage(self.chat_id, response_key_source(response, self.chat_id), model, data)
+                            return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                        record_usage(self.chat_id, response_key_source(response, self.chat_id), model, {})
+                        last_error = RuntimeError("provider_error")
+                        if not recovered_key and recover_missing_managed_key(self.chat_id, response):
+                            recovered_key = True
+                            continue
+                        if response.status_code in {429, 500, 501, 502, 503, 504} and attempt == 0:
+                            # This helper runs under asyncio.to_thread(); keep
+                            # retry backoff out of the application event loop.
+                            threading.Event().wait(1.2)
+                            continue
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        break
+                    finally:
+                        if response is not None:
+                            with contextlib.suppress(Exception):
+                                response.close()
+            raise RuntimeError("provider_error") from last_error
         return await asyncio.to_thread(call)
     async def generate_structured(self, *, system_prompt, input_payload, output_schema):
         return await self._generate(system_prompt, {"input": input_payload, "schema": output_schema})
@@ -4865,14 +4906,18 @@ def person_plan_validator():
     return PlanValidator(person_entity_resolver(), observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric)
 
 
-def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None):
+def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None, legacy_trace=None, loop=None):
     """Channel-neutral fire-and-forget shadow hook; all failures are isolated."""
     try:
         orchestrator = get_semantic_shadow_orchestrator(chat_id)
         if orchestrator is None: return None
-        return orchestrator.schedule(trusted_owner=chat_id, request_id=request_id or uuid.uuid4().hex,
+        kwargs = dict(trusted_owner=chat_id, request_id=str(request_id or uuid.uuid4().hex),
             utterance=text, now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
-            conversation_context=conversation_context or {"recent_entities": []})
+            conversation_context=conversation_context or {"recent_entities": []}, legacy_trace=legacy_trace)
+        if loop is not None:
+            async def schedule_on_main_loop(): return orchestrator.schedule(**kwargs)
+            return asyncio.run_coroutine_threadsafe(schedule_on_main_loop(), loop)
+        return orchestrator.schedule(**kwargs)
     except Exception:
         return None
 
@@ -4919,9 +4964,7 @@ def runtime_state_for_tool(name):
     return runtime_state_event(state, text=label, tool=name)
 
 
-def stream_agent_response(chat_id, text, cancel_event=None):
-    # Default-off and fire-and-forget: this cannot delay or replace legacy SSE.
-    schedule_semantic_shadow_turn(chat_id, text)
+def _stream_agent_response_legacy(chat_id, text, cancel_event=None):
     """One streaming core for text and voice; yields display-safe runtime events."""
     started = time.perf_counter()
     cancel_event = cancel_event or threading.Event()
@@ -5113,6 +5156,27 @@ def stream_agent_response(chat_id, text, cancel_event=None):
            "canonical_user_message_id": canonical_user_message_id}
 
 
+def stream_agent_response(chat_id, text, cancel_event=None, *, request_id=None, shadow_loop=None):
+    """Run the unchanged legacy stream while mirroring it safely in shadow."""
+    from semantic_orchestrator import LegacyExecutionTrace
+    trace = LegacyExecutionTrace()
+    previous = getattr(_LEGACY_SHADOW_TRACE, "trace", None)
+    _LEGACY_SHADOW_TRACE.trace = trace
+    # Default-off and fire-and-forget: this cannot delay or replace legacy SSE.
+    schedule_semantic_shadow_turn(
+        chat_id, text, request_id=request_id, legacy_trace=trace, loop=shadow_loop,
+    )
+    try:
+        yield from _stream_agent_response_legacy(chat_id, text, cancel_event)
+    finally:
+        trace.finalize()
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                del _LEGACY_SHADOW_TRACE.trace
+        else:
+            _LEGACY_SHADOW_TRACE.trace = previous
+
+
 def mint_mistral_realtime_session():
     """Mint a model-scoped, short-lived rt_* token without exposing the API key."""
     if not MISTRAL_API_KEY:
@@ -5194,7 +5258,12 @@ async def stream_answer_to_telegram_draft(update, context, text):
 
     def produce():
         try:
-            for event in stream_agent_response(chat_id, text, cancelled):
+            stream = stream_agent_response
+            if "request_id" in inspect.signature(stream).parameters:
+                events = stream(chat_id, text, cancelled, request_id=draft_id, shadow_loop=loop)
+            else:  # Existing embedders/tests that retain the old stream shape.
+                events = stream(chat_id, text, cancelled)
+            for event in events:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -5521,7 +5590,12 @@ async def stream_answer_to_telegram(update, context, text):
 
     def produce():
         try:
-            for event in stream_agent_response(chat_id, text, cancelled):
+            stream = stream_agent_response
+            if "request_id" in inspect.signature(stream).parameters:
+                events = stream(chat_id, text, cancelled, request_id=request_id, shadow_loop=loop)
+            else:  # Existing embedders/tests that retain the old stream shape.
+                events = stream(chat_id, text, cancelled)
+            for event in events:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
