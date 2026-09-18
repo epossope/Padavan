@@ -25,6 +25,7 @@ class ShadowTests(unittest.TestCase):
     def test_read_executes_only_reads_and_commit_never_writes(self):
         services=Services(); read=SemanticShadowOrchestrator(Planner(SemanticPlan("finance","read",reads=[ReadRequest("finance","summary",read_id="f")])),Validator(),services,Assembler(),Responder(),enabled=True)
         result=asyncio.run(read.run(**self.args())); self.assertEqual("READ_COMPLETED",result.status); self.assertEqual(1,services.reads)
+        self.assertEqual(("OK","OK","OK","OK",1,0,[]),(result.planner_status,result.validation_status,result.read_status,result.grounding_status,result.read_count,result.action_count,result.proposed_operations)); self.assertGreater(result.latency_ms,0)
         commit=SemanticShadowOrchestrator(Planner(SemanticPlan("meeting","commit",actions=[ActionRequest("event","create",action_id="e")])),Validator(),services,Assembler(),Responder(),enabled=True)
         result=asyncio.run(commit.run(**self.args())); self.assertEqual("VALIDATED_COMMIT",result.status); self.assertEqual(1,services.reads)
     def test_same_turn_schedules_once(self):
@@ -32,3 +33,12 @@ class ShadowTests(unittest.TestCase):
         async def run():
             a=o.schedule(**self.args()); b=o.schedule(**self.args()); await a; return b
         self.assertIsNone(asyncio.run(run())); self.assertEqual(1,planner.calls)
+
+    def test_capacity_is_bounded_without_backlog(self):
+        class Slow(Planner):
+            async def plan(self,*args,**kwargs): await asyncio.sleep(.02); return self.result
+        o=SemanticShadowOrchestrator(Slow(SemanticPlan("x","answer")),Validator(),Services(),Assembler(),Responder(),enabled=True,max_concurrency=2)
+        async def run():
+            tasks=[o.schedule(**{**self.args(),"request_id":str(i)}) for i in range(20)]
+            accepted=[x for x in tasks if x]; await asyncio.gather(*accepted); return len(accepted)
+        self.assertEqual(2,asyncio.run(run()))

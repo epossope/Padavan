@@ -5,6 +5,7 @@ executor is ``ShadowReadExecutor``; importing it cannot mutate user state.
 """
 from __future__ import annotations
 import asyncio, os, time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 from plan_runtime import ExecutionResult, ExecutionStep, PlanValidationError
@@ -17,7 +18,7 @@ class LegacyExecutionTrace:
 
 @dataclass(slots=True)
 class ShadowRunResult:
-    status: str; disposition: str = ""; planner_status: str = ""; validation_status: str = ""; read_status: str = ""; grounding_status: str = ""; read_count: int = 0; action_count: int = 0; proposed_operations: list[str] = field(default_factory=list); failure_category: str = ""; latency_ms: float = 0.0
+    status: str; disposition: str = ""; planner_status: str = ""; validation_status: str = ""; read_status: str = ""; grounding_status: str = ""; read_count: int = 0; action_count: int = 0; proposed_operations: list[str] = field(default_factory=list); failure_category: str = ""; latency_ms: float = 0.0; match_class: str = ""
     plan: Any = None; evidence: Any = None
 
 class ShadowReadExecutor:
@@ -39,10 +40,10 @@ def compare_shadow(semantic_operations, legacy_trace):
     return "MATCH" if mapped==legacy else "PARTIAL_MATCH" if mapped & legacy else "DIFFERENT_OPERATIONS"
 
 class SemanticShadowOrchestrator:
-    def __init__(self, planner, validator, services, assembler, responder, *, enabled=None, max_concurrency=2, timeout_seconds=20, observer=None, metric_recorder=None):
+    def __init__(self, planner, validator, services, assembler, responder, *, enabled=None, max_concurrency=2, timeout_seconds=20, dedupe_max=2048, observer=None, metric_recorder=None):
         self.planner,self.validator,self.reads,self.assembler,self.responder=planner,validator,ShadowReadExecutor(services),assembler,responder
         self.enabled=(os.getenv("SEMANTIC_SHADOW_ENABLED","0")=="1") if enabled is None else bool(enabled)
-        self.timeout=float(timeout_seconds); self.semaphore=asyncio.Semaphore(max(1,int(max_concurrency))); self.observer,self.metric=observer,metric_recorder; self._scheduled=set(); self._tasks=set()
+        self.timeout=float(timeout_seconds); self.max_concurrency=max(1,int(max_concurrency)); self.semaphore=asyncio.Semaphore(self.max_concurrency); self.observer,self.metric=observer,metric_recorder; self._scheduled=OrderedDict(); self.dedupe_max=max(1,int(dedupe_max)); self._tasks=set()
     def _emit(self,event,**fields):
         try:
             if self.observer:self.observer(event,**fields)
@@ -51,29 +52,38 @@ class SemanticShadowOrchestrator:
         if not self.enabled: return None
         key=(trusted_owner,request_id)
         if key in self._scheduled: return None
-        if self.semaphore.locked() and self.semaphore._value == 0: self._emit("shadow_capacity_skipped"); return None
-        self._scheduled.add(key); task=asyncio.create_task(self.run(trusted_owner=trusted_owner,request_id=request_id,utterance=utterance,now=now,timezone=timezone,conversation_context=conversation_context,memory_context=memory_context,legacy_trace=legacy_trace)); self._tasks.add(task); task.add_done_callback(self._tasks.discard); return task
+        if len(self._tasks) >= self.max_concurrency: self._emit("shadow_capacity_skipped"); return None
+        self._scheduled[key]=None
+        while len(self._scheduled)>self.dedupe_max:self._scheduled.popitem(last=False)
+        task=asyncio.create_task(self.run(trusted_owner=trusted_owner,request_id=request_id,utterance=utterance,now=now,timezone=timezone,conversation_context=conversation_context,memory_context=memory_context,legacy_trace=legacy_trace)); self._tasks.add(task); task.add_done_callback(self._tasks.discard); return task
     async def run(self, *, trusted_owner, request_id, utterance, now, timezone, conversation_context, memory_context=None, legacy_trace=None):
         started=time.perf_counter()
         try:
             async with self.semaphore:
-                return await asyncio.wait_for(self._run(trusted_owner,request_id,utterance,now,timezone,conversation_context,memory_context,legacy_trace),self.timeout)
-        except asyncio.TimeoutError: return ShadowRunResult("TIMEOUT",failure_category="timeout",latency_ms=(time.perf_counter()-started)*1000)
-        except Exception: return ShadowRunResult("PLANNER_FAILED",failure_category="unexpected",latency_ms=(time.perf_counter()-started)*1000)
+                result=await asyncio.wait_for(self._run(trusted_owner,request_id,utterance,now,timezone,conversation_context,memory_context,legacy_trace),self.timeout)
+        except asyncio.TimeoutError: result=ShadowRunResult(status="TIMEOUT",failure_category="timeout")
+        except Exception: result=ShadowRunResult(status="PLANNER_FAILED",failure_category="unexpected")
+        result.latency_ms=(time.perf_counter()-started)*1000
+        self._emit("semantic_shadow_completed",shadow_status=result.status,shadow_disposition=result.disposition,shadow_match_class=result.match_class,shadow_read_count=result.read_count,shadow_action_count=result.action_count,shadow_failure_category=result.failure_category,shadow_total_ms=result.latency_ms)
+        if self.metric:
+            try:self.metric("shadow_total_ms",result.latency_ms)
+            except Exception:pass
+        return result
     async def _run(self, owner, request_id, utterance, now, timezone, context, memory, legacy):
         plan=await self.planner.plan(utterance,now=now,timezone=timezone,conversation_context=context,memory_context=memory)
-        if plan.intent=="planner_failure": return ShadowRunResult("PLANNER_FAILED",plan.disposition,"FAILED",failure_category="planner")
+        if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category="planner")
         operations=[f"{a.domain}.{a.operation}" for a in plan.actions]
-        if plan.disposition=="answer": return ShadowRunResult("ANSWER_ONLY",plan.disposition,"OK",action_count=len(plan.actions),proposed_operations=operations,plan=plan)
-        if plan.disposition=="clarify": return ShadowRunResult("CLARIFICATION",plan.disposition,"OK",proposed_operations=operations,plan=plan)
-        try: validated=self.validator.validate(owner,plan,conversation_context=context,now=now,timezone=timezone,request_id=request_id)
-        except PlanValidationError as exc: return ShadowRunResult("VALIDATION_FAILED",plan.disposition,"FAILED",action_count=len(plan.actions),proposed_operations=operations,failure_category=exc.category,plan=plan)
-        if plan.disposition=="commit": return ShadowRunResult("VALIDATED_COMMIT",plan.disposition,"OK",action_count=len(validated.actions),proposed_operations=operations,plan=plan)
-        try: reads=self.reads.execute(owner,validated)
-        except Exception: return ShadowRunResult("READ_FAILED",plan.disposition,"OK","FAILED",action_count=len(validated.actions),proposed_operations=operations,plan=plan)
+        if plan.disposition=="answer": return ShadowRunResult(status="ANSWER_ONLY",disposition=plan.disposition,planner_status="OK",action_count=len(plan.actions),proposed_operations=operations,plan=plan)
+        if plan.disposition=="clarify": return ShadowRunResult(status="CLARIFICATION",disposition=plan.disposition,planner_status="OK",proposed_operations=operations,match_class="SEMANTIC_CLARIFIED",plan=plan)
+        try: validated=await asyncio.to_thread(self.validator.validate,owner,plan,conversation_context=context,now=now,timezone=timezone,request_id=request_id)
+        except Exception as exc: return ShadowRunResult(status="VALIDATION_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="FAILED",action_count=len(plan.actions),proposed_operations=operations,failure_category=getattr(exc,"category","validation_error"),plan=plan)
+        match=compare_shadow(operations,legacy)
+        if plan.disposition=="commit": return ShadowRunResult(status="VALIDATED_COMMIT",disposition=plan.disposition,planner_status="OK",validation_status="OK",action_count=len(validated.actions),proposed_operations=operations,match_class=match,plan=plan)
+        try: reads=await asyncio.to_thread(self.reads.execute,owner,validated)
+        except Exception: return ShadowRunResult(status="READ_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="FAILED",action_count=len(validated.actions),proposed_operations=operations,match_class=match,plan=plan)
         try:
             evidence=self.assembler.build(validated,reads,semantic_memory=memory)
             response=await self.responder.respond(utterance,evidence)
             status="READ_COMPLETED" if response.status=="OK" else "GROUNDING_FAILED"
-            return ShadowRunResult(status,plan.disposition,"OK","OK", "OK" if status=="READ_COMPLETED" else "FAILED",len(reads.reads),len(validated.actions),operations,plan=plan,evidence=evidence)
-        except Exception: return ShadowRunResult("GROUNDING_FAILED",plan.disposition,"OK","OK","FAILED",len(reads.reads),len(validated.actions),operations,plan=plan)
+            return ShadowRunResult(status=status,disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="OK", grounding_status="OK" if status=="READ_COMPLETED" else "FAILED",read_count=len(reads.reads),action_count=len(validated.actions),proposed_operations=operations,match_class=match,plan=plan,evidence=evidence)
+        except Exception: return ShadowRunResult(status="GROUNDING_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="OK",grounding_status="FAILED",read_count=len(reads.reads),action_count=len(validated.actions),proposed_operations=operations,match_class=match,plan=plan)

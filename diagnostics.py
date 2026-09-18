@@ -22,6 +22,9 @@ class DiagnosticsJournal:
         "miniapp_job_count", "active_stream_count", "activity", "instance_id", "pid",
         "intent", "disposition", "entity_count", "read_count", "action_count",
         "failure_category", "planner_latency_ms",
+        "shadow_status", "shadow_disposition", "shadow_match_class",
+        "shadow_read_count", "shadow_action_count", "shadow_failure_category",
+        "shadow_total_ms", "plan_validation_ms", "plan_execution_ms",
     }
 
     def __init__(self, directory: Path, max_bytes=5 * 1024 * 1024, backups=2):
