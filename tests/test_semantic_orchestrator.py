@@ -25,7 +25,7 @@ class ShadowTests(unittest.TestCase):
     def test_read_executes_only_reads_and_commit_never_writes(self):
         services=Services(); read=SemanticShadowOrchestrator(Planner(SemanticPlan("finance","read",reads=[ReadRequest("finance","summary",read_id="f")])),Validator(),services,Assembler(),Responder(),enabled=True)
         result=asyncio.run(read.run(**self.args())); self.assertEqual("READ_COMPLETED",result.status); self.assertEqual(1,services.reads)
-        self.assertEqual(("OK","OK","OK","OK",1,0,[]),(result.planner_status,result.validation_status,result.read_status,result.grounding_status,result.read_count,result.action_count,result.proposed_operations)); self.assertGreater(result.latency_ms,0)
+        self.assertEqual(("OK","OK","OK","OK",1,0,["finance.summary"]),(result.planner_status,result.validation_status,result.read_status,result.grounding_status,result.read_count,result.action_count,result.proposed_operations)); self.assertGreater(result.latency_ms,0)
         commit=SemanticShadowOrchestrator(Planner(SemanticPlan("meeting","commit",actions=[ActionRequest("event","create",action_id="e")])),Validator(),services,Assembler(),Responder(),enabled=True)
         result=asyncio.run(commit.run(**self.args())); self.assertEqual("VALIDATED_COMMIT",result.status); self.assertEqual(1,services.reads)
     def test_same_turn_schedules_once(self):
@@ -57,11 +57,11 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(("OK", 1, 1), (result.read_status, result.read_count, result.action_count))
         self.assertEqual(1, services.reads)
 
-    def test_final_trace_is_private_and_compared_only_after_finalization(self):
+    def test_final_read_trace_comparison_uses_canonical_read_operations(self):
         trace = LegacyExecutionTrace()
         trace.record("finance_summary", True)
         trace.finalize()
-        plan = SemanticPlan("finance", "commit", actions=[ActionRequest("finance", "summary")])
+        plan = SemanticPlan("finance", "read", reads=[ReadRequest("finance", "summary", read_id="finance")])
         result = asyncio.run(SemanticShadowOrchestrator(
             Planner(plan), Validator(), Services(), Assembler(), Responder(), enabled=True,
         ).run(**self.args(), legacy_trace=trace))
@@ -69,6 +69,23 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(["finance_summary"], trace.tool_names)
         self.assertEqual((1, 0, True), (trace.success_count, trace.failure_count, trace.finalized))
         self.assertFalse(hasattr(trace, "args"))
+
+        event_trace = LegacyExecutionTrace()
+        event_trace.record("event_search", True)
+        event_trace.finalize()
+        event_plan = SemanticPlan("meeting", "read", reads=[ReadRequest("event", "search", read_id="event")])
+        event_result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(event_plan), Validator(), Services(), Assembler(), Responder(), enabled=True,
+        ).run(**self.args(), legacy_trace=event_trace))
+        self.assertEqual("MATCH", event_result.match_class)
+
+        different_trace = LegacyExecutionTrace()
+        different_trace.record("task_list", True)
+        different_trace.finalize()
+        different_result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(plan), Validator(), Services(), Assembler(), Responder(), enabled=True,
+        ).run(**self.args(), legacy_trace=different_trace))
+        self.assertEqual("DIFFERENT_OPERATIONS", different_result.match_class)
 
     def test_global_capacity_is_shared_between_owners(self):
         class Slow(Planner):

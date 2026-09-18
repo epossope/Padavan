@@ -55,7 +55,13 @@ class ShadowReadExecutor:
 def compare_shadow(semantic_operations, legacy_trace):
     legacy=set(legacy_trace.tool_names if legacy_trace else [])
     if not semantic_operations: return "LEGACY_NO_TOOL" if not legacy else "NOT_COMPARABLE"
-    table={"finance.summary":"finance_summary","person.upsert":"person_upsert","event.create":"event_create","reminder.create":"set_reminder","transaction.create":"add_expense"}
+    table={
+        "finance.summary":"finance_summary", "transaction.list":"finance_list_transactions",
+        "task.list":"task_list", "reminder.list":"reminder_list", "note.list":"note_list",
+        "event.list":"event_list", "event.search":"event_search",
+        "person.upsert":"person_upsert", "event.create":"event_create",
+        "reminder.create":"set_reminder", "transaction.create":"add_expense",
+    }
     mapped={table.get(x,x) for x in semantic_operations}
     return "MATCH" if mapped==legacy else "PARTIAL_MATCH" if mapped & legacy else "DIFFERENT_OPERATIONS"
 
@@ -115,7 +121,10 @@ class SemanticShadowOrchestrator:
     async def _run(self, owner, request_id, utterance, now, timezone, context, memory, legacy):
         plan=await self.planner.plan(utterance,now=now,timezone=timezone,conversation_context=context,memory_context=memory)
         if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category="planner")
-        operations=[f"{a.domain}.{a.operation}" for a in plan.actions]
+        # This list is diagnostic-only.  Reads must be represented too: the
+        # legacy path often executes exactly one canonical read tool.
+        operations=[f"{r.domain}.{r.operation}" for r in plan.reads]
+        operations += [f"{a.domain}.{a.operation}" for a in plan.actions]
         if plan.disposition=="answer": return ShadowRunResult(status="ANSWER_ONLY",disposition=plan.disposition,planner_status="OK",action_count=len(plan.actions),proposed_operations=operations,plan=plan)
         if plan.disposition=="clarify": return ShadowRunResult(status="CLARIFICATION",disposition=plan.disposition,planner_status="OK",proposed_operations=operations,match_class="SEMANTIC_CLARIFIED",plan=plan)
         try: validated=await asyncio.to_thread(self.validator.validate,owner,plan,conversation_context=context,now=now,timezone=timezone,request_id=request_id)
