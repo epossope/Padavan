@@ -4886,7 +4886,12 @@ class _SemanticRuntimeBackend:
         except Exception:
             return await self._generate(system_prompt, payload)
     async def generate_grounded(self, *, system_prompt, question, evidence):
-        return await self._generate(system_prompt, {"question": question, "evidence": evidence})
+        payload = {"question": question, "evidence": evidence}
+        structured = {"type": "json_schema", "json_schema": {"name": "grounded_response", "strict": True, "schema": __import__("grounded_response").GROUNDED_OUTPUT_SCHEMA}}
+        try:
+            return await self._generate(system_prompt, payload, response_format=structured)
+        except Exception:
+            return await self._generate(system_prompt, payload)
 
 
 _SEMANTIC_SHADOWS = {}

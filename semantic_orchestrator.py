@@ -143,5 +143,5 @@ class SemanticShadowOrchestrator:
             evidence=self.assembler.build(validated,reads,semantic_memory=memory)
             response=await self.responder.respond(utterance,evidence)
             status="READ_COMPLETED" if response.status=="OK" else "GROUNDING_FAILED"
-            return ShadowRunResult(status=status,disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="OK", grounding_status="OK" if status=="READ_COMPLETED" else "FAILED",read_count=len(reads.reads),action_count=len(validated.actions),proposed_operations=operations,plan=plan,evidence=evidence)
+            return ShadowRunResult(status=status,disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="OK", grounding_status="OK" if status=="READ_COMPLETED" else "FAILED",read_count=len(reads.reads),action_count=len(validated.actions),proposed_operations=operations,failure_category=getattr(response,"failure_category","") if status=="GROUNDING_FAILED" else "",plan=plan,evidence=evidence)
         except Exception: return ShadowRunResult(status="GROUNDING_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="OK",grounding_status="FAILED",read_count=len(reads.reads),action_count=len(validated.actions),proposed_operations=operations,plan=plan)

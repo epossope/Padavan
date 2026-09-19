@@ -16,6 +16,7 @@ EXACT_ID_KEYS = frozenset({"id", "person_id", "event_id", "task_id", "reminder_i
 WRITE_OPS = frozenset({"create", "upsert", "update", "delete", "cancel", "overwrite", "replace", "resolve_or_create"})
 DESTRUCTIVE = frozenset({"delete", "cancel", "overwrite", "replace", "update"})
 READ_OPERATIONS = {"person": {"resolve", "interactions_list"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
+READ_FILTERS = {("person", "resolve"): set(), ("person", "interactions_list"): {"limit"}, ("event", "list"): {"date_from", "date_to", "status", "limit"}, ("event", "search"): {"query", "date_from", "date_to", "limit"}, ("finance", "summary"): {"period", "date_from", "date_to"}, ("transaction", "list"): {"period", "date_from", "date_to", "kind", "query", "limit", "offset"}, ("task", "list"): {"scope", "query", "limit"}, ("reminder", "list"): {"scope", "date_from", "date_to", "query", "include_acknowledged", "limit"}, ("note", "list"): {"query", "date", "limit"}, ("note", "search"): {"query"}}
 WRITE_OPERATIONS = {"person": {"upsert", "resolve_or_create"}, "event": {"create", "update", "delete", "cancel"}, "reminder": {"create"}, "transaction": {"create"}, "note": {"create"}, "task": {"create"}}
 
 
@@ -153,6 +154,7 @@ class PlanValidator:
             if not item.read_id or item.read_id in namespace: raise PlanValidationError("invalid_read_id")
             if _has_exact_id(item.filters): raise PlanValidationError("model_exact_id")
             if item.domain not in READ_OPERATIONS or item.operation not in READ_OPERATIONS[item.domain]: raise PlanValidationError("unsupported_read")
+            if set(item.filters) - READ_FILTERS[(item.domain, item.operation)]: raise PlanValidationError("unsupported_read_filter")
             if any(_has_exact_id(ref.attributes) for ref in item.entity_refs): raise PlanValidationError("model_exact_id")
             namespace.add(item.read_id)
             reads.append(ValidatedRead(item.read_id, item.domain, item.operation, dict(item.filters), [resolve(r, False) for r in item.entity_refs]))
@@ -169,7 +171,10 @@ class PlanValidator:
                 allowed = {"name","relationship","birthday","age","home_city","current_location","projects","notes","aliases","groups","tags"}
                 if set(fields) - allowed: raise PlanValidationError("unsupported_person_field")
             refs = [resolve(r, r.mention.casefold().strip() in create_mentions) for r in item.entity_refs]
-            if item.domain == "event" and item.operation == "create": fields = _time_fields(fields, timezone, event=True)
+            if item.domain == "event" and item.operation == "create":
+                if fields.get("kind", "other") in {"meeting", "call", "appointment", "lesson"} and fields.get("local_date") and not fields.get("local_datetime") and not fields.get("all_day"):
+                    raise PlanValidationError("missing_time")
+                fields = _time_fields(fields, timezone, event=True)
             if item.domain == "reminder" and item.operation == "create": fields = _time_fields(fields, timezone, event=False)
             if item.domain == "event" and item.operation == "create" and (not str(fields.get("title") or "").strip() or fields.get("kind", "other") not in {"meeting", "call", "appointment", "lesson", "travel", "personal", "other"}): raise PlanValidationError("invalid_event_fields")
             if item.domain == "transaction" and item.operation == "create":

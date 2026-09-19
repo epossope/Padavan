@@ -6,6 +6,7 @@ from typing import Any, Mapping, Protocol
 from semantic_core import EvidenceItem, EvidencePacket
 
 PROMPT = """Return JSON only. User-specific facts require supplied evidence IDs. exact_current outranks historical, memory and conversation. exact-empty domains mean no current record may be resurrected. Never invent personal facts or mention internal IDs."""
+GROUNDED_OUTPUT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["claims", "confidence", "clarification"], "properties": {"claims": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["text", "claim_type", "evidence_ids"], "properties": {"text": {"type": "string"}, "claim_type": {"enum": ["personal_fact", "general_text", "clarification"]}, "evidence_ids": {"type": "array", "items": {"type": "string"}}}}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "clarification": {"type": "string"}}}
 MAX_ITEMS, MAX_TEXT, MAX_RESPONSE = 64, 1200, 64 * 1024
 PERSONAL = {"personal_fact"}
 EXACT_KEYS = {"id","person_id","event_id","task_id","reminder_id","transaction_id","note_id","file_id","project_id","source_turn_id","resolved_id","chat_id","owner_id","user_id"}
@@ -18,7 +19,7 @@ class GroundedClaim:
     text: str; claim_type: str = "general_text"; evidence_ids: list[str] = field(default_factory=list)
 @dataclass(slots=True)
 class GroundedResponse:
-    claims: list[GroundedClaim] = field(default_factory=list); confidence: float = 0.0; clarification: str = ""; status: str = "OK"
+    claims: list[GroundedClaim] = field(default_factory=list); confidence: float = 0.0; clarification: str = ""; status: str = "OK"; failure_category: str = ""
     def render(self) -> str: return " ".join(c.text for c in self.claims if c.text).strip() or self.clarification
 
 class GroundingError(ValueError):
@@ -114,7 +115,7 @@ class GroundedResponder:
             response=GroundedResponse(claims,confidence,str(data.get("clarification") or "")); self._emit("grounded_response_completed",claim_count=len(claims)); return response
         except Exception as exc:
             category=exc.category if isinstance(exc,GroundingError) else "provider_error"; self._emit("grounded_response_invalid" if isinstance(exc,GroundingError) else "grounded_response_failed",failure_category=category)
-            empty=", ".join(packet.exact_empty_domains); return GroundedResponse([],0,"В текущих данных ничего не найдено." if empty else "Не удалось надёжно сформировать ответ.","NO_DATA")
+            empty=", ".join(packet.exact_empty_domains); return GroundedResponse([],0,"В текущих данных ничего не найдено." if empty else "Не удалось надёжно сформировать ответ.","NO_DATA",category)
         finally:
             if self.metric:
                 try:self.metric("grounded_response_ms",(time.perf_counter()-started)*1000)
