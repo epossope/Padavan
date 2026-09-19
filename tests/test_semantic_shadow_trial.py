@@ -88,6 +88,17 @@ class SemanticShadowTrialTests(unittest.TestCase):
         self.assertEqual("WARN", verdict)
         self.assertTrue(notes)
 
+    def test_case_two_accepts_each_canonical_event_read_only_when_completed(self):
+        case = trial.CASES[1]
+        for operation in ("event.list", "event.search"):
+            with self.subTest(operation=operation):
+                semantic = _semantic(disposition="read", operations=[operation], status="READ_COMPLETED")
+                semantic["read_count"] = 1
+                self.assertEqual(("PASS", []), trial.verdict_for(case, semantic, "MATCH"))
+        incomplete = _semantic(disposition="read", operations=["event.list"], status="VALIDATED_COMMIT")
+        incomplete["read_count"] = 0
+        self.assertEqual("FAIL", trial.verdict_for(case, incomplete, "MATCH")[0])
+
     def test_semantic_mutation_fails_and_acceptance_blocks_canary(self):
         case = trial.CASES[0]
         verdict, _ = trial.verdict_for(case, _semantic(zero_write=False), "MATCH")

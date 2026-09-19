@@ -53,6 +53,7 @@ class TrialCase:
     required_operation: str = ""
     required_operations_any: tuple[str, ...] = ()
     exact_evidence: bool = False
+    require_completed_read: bool = False
     destructive: bool = False
     general_knowledge: bool = False
     require_clarification: bool = False
@@ -61,7 +62,7 @@ class TrialCase:
 
 CASES = (
     TrialCase(1, "Завтра в 15 встреча с Иваном", "commit meeting proposal; no shadow write", ("commit",), "event.create"),
-    TrialCase(2, "Когда я встречаюсь с Иваном?", "exact event read and grounded answer", ("read",), required_operations_any=("event.list", "event.search"), exact_evidence=True),
+    TrialCase(2, "Когда я встречаюсь с Иваном?", "exact event read and grounded answer", ("read",), required_operations_any=("event.list", "event.search"), exact_evidence=True, require_completed_read=True),
     TrialCase(3, "Что мы с ним обсуждали?", "resolve Иван and read interaction history", ("read",), "person.interactions_list", True, uses_referent=True),
     TrialCase(4, "Потратил 450 рублей на кофе", "commit transaction proposal; no shadow write", ("commit",), "transaction.create"),
     TrialCase(5, "Сколько я потратил сегодня?", "exact finance summary and grounded answer", ("read",), "finance.summary", True),
@@ -285,6 +286,8 @@ def verdict_for(case: TrialCase, semantic: dict[str, Any], comparison: str) -> t
         return "FAIL", ["unexpected semantic disposition"]
     if case.required_operations_any and not set(case.required_operations_any).intersection(semantic["operations"]):
         return "FAIL", ["required operation absent"]
+    if case.require_completed_read and (semantic["status"] != "READ_COMPLETED" or semantic["read_count"] < 1):
+        return "FAIL", ["required exact read did not complete"]
     if case.required_operation and case.required_operation not in semantic["operations"]:
         return "FAIL", ["required structural operation absent"]
     if case.exact_evidence and not semantic["exact_evidence"]:

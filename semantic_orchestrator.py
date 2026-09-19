@@ -120,7 +120,7 @@ class SemanticShadowOrchestrator:
         return compare_shadow(result.proposed_operations, legacy_trace)
     async def _run(self, owner, request_id, utterance, now, timezone, context, memory, legacy):
         plan=await self.planner.plan(utterance,now=now,timezone=timezone,conversation_context=context,memory_context=memory)
-        if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category=plan.planner_failure_category or "planner")
+        if plan.intent=="planner_failure": return ShadowRunResult(status="PLANNER_FAILED",disposition=plan.disposition,planner_status="FAILED",failure_category=plan.planner_failure_category or "planner",plan=plan)
         # This list is diagnostic-only.  Reads must be represented too: the
         # legacy path often executes exactly one canonical read tool.
         operations=[f"{r.domain}.{r.operation}" for r in plan.reads]
@@ -128,7 +128,11 @@ class SemanticShadowOrchestrator:
         if plan.disposition=="answer": return ShadowRunResult(status="ANSWER_ONLY",disposition=plan.disposition,planner_status="OK",action_count=len(plan.actions),proposed_operations=operations,plan=plan)
         if plan.disposition=="clarify": return ShadowRunResult(status="CLARIFICATION",disposition=plan.disposition,planner_status="OK",proposed_operations=operations,match_class="SEMANTIC_CLARIFIED",plan=plan)
         try: validated=await asyncio.to_thread(self.validator.validate,owner,plan,conversation_context=context,now=now,timezone=timezone,request_id=request_id)
-        except Exception as exc: return ShadowRunResult(status="VALIDATION_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="FAILED",action_count=len(plan.actions),proposed_operations=operations,failure_category=getattr(exc,"category","validation_error"),plan=plan)
+        except Exception as exc:
+            category = getattr(exc, "category", "validation_error")
+            if category == "missing_time":
+                return ShadowRunResult(status="CLARIFICATION", disposition="clarify", planner_status="OK", validation_status="FAILED", action_count=len(plan.actions), proposed_operations=operations, failure_category=category, plan=plan)
+            return ShadowRunResult(status="VALIDATION_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="FAILED",action_count=len(plan.actions),proposed_operations=operations,failure_category=category,plan=plan)
         if plan.disposition=="commit":
             # A proposed commit may depend on trusted lookup results.  Read
             # those prerequisites, but never pass actions to any executor.

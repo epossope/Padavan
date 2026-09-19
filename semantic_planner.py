@@ -58,6 +58,18 @@ DOMAIN_OPERATIONS: dict[str, frozenset[str]] = {
 READ_OPERATIONS = frozenset({"resolve", "get", "list", "search", "summary", "interactions_list"})
 CANONICAL_READ_PAIRS = frozenset({("person","resolve"),("person","interactions_list"),("event","list"),("event","search"),("finance","summary"),("transaction","list"),("task","list"),("reminder","list"),("note","list"),("note","search")})
 CANONICAL_ACTION_PAIRS = frozenset({("person","upsert"),("event","create"),("event","update"),("event","delete"),("event","cancel"),("transaction","create"),("reminder","create"),("task","create"),("note","create")})
+READ_FILTERS: dict[tuple[str, str], frozenset[str]] = {
+    ("person", "resolve"): frozenset(),
+    ("person", "interactions_list"): frozenset({"limit"}),
+    ("event", "list"): frozenset({"date_from", "date_to", "status", "limit"}),
+    ("event", "search"): frozenset({"query", "date_from", "date_to", "limit"}),
+    ("finance", "summary"): frozenset({"period", "date_from", "date_to"}),
+    ("transaction", "list"): frozenset({"period", "date_from", "date_to", "kind", "query", "limit", "offset"}),
+    ("task", "list"): frozenset({"scope", "query", "limit"}),
+    ("reminder", "list"): frozenset({"scope", "date_from", "date_to", "query", "include_acknowledged", "limit"}),
+    ("note", "list"): frozenset({"query", "date", "limit"}),
+    ("note", "search"): frozenset({"query"}),
+}
 DESTRUCTIVE_OPERATIONS = frozenset({"delete", "cancel", "overwrite", "replace"})
 OWNER_KEYS = frozenset({"chat_id", "user_id", "owner_id"})
 CONTEXT_ID_KEYS = OWNER_KEYS | frozenset({"id", "person_id", "resolved_id"})
@@ -74,15 +86,9 @@ MAX_VALUE_STRING = 1000
 MAX_CLARIFICATION = 600
 
 
-PLANNER_PROMPT = """You are Noema's semantic planner. Understand the user's intent; do not answer it or execute anything.
-Return only JSON matching the supplied schema. Plan exact reads and semantic actions, but never invent or copy database IDs or owner identifiers.
-User-specific facts require exact reads; current exact state outranks memory and conversation. Never invent missing personal facts.
-Only explicit committed requests may produce actions. Uncertainty or missing required meaning must produce disposition=clarify with a useful question.
-Explicit create/update/delete/save/remind/spend requests are commit. Questions about user state are read. General/world knowledge without personal state is answer. Missing required execution data is clarify. A deletion is commit, with event.search and a dependency before its destructive action.
-First-person references mean the trusted owner: never create a person reference or person.resolve for them. A user's spending question uses finance.summary. Discussion history with a person uses person.interactions_list; meeting questions use event.list or event.search. Keep pronouns such as "с ним" unchanged for the trusted contextual resolver, but use a named person in canonical/base form where unambiguous. Store unsupported person facts such as profession in notes; use home_city for an unambiguous "from <city>" fact. Delete/cancel/update requires event.search with read_id and an event action with action_id and depends_on containing that exact read_id.
-Keep relative/fuzzy time as semantic fields when it cannot be normalized without guessing. Use now and timezone supplied in input.
-Pronouns remain mention text (for example "с ним"); a later trusted resolver handles identity.
-Deletion/cancellation must first plan a target read and make the destructive action depend on that resolution. JSON only."""
+PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only JSON matching the schema; never invent database IDs or owner identifiers.
+User facts need exact reads; exact current state outranks memory/conversation. Only explicit committed requests produce actions. Uncertainty or missing execution data is clarify. Create/update/delete/save/remind/spend is commit; user-state questions are read; general knowledge is answer.
+First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Delete/cancel/update requires event.search with read_id and an event action with action_id depending on that read_id. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
 
 # One model-visible contract, deliberately independent of user phrasing.
 OPERATION_CONTRACT = {
@@ -104,6 +110,35 @@ OPERATION_CONTRACT = {
         "event.delete": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.cancel": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.update": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]},
     },
 }
+
+
+def _read_schema(domain: str, operation: str) -> dict[str, Any]:
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["domain", "operation"],
+        "properties": {
+            "domain": {"const": domain}, "operation": {"const": operation},
+            "read_id": {"type": "string"},
+            "filters": {"type": "object", "additionalProperties": False,
+                        "properties": {key: {} for key in sorted(READ_FILTERS[(domain, operation)])}},
+            "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
+        },
+    }
+
+
+def _action_schema(domain: str, operation: str) -> dict[str, Any]:
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["domain", "operation"],
+        "properties": {
+            "domain": {"const": domain}, "operation": {"const": operation},
+            "fields": {"type": "object"},
+            "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
+            "depends_on": {"type": "array", "items": {"type": "string"}},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "action_id": {"type": "string"},
+        },
+    }
 
 
 OUTPUT_SCHEMA: dict[str, Any] = {
@@ -132,29 +167,10 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             },
         },
         "read": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["domain", "operation"],
-            "properties": {
-                "domain": {"enum": sorted(DOMAIN_OPERATIONS)}, "read_id": {"type": "string"},
-                "operation": {"enum": sorted({item[1] for item in CANONICAL_READ_PAIRS})},
-                "filters": {"type": "object"},
-                "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
-            },
+            "oneOf": [_read_schema(domain, operation) for domain, operation in sorted(CANONICAL_READ_PAIRS)],
         },
         "action": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["domain", "operation"],
-            "properties": {
-                "domain": {"enum": sorted(DOMAIN_OPERATIONS)},
-                "operation": {"enum": sorted({item[1] for item in CANONICAL_ACTION_PAIRS})},
-                "fields": {"type": "object"},
-                "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
-                "depends_on": {"type": "array", "items": {"type": "string"}},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "action_id": {"type": "string"},
-            },
+            "oneOf": [_action_schema(domain, operation) for domain, operation in sorted(CANONICAL_ACTION_PAIRS)],
         },
     },
 }
@@ -272,6 +288,8 @@ def _read(value: Any) -> ReadRequest:
     filters = _bounded_value(data.get("filters", {}))
     if not isinstance(filters, dict):
         raise _invalid("filters_type")
+    if set(filters) - READ_FILTERS[(domain, operation)]:
+        raise _invalid("unsupported_read_filter")
     return ReadRequest(
         domain=domain,
         operation=operation,

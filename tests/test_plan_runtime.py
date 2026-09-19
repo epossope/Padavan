@@ -21,9 +21,9 @@ class PlanRuntimeTests(unittest.TestCase):
     def validate(self, plan, request="request-1", context=None):
         return self.validator.validate(self.owner, plan, conversation_context=context or {}, now=datetime.now(), timezone="Europe/Moscow", request_id=request)
 
-    def test_meeting_alias_context_date_only_and_replay(self):
+    def test_all_day_event_alias_context_date_only_and_replay(self):
         person = bot.person_upsert(self.owner, "Иван Петров", aliases=["Ваня"])
-        plan = SemanticPlan("meeting", "commit", actions=[ActionRequest("event", "create", fields={"title": "Встреча", "local_date": "2026-09-20"}, entity_refs=[EntityReference("person", "Ваня")], action_id="event")])
+        plan = SemanticPlan("event", "commit", actions=[ActionRequest("event", "create", fields={"title": "Выходной", "local_date": "2026-09-20", "all_day": True}, entity_refs=[EntityReference("person", "Ваня")], action_id="event")])
         validated = self.validate(plan)
         self.assertEqual(person["id"], validated.actions[0].entity_refs[0].resolved_id)
         first = self.executor.execute(validated, timezone_name="Europe/Moscow")
@@ -39,6 +39,14 @@ class PlanRuntimeTests(unittest.TestCase):
         result = self.executor.execute(self.validate(SemanticPlan("meeting", "commit", actions=[event, reminder]), context={"recent_entities": [{"type": "person", "id": person["id"]}]}), timezone_name="Europe/Moscow")
         self.assertEqual("EXECUTED", result.status)
         with bot.conn() as c: self.assertEqual(result.actions[0].result["id"], c.execute("SELECT event_id FROM reminders WHERE id=?", (result.actions[1].result["id"],)).fetchone()["event_id"])
+
+    def test_meeting_with_existing_person_needs_no_person_upsert(self):
+        person = bot.person_upsert(self.owner, "Иван")
+        event = ActionRequest("event", "create", fields={"title": "Встреча", "kind": "meeting", "local_datetime": "2026-09-20T15:00:00"}, entity_refs=[EntityReference("person", "Иван")], action_id="event")
+        validated = self.validate(SemanticPlan("meeting", "commit", actions=[event]))
+        self.assertEqual(["event"], [item.domain for item in validated.actions])
+        self.assertEqual(person["id"], validated.actions[0].entity_refs[0].resolved_id)
+        self.assertEqual(1, len(bot.get_people(self.owner)["people"]))
 
     def test_rejects_model_ids_dependencies_ambiguity_and_preflight(self):
         foreign = bot.person_upsert(self.other, "Иван")
@@ -81,6 +89,12 @@ class PlanRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "missing_time"):
             self.validate(plan)
         self.assertEqual([], bot.get_people(self.owner)["people"])
+
+    def test_date_only_meeting_fails_before_execution(self):
+        plan = SemanticPlan("meeting", "commit", actions=[ActionRequest("event", "create", fields={"title": "Встреча", "kind": "meeting", "local_date": "2026-09-20"}, action_id="event")])
+        with self.assertRaisesRegex(PlanValidationError, "missing_time"):
+            self.validate(plan)
+        self.assertEqual(0, bot.event_list(self.owner)["count"])
 
     def test_execution_metric_is_safe(self):
         metrics = []

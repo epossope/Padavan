@@ -3,7 +3,7 @@ import json
 import unittest
 from datetime import datetime
 
-from semantic_planner import PLANNER_PROMPT, SemanticPlanner, parse_semantic_plan
+from semantic_planner import OUTPUT_SCHEMA, PLANNER_PROMPT, SemanticPlanner, parse_semantic_plan
 
 
 NOW = datetime.fromisoformat("2026-09-17T10:00:00+03:00")
@@ -50,18 +50,10 @@ class FakePlannerBackend:
 
 MEETING_ACTIONS = [
     action(
-        "person",
-        "upsert",
-        fields={"name": "Иван"},
-        entity_refs=[entity("person", "Иван")],
-        action_id="resolve_person",
-    ),
-    action(
         "event",
         "create",
         fields={"kind": "meeting", "title": "Встреча с Иваном", "local_datetime": "2026-09-18T15:00:00"},
         entity_refs=[entity("person", "Иван")],
-        depends_on=["resolve_person"],
         action_id="create_event",
     ),
 ]
@@ -136,7 +128,7 @@ NATURAL_LANGUAGE_CASES = {
     "Сколько ушло на такси за неделю?": plan(
         "expense_summary",
         "read",
-        reads=[read("finance", "summary", filters={"category": "такси", "period": "week"})],
+        reads=[read("finance", "summary", filters={"period": "7_days"})],
     ),
     "Напомни позвонить маме завтра в 12.": plan(
         "create_reminder",
@@ -150,6 +142,11 @@ NATURAL_LANGUAGE_CASES = {
                 entity_refs=[entity("person", "маме")],
             )
         ],
+    ),
+    "Напомни завтра в 9 позвонить": plan(
+        "create_reminder",
+        "commit",
+        actions=[action("reminder", "create", fields={"title": "Позвонить", "local_datetime": "2026-09-18T09:00:00"})],
     ),
     "Запиши: сервер переехал на новый IP.": plan(
         "save_note",
@@ -185,6 +182,10 @@ NATURAL_LANGUAGE_CASES = {
         entities=[entity("person", "Иван")],
         clarification="Что запланировать с Иваном на пятницу?",
     ),
+    "В пятницу встреча с Иваном": plan(
+        "missing_meeting_time", "clarify", entities=[entity("person", "Иван")],
+        clarification="Во сколько встреча с Иваном в пятницу?",
+    ),
     "Кто такой Иван Грозный?": plan(
         "general_knowledge_question", "answer", entities=[entity("knowledge", "Иван Грозный")]
     ),
@@ -217,7 +218,7 @@ class SemanticPlannerNaturalLanguageTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(all(item.intent == "schedule_event" and item.disposition == "commit" for item in equivalent))
         self.assertTrue(all(item.entities[0].mention == "Иван" for item in equivalent))
-        self.assertTrue(all([request.domain for request in item.actions] == ["person", "event"] for item in equivalent))
+        self.assertTrue(all([request.domain for request in item.actions] == ["event"] for item in equivalent))
 
         contextual = results["Он завтра сможет в четыре, поставь встречу."]
         self.assertEqual(contextual.entities[0].mention, "Он")
@@ -231,14 +232,19 @@ class SemanticPlannerNaturalLanguageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results["Потратил 850 рублей на такси."].actions[0].domain, "transaction")
         self.assertEqual(results["Сколько ушло на такси за неделю?"].reads[0].domain, "finance")
         self.assertEqual(results["Напомни позвонить маме завтра в 12."].actions[0].domain, "reminder")
+        reminder = results["Напомни завтра в 9 позвонить"]
+        self.assertEqual(("commit", "reminder", "create"), (reminder.disposition, reminder.actions[0].domain, reminder.actions[0].operation))
         self.assertEqual(results["Запиши: сервер переехал на новый IP."].actions[0].domain, "note")
         destructive = results["Удали встречу с Иваном завтра."]
         self.assertTrue(destructive.reads)
         self.assertTrue(destructive.actions[0].depends_on)
         self.assertEqual(results["Да"].actions, [])
         self.assertEqual(results["В пятницу Иван."].disposition, "clarify")
+        self.assertEqual(results["В пятницу встреча с Иваном"].disposition, "clarify")
         self.assertEqual(results["Кто такой Иван Грозный?"].actions, [])
         self.assertEqual(results["Создай человека Иван"].actions[0].operation, "upsert")
+        explicit_fact = results["Познакомился с Артёмом, он дизайнер."]
+        self.assertEqual(("person", "upsert"), (explicit_fact.actions[0].domain, explicit_fact.actions[0].operation))
 
     async def test_time_and_context_are_supplied_without_exact_ids(self):
         backend = FakePlannerBackend({"С ним завтра встреча.": plan("possible_event", "answer")})
@@ -367,6 +373,26 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with self.assertRaisesRegex(ValueError, "unknown_operation"):
                     parse_semantic_plan(unsafe)
+
+    def test_pair_specific_schema_and_parser_reject_cross_domain_operations(self):
+        action_schemas = OUTPUT_SCHEMA["$defs"]["action"]["oneOf"]
+        transaction_create = next(item for item in action_schemas if item["properties"]["domain"]["const"] == "transaction" and item["properties"]["operation"]["const"] == "create")
+        self.assertEqual("transaction", transaction_create["properties"]["domain"]["const"])
+        valid = parse_semantic_plan(plan("expense", "commit", actions=[action("transaction", "create", fields={"amount": 1})]))
+        self.assertEqual(("transaction", "create"), (valid.actions[0].domain, valid.actions[0].operation))
+        for invalid in (("finance", "create"), ("transaction", "summary"), ("event", "upsert")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "unknown_operation"):
+                parse_semantic_plan(plan("bad", "commit", actions=[action(*invalid, fields={})]))
+
+    def test_pair_specific_read_filters_are_fenced(self):
+        read_schemas = OUTPUT_SCHEMA["$defs"]["read"]["oneOf"]
+        event_list = next(item for item in read_schemas if item["properties"]["domain"]["const"] == "event" and item["properties"]["operation"]["const"] == "list")
+        self.assertFalse(event_list["properties"]["filters"]["additionalProperties"])
+        self.assertNotIn("participant", event_list["properties"]["filters"]["properties"])
+        with self.assertRaisesRegex(ValueError, "unsupported_read_filter"):
+            parse_semantic_plan(plan("events", "read", reads=[read("event", "list", filters={"participant": "Иван"})]))
+        valid = parse_semantic_plan(plan("finance", "read", reads=[read("finance", "summary", filters={"period": "today", "date_from": "2026-09-17"})]))
+        self.assertEqual("today", valid.reads[0].filters["period"])
 
 class SemanticPlannerTransportTests(unittest.TestCase):
     def test_missing_local_ids_are_normalized_and_fenced_json_is_accepted(self):

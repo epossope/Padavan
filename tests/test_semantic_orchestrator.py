@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 from semantic_core import SemanticPlan, ReadRequest, ActionRequest
 from semantic_orchestrator import LegacyExecutionTrace, SemanticShadowOrchestrator, ShadowReadExecutor
+from plan_runtime import PlanValidationError
 
 class Planner:
     def __init__(self, plan): self.result=plan; self.calls=0
@@ -56,6 +57,25 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual("VALIDATED_COMMIT", result.status)
         self.assertEqual(("OK", 1, 1), (result.read_status, result.read_count, result.action_count))
         self.assertEqual(1, services.reads)
+
+    def test_planner_failure_retains_safe_category_on_its_plan(self):
+        failed = SemanticPlan("planner_failure", "clarify", planner_failure_category="malformed_json")
+        result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(failed), Validator(), Services(), Assembler(), Responder(), enabled=True,
+        ).run(**self.args()))
+        self.assertEqual(("PLANNER_FAILED", "malformed_json"), (result.status, result.failure_category))
+        self.assertIs(result.plan, failed)
+        self.assertEqual("malformed_json", result.plan.planner_failure_category)
+
+    def test_missing_time_validation_becomes_safe_clarification(self):
+        class MissingTimeValidator:
+            def validate(self, *args, **kwargs):
+                raise PlanValidationError("missing_time")
+        plan = SemanticPlan("meeting", "commit", actions=[ActionRequest("event", "create", action_id="event")])
+        result = asyncio.run(SemanticShadowOrchestrator(
+            Planner(plan), MissingTimeValidator(), Services(), Assembler(), Responder(), enabled=True,
+        ).run(**self.args()))
+        self.assertEqual(("CLARIFICATION", "clarify", "missing_time"), (result.status, result.disposition, result.failure_category))
 
     def test_final_read_trace_comparison_uses_canonical_read_operations(self):
         trace = LegacyExecutionTrace()
