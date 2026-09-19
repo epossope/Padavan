@@ -134,11 +134,11 @@ class SemanticShadowOrchestrator:
             # those prerequisites, but never pass actions to any executor.
             try:
                 reads = await asyncio.to_thread(self.reads.execute, owner, validated)
-            except Exception:
-                return ShadowRunResult(status="READ_FAILED", disposition=plan.disposition, planner_status="OK", validation_status="OK", read_status="FAILED", action_count=len(validated.actions), proposed_operations=operations, plan=plan)
+            except Exception as exc:
+                return ShadowRunResult(status="READ_FAILED", disposition=plan.disposition, planner_status="OK", validation_status="OK", read_status="FAILED", action_count=len(validated.actions), proposed_operations=operations, failure_category=getattr(exc, "category", "read_error"), plan=plan)
             return ShadowRunResult(status="VALIDATED_COMMIT", disposition=plan.disposition, planner_status="OK", validation_status="OK", read_status="OK", read_count=len(reads.reads), action_count=len(validated.actions), proposed_operations=operations, plan=plan)
         try: reads=await asyncio.to_thread(self.reads.execute,owner,validated)
-        except Exception: return ShadowRunResult(status="READ_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="FAILED",action_count=len(validated.actions),proposed_operations=operations,plan=plan)
+        except Exception as exc: return ShadowRunResult(status="READ_FAILED",disposition=plan.disposition,planner_status="OK",validation_status="OK",read_status="FAILED",action_count=len(validated.actions),proposed_operations=operations,failure_category=getattr(exc,"category","read_error"),plan=plan)
         try:
             evidence=self.assembler.build(validated,reads,semantic_memory=memory)
             response=await self.responder.respond(utterance,evidence)

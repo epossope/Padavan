@@ -51,6 +51,7 @@ class TrialCase:
     expected: str
     expected_dispositions: tuple[str, ...]
     required_operation: str = ""
+    required_operations_any: tuple[str, ...] = ()
     exact_evidence: bool = False
     destructive: bool = False
     general_knowledge: bool = False
@@ -60,7 +61,7 @@ class TrialCase:
 
 CASES = (
     TrialCase(1, "Завтра в 15 встреча с Иваном", "commit meeting proposal; no shadow write", ("commit",), "event.create"),
-    TrialCase(2, "Когда я встречаюсь с Иваном?", "exact event read and grounded answer", ("read",), "event.search", True),
+    TrialCase(2, "Когда я встречаюсь с Иваном?", "exact event read and grounded answer", ("read",), required_operations_any=("event.list", "event.search"), exact_evidence=True),
     TrialCase(3, "Что мы с ним обсуждали?", "resolve Иван and read interaction history", ("read",), "person.interactions_list", True, uses_referent=True),
     TrialCase(4, "Потратил 450 рублей на кофе", "commit transaction proposal; no shadow write", ("commit",), "transaction.create"),
     TrialCase(5, "Сколько я потратил сегодня?", "exact finance summary and grounded answer", ("read",), "finance.summary", True),
@@ -282,6 +283,8 @@ def verdict_for(case: TrialCase, semantic: dict[str, Any], comparison: str) -> t
         return "FAIL", ["semantic planner/validator/runtime failed"]
     if semantic["disposition"] not in case.expected_dispositions:
         return "FAIL", ["unexpected semantic disposition"]
+    if case.required_operations_any and not set(case.required_operations_any).intersection(semantic["operations"]):
+        return "FAIL", ["required operation absent"]
     if case.required_operation and case.required_operation not in semantic["operations"]:
         return "FAIL", ["required structural operation absent"]
     if case.exact_evidence and not semantic["exact_evidence"]:
@@ -320,7 +323,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         lines.append(f"| {item['number']} | {item['phrase']} | {', '.join(legacy['tool_names']) or '—'} | {semantic['status']} | {', '.join(semantic['operations']) or '—'} | {item['comparison']} | {'PASS' if semantic['zero_write'] else 'FAIL'} | {item['verdict']} | {semantic['latency_ms']:.1f}/{legacy['latency_ms']:.1f} ms |")
     for item in report["cases"]:
         semantic, legacy = item["semantic"], item["legacy"]
-        lines += ["", f"## {item['number']}. {item['phrase']}", "", f"EXPECTED: {item['expected']}", "", f"LEGACY: tools={legacy['tool_names']}; success={legacy['success_count']}; failure={legacy['failure_count']}", "", f"SEMANTIC: status={semantic['status']}; disposition={semantic['disposition']}; failure_category={semantic['failure_category']}; plan={semantic['plan']}", "", f"GROUNDING: {semantic['grounding_status'] or 'n/a'}; exact_evidence={semantic['exact_evidence']}", "", f"COMPARISON: {item['comparison']}", "", f"ZERO_WRITE: {'PASS' if semantic['zero_write'] else 'FAIL'}", "", f"VERDICT: {item['verdict']}", "", f"NOTES: {', '.join(item['notes']) or '—'}"]
+        lines += ["", f"## {item['number']}. {item['phrase']}", "", f"EXPECTED: {item['expected']}", "", f"LEGACY: tools={legacy['tool_names']}; success={legacy['success_count']}; failure={legacy['failure_count']}", "", f"SEMANTIC: status={semantic['status']}; disposition={semantic['disposition']}; failure_category={semantic['failure_category']}; planner_failure_category={semantic.get('planner_failure_category', '')}; plan={semantic['plan']}", "", f"GROUNDING: {semantic['grounding_status'] or 'n/a'}; exact_evidence={semantic['exact_evidence']}", "", f"COMPARISON: {item['comparison']}", "", f"ZERO_WRITE: {'PASS' if semantic['zero_write'] else 'FAIL'}", "", f"VERDICT: {item['verdict']}", "", f"NOTES: {', '.join(item['notes']) or '—'}"]
     lines += ["", "## TOTAL", ""]
     for key, value in report["summary"].items():
         lines.append(f"{key}: {value}")

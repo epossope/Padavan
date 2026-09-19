@@ -79,6 +79,7 @@ Return only JSON matching the supplied schema. Plan exact reads and semantic act
 User-specific facts require exact reads; current exact state outranks memory and conversation. Never invent missing personal facts.
 Only explicit committed requests may produce actions. Uncertainty or missing required meaning must produce disposition=clarify with a useful question.
 Explicit create/update/delete/save/remind/spend requests are commit. Questions about user state are read. General/world knowledge without personal state is answer. Missing required execution data is clarify. A deletion is commit, with event.search and a dependency before its destructive action.
+First-person references mean the trusted owner: never create a person reference or person.resolve for them. A user's spending question uses finance.summary. Discussion history with a person uses person.interactions_list; meeting questions use event.list or event.search. Keep pronouns such as "с ним" unchanged for the trusted contextual resolver, but use a named person in canonical/base form where unambiguous. Store unsupported person facts such as profession in notes; use home_city for an unambiguous "from <city>" fact. Delete/cancel/update requires event.search with read_id and an event action with action_id and depends_on containing that exact read_id.
 Keep relative/fuzzy time as semantic fields when it cannot be normalized without guessing. Use now and timezone supplied in input.
 Pronouns remain mention text (for example "с ним"); a later trusted resolver handles identity.
 Deletion/cancellation must first plan a target read and make the destructive action depend on that resolution. JSON only."""
@@ -96,7 +97,7 @@ OPERATION_CONTRACT = {
         "note.list": {"filters": ["query", "date", "limit"]}, "note.search": {"filters": ["query"]},
     },
     "actions": {
-        "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"]},
+        "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"], "unsupported_facts": "notes"},
         "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs"},
         "transaction.create": {"required": ["amount"], "optional": ["currency", "category", "description", "merchant", "kind", "spent_at"]},
         "reminder.create": {"required": ["title/text", "local_datetime"]}, "task.create": {}, "note.create": {},
