@@ -42,6 +42,12 @@ class SemanticPlanValidationError(ValueError):
 ENTITY_TYPES = frozenset(
     {"person", "event", "task", "reminder", "transaction", "note", "knowledge", "project", "file"}
 )
+# Narrow semantic aliases never establish exact identity; unknown types still fail closed.
+ENTITY_TYPE_ALIASES = {
+    "participant": "person", "contact": "person", "human": "person",
+    "meeting": "event", "appointment": "event", "call": "event",
+    "expense": "transaction", "income": "transaction", "payment": "transaction",
+}
 DISPOSITIONS = frozenset({"answer", "read", "commit", "clarify"})
 DOMAIN_OPERATIONS: dict[str, frozenset[str]] = {
     "person": frozenset({"resolve", "resolve_or_create", "upsert", "interactions_list", "delete", "overwrite", "replace"}),
@@ -98,7 +104,7 @@ MAX_CLARIFICATION = 600
 
 PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only JSON matching the schema; never invent database IDs or owner identifiers.
 User facts need exact reads; exact current state outranks memory/conversation. Only explicit committed requests produce actions. Uncertainty or missing execution data is clarify. Create/update/delete/save/remind/spend is commit; user-state questions are read; general knowledge is answer.
-First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Owner-only reads such as finance.summary never carry person entity_refs. Delete/cancel/update requires event.search with read_id and an event action with action_id depending on that read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
+First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Entity refs are people only: type exactly "person"; a meeting is event domain, never entity type "meeting". Owner-only reads such as finance.summary never carry person entity_refs. Explicit delete/cancel/update is always commit: event.search is only the prerequisite lookup, then include the mutation action; never stop at read. The mutation action has no entity_refs; keep the person ref on event.search and depend_on its read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
 
 # One model-visible contract, deliberately independent of user phrasing.
 OPERATION_CONTRACT = {
@@ -114,10 +120,12 @@ OPERATION_CONTRACT = {
     },
     "actions": {
         "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"], "unsupported_facts": "notes"},
-        "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs"},
+        "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs(type=person only)"},
         "transaction.create": {"required": ["amount"], "optional": ["currency", "category", "description", "merchant", "kind", "spent_at"]},
         "reminder.create": {"required": ["title/text", "local_datetime"]}, "task.create": {}, "note.create": {},
-        "event.delete": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.cancel": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]}, "event.update": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"]},
+        "event.delete": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"], "fields": [], "entity_refs": "forbidden", "disposition": "commit"},
+        "event.cancel": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"], "entity_refs": "forbidden", "disposition": "commit"},
+        "event.update": {"requires": ["event.search read with read_id", "action_id", "depends_on=[that exact read_id]"], "entity_refs": "forbidden", "disposition": "commit"},
     },
 }
 
@@ -131,7 +139,7 @@ def _read_schema(domain: str, operation: str) -> dict[str, Any]:
                     "properties": {key: {} for key in sorted(READ_FILTERS[pair])}},
     }
     if pair in READ_ENTITY_REF_PAIRS:
-        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/entity"}}
+        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/person_entity"}}
     return {
         "type": "object",
         "additionalProperties": False,
@@ -150,7 +158,7 @@ def _action_schema(domain: str, operation: str) -> dict[str, Any]:
         "action_id": {"type": "string"},
     }
     if pair in ACTION_ENTITY_REF_PAIRS:
-        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/entity"}}
+        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/person_entity"}}
     return {
         "type": "object",
         "additionalProperties": False,
@@ -179,6 +187,17 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "required": ["type", "mention"],
             "properties": {
                 "type": {"enum": sorted(ENTITY_TYPES)},
+                "mention": {"type": "string"},
+                "attributes": {"type": "object"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        "person_entity": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "mention"],
+            "properties": {
+                "type": {"const": "person"},
                 "mention": {"type": "string"},
                 "attributes": {"type": "object"},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -267,7 +286,8 @@ def _entity(value: Any) -> EntityReference:
         required={"type", "mention"},
         label="entity",
     )
-    entity_type = _string(data["type"], label="entity_type")
+    entity_type = _string(data["type"], label="entity_type").casefold()
+    entity_type = ENTITY_TYPE_ALIASES.get(entity_type, entity_type)
     if entity_type not in ENTITY_TYPES:
         raise _invalid("entity_type")
     # A model-provided resolved_id is deliberately discarded.  Only the
@@ -285,6 +305,13 @@ def _entity_list(value: Any, *, maximum: int) -> list[EntityReference]:
     if not isinstance(value, list) or len(value) > maximum:
         raise _invalid("entity_list")
     return [_entity(item) for item in value]
+
+
+def _person_ref_list(value: Any, *, maximum: int) -> list[EntityReference]:
+    refs = _entity_list(value, maximum=maximum)
+    if any(ref.type != "person" for ref in refs):
+        raise _invalid("unsupported_entity_ref_type")
+    return refs
 
 
 def _validate_domain_operation(domain_value: Any, operation_value: Any, *, read: bool) -> tuple[str, str]:
@@ -316,7 +343,8 @@ def _read(value: Any) -> ReadRequest:
         operation=operation,
         read_id=_string(data.get("read_id", ""), label="read_id", allow_empty=True),
         filters=filters,
-        entity_refs=_entity_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS),
+        entity_refs=_person_ref_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS)
+        if pair in READ_ENTITY_REF_PAIRS else [],
     )
 
 
@@ -341,7 +369,8 @@ def _action(value: Any) -> ActionRequest:
         domain=domain,
         operation=operation,
         fields=fields,
-        entity_refs=_entity_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS),
+        entity_refs=_person_ref_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS)
+        if pair in ACTION_ENTITY_REF_PAIRS else [],
         depends_on=[_string(item, label="dependency") for item in dependencies],
         confidence=_confidence(data.get("confidence")),
         action_id=_string(data.get("action_id", ""), label="action_id", allow_empty=True),

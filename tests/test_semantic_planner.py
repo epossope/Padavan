@@ -450,6 +450,36 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"в 9"=09:00', PLANNER_PROMPT)
         self.assertIn('"в 15"=15:00', PLANNER_PROMPT)
 
+    def test_entity_type_aliases_are_narrow_and_person_refs_are_strict(self):
+        top_level = parse_semantic_plan(plan(
+            "meeting", "answer",
+            entities=[entity("meeting", "встреча"), entity("participant", "Иван")],
+        ))
+        self.assertEqual(["event", "person"], [item.type for item in top_level.entities])
+        with self.assertRaisesRegex(ValueError, "unsupported_entity_ref_type"):
+            parse_semantic_plan(plan(
+                "meeting", "commit",
+                actions=[action(
+                    "event", "create",
+                    fields={"title": "Встреча", "local_datetime": "2026-09-20T15:00:00"},
+                    entity_refs=[entity("event", "Иван")],
+                )],
+            ))
+        with self.assertRaisesRegex(ValueError, "entity_type"):
+            parse_semantic_plan(plan("x", "answer", entities=[entity("arbitrary_new_type", "x")]))
+
+    def test_person_ref_schema_and_destructive_prompt_contract_are_explicit(self):
+        read_schemas = OUTPUT_SCHEMA["$defs"]["read"]["oneOf"]
+        event_search = next(item for item in read_schemas if item["properties"]["domain"]["const"] == "event" and item["properties"]["operation"]["const"] == "search")
+        self.assertEqual("#/$defs/person_entity", event_search["properties"]["entity_refs"]["items"]["$ref"])
+        action_schemas = OUTPUT_SCHEMA["$defs"]["action"]["oneOf"]
+        event_create = next(item for item in action_schemas if item["properties"]["domain"]["const"] == "event" and item["properties"]["operation"]["const"] == "create")
+        self.assertEqual("#/$defs/person_entity", event_create["properties"]["entity_refs"]["items"]["$ref"])
+        event_delete = next(item for item in action_schemas if item["properties"]["domain"]["const"] == "event" and item["properties"]["operation"]["const"] == "delete")
+        self.assertNotIn("entity_refs", event_delete["properties"])
+        self.assertIn("never stop at read", PLANNER_PROMPT)
+        self.assertIn('type exactly "person"', PLANNER_PROMPT)
+
 class SemanticPlannerTransportTests(unittest.TestCase):
     def test_missing_local_ids_are_normalized_and_fenced_json_is_accepted(self):
         parsed = parse_semantic_plan("```json\n{\"intent\":\"meeting\",\"disposition\":\"commit\",\"reads\":[{\"domain\":\"event\",\"operation\":\"search\"}],\"actions\":[{\"domain\":\"event\",\"operation\":\"create\",\"fields\":{\"title\":\"x\",\"local_datetime\":\"2026-09-20T15:00:00\"}}]}\n```")
