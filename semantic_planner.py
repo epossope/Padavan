@@ -56,6 +56,8 @@ DOMAIN_OPERATIONS: dict[str, frozenset[str]] = {
     "file": frozenset({"create", "get", "list", "search", "update", "delete", "overwrite", "replace"}),
 }
 READ_OPERATIONS = frozenset({"resolve", "get", "list", "search", "summary", "interactions_list"})
+CANONICAL_READ_PAIRS = frozenset({("person","resolve"),("person","interactions_list"),("event","list"),("event","search"),("finance","summary"),("transaction","list"),("task","list"),("reminder","list"),("note","list"),("note","search")})
+CANONICAL_ACTION_PAIRS = frozenset({("person","upsert"),("event","create"),("event","update"),("event","delete"),("event","cancel"),("transaction","create"),("reminder","create"),("task","create"),("note","create")})
 DESTRUCTIVE_OPERATIONS = frozenset({"delete", "cancel", "overwrite", "replace"})
 OWNER_KEYS = frozenset({"chat_id", "user_id", "owner_id"})
 CONTEXT_ID_KEYS = OWNER_KEYS | frozenset({"id", "person_id", "resolved_id"})
@@ -134,7 +136,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "required": ["domain", "operation"],
             "properties": {
                 "domain": {"enum": sorted(DOMAIN_OPERATIONS)}, "read_id": {"type": "string"},
-                "operation": {"type": "string"},
+                "operation": {"enum": sorted({item[1] for item in CANONICAL_READ_PAIRS})},
                 "filters": {"type": "object"},
                 "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
             },
@@ -145,7 +147,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "required": ["domain", "operation"],
             "properties": {
                 "domain": {"enum": sorted(DOMAIN_OPERATIONS)},
-                "operation": {"type": "string"},
+                "operation": {"enum": sorted({item[1] for item in CANONICAL_ACTION_PAIRS})},
                 "fields": {"type": "object"},
                 "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
@@ -253,10 +255,8 @@ def _entity_list(value: Any, *, maximum: int) -> list[EntityReference]:
 def _validate_domain_operation(domain_value: Any, operation_value: Any, *, read: bool) -> tuple[str, str]:
     domain = _string(domain_value, label="domain").casefold()
     operation = _string(operation_value, label="operation").casefold()
-    if domain not in DOMAIN_OPERATIONS or operation not in DOMAIN_OPERATIONS[domain]:
+    if (domain, operation) not in (CANONICAL_READ_PAIRS if read else CANONICAL_ACTION_PAIRS):
         raise _invalid("unknown_operation")
-    if read and operation not in READ_OPERATIONS:
-        raise _invalid("write_in_reads")
     return domain, operation
 
 

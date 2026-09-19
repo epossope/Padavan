@@ -51,7 +51,7 @@ class FakePlannerBackend:
 MEETING_ACTIONS = [
     action(
         "person",
-        "resolve_or_create",
+        "upsert",
         fields={"name": "Иван"},
         entity_refs=[entity("person", "Иван")],
         action_id="resolve_person",
@@ -80,12 +80,12 @@ NATURAL_LANGUAGE_CASES = {
     "Познакомился с Артёмом, он дизайнер.": plan(
         "remember_person",
         "commit",
-        entities=[entity("person", "Артём", attributes={"occupation": "дизайнер"})],
+        entities=[entity("person", "Артём", attributes={"notes": "дизайнер"})],
         actions=[
             action(
                 "person",
                 "upsert",
-                fields={"name": "Артём", "occupation": "дизайнер"},
+                fields={"name": "Артём", "notes": "дизайнер"},
                 entity_refs=[entity("person", "Артём")],
             )
         ],
@@ -115,7 +115,7 @@ NATURAL_LANGUAGE_CASES = {
         entities=[entity("person", "Сергей")],
         reads=[
             read("person", "resolve", entity_refs=[entity("person", "Сергей")]),
-            read("event", "search", filters={"participant": "Сергей"}, entity_refs=[entity("person", "Сергей")]),
+            read("event", "search", read_id="events", filters={"query": "встреч"}, entity_refs=[entity("person", "Сергей")]),
         ],
     ),
     "Что мы с ним обсуждали?": plan(
@@ -164,7 +164,7 @@ NATURAL_LANGUAGE_CASES = {
             read(
                 "event",
                 "search",
-                filters={"date": "2026-09-18", "participant": "Иван"},
+                read_id="target", filters={"query": "встреч", "date_from": "2026-09-18", "date_to": "2026-09-18"},
                 entity_refs=[entity("person", "Иван")],
             )
         ],
@@ -174,7 +174,7 @@ NATURAL_LANGUAGE_CASES = {
                 "delete",
                 fields={"semantic_target": "встреча с Иваном завтра"},
                 entity_refs=[entity("person", "Иван")],
-                depends_on=["event.search"],
+                action_id="delete_event", depends_on=["target"],
             )
         ],
     ),
@@ -357,31 +357,15 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
                 plan("x", "commit", actions=[action("note", "create", fields=nested)])
             )
 
-    def test_overwrite_and_replace_require_target_read_and_dependency(self):
+    def test_overwrite_and_replace_are_not_canonical_operations(self):
         for operation in ("overwrite", "replace"):
             with self.subTest(operation=operation):
-                safe = parse_semantic_plan(
-                    plan(
-                        "replace_note",
-                        "commit",
-                        reads=[read("note", "search", filters={"semantic_target": "server note"})],
-                        actions=[
-                            action(
-                                "note",
-                                operation,
-                                fields={"semantic_target": "server note", "text": "new value"},
-                                depends_on=["note.search"],
-                            )
-                        ],
-                    )
-                )
-                self.assertEqual(safe.actions[0].operation, operation)
                 unsafe = plan(
                     "replace_note",
                     "commit",
                     actions=[action("note", operation, fields={"text": "new value"})],
                 )
-                with self.assertRaisesRegex(ValueError, "unsafe_destructive_action"):
+                with self.assertRaisesRegex(ValueError, "unknown_operation"):
                     parse_semantic_plan(unsafe)
 
 class SemanticPlannerTransportTests(unittest.TestCase):
