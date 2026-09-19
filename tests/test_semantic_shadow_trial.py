@@ -110,6 +110,49 @@ class SemanticShadowTrialTests(unittest.TestCase):
         self.assertEqual("WARN", verdict)
         self.assertTrue(notes)
 
+    def test_exact_empty_event_read_counts_as_exact_evidence(self):
+        class EmptyEventBackend:
+            def __init__(self, owner):
+                self.owner = owner
+            async def generate_structured(self, **kwargs):
+                payload = kwargs["input_payload"]
+                if "utterance" in payload:
+                    return {
+                        "intent": "query_meeting_time",
+                        "disposition": "read",
+                        "reads": [{
+                            "domain": "event",
+                            "operation": "search",
+                            "read_id": "events",
+                            "filters": {"query": "несуществующая встреча"},
+                        }],
+                        "actions": [],
+                        "clarification": "",
+                    }
+                return {
+                    "claims": [],
+                    "confidence": 1,
+                    "clarification": "В текущих данных ничего не найдено.",
+                }
+            async def generate_grounded(self, **kwargs):
+                raise AssertionError("structured grounding path should be used")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            base = root / "fixture.db"
+            trial.seed_fixture(base)
+            semantic_db, _legacy_db = trial.copy_case_databases(base, root, 2)
+            result = trial.run_semantic_case(
+                trial.CASES[1],
+                semantic_db,
+                backend_factory=EmptyEventBackend,
+            )
+
+        self.assertEqual("READ_COMPLETED", result["status"])
+        self.assertEqual(["event.search"], result["operations"])
+        self.assertTrue(result["exact_evidence"])
+        self.assertTrue(result["zero_write"])
+
     def test_case_two_accepts_each_canonical_event_read_only_when_completed(self):
         case = trial.CASES[1]
         for operation in ("event.list", "event.search"):

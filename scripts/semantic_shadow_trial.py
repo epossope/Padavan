@@ -278,13 +278,19 @@ def run_semantic_case(case: TrialCase, database: Path, *, backend_factory=None) 
                 conversation_context=trusted_context(case, _person_id(database)),
             ))
         after = _table_snapshot(database)
-    evidence_items = list(getattr(getattr(result, "evidence", None), "items", []) or [])
+    evidence_packet = getattr(result, "evidence", None)
+    evidence_items = list(getattr(evidence_packet, "items", []) or [])
+    exact_empty_domains = list(getattr(evidence_packet, "exact_empty_domains", []) or [])
+    exact_evidence = (
+        any(item.source.startswith("exact_") for item in evidence_items)
+        or bool(exact_empty_domains)
+    )
     return {
         "status": result.status, "disposition": result.disposition, "intent": getattr(result.plan, "intent", ""),
         "read_count": result.read_count, "action_count": result.action_count,
         "operations": list(result.proposed_operations), "grounding_status": result.grounding_status,
         "failure_category": result.failure_category, "planner_failure_category": getattr(result.plan, "planner_failure_category", ""), "latency_ms": round((time.perf_counter() - started) * 1000, 1),
-        "plan": plan_summary(result.plan), "exact_evidence": any(item.source.startswith("exact_") for item in evidence_items),
+        "plan": plan_summary(result.plan), "exact_evidence": exact_evidence,
         "zero_write": semantic_zero_write(before, after),
     }
 
