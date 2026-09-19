@@ -91,7 +91,22 @@ class GroundedResponder:
     async def respond(self, question: str, packet: EvidencePacket) -> GroundedResponse:
         started=time.perf_counter(); self._emit("grounded_response_started")
         try:
-            raw=await asyncio.wait_for(self.backend.generate_grounded(system_prompt=PROMPT,question=str(question)[:MAX_TEXT],evidence=model_packet(packet)),self.timeout)
+            payload={"question":str(question)[:MAX_TEXT],"evidence":model_packet(packet)}
+            structured=getattr(self.backend,"generate_structured",None)
+            if structured is not None:
+                raw=await asyncio.wait_for(
+                    structured(system_prompt=PROMPT,input_payload=payload,output_schema=GROUNDED_OUTPUT_SCHEMA),
+                    self.timeout,
+                )
+            else:
+                raw=await asyncio.wait_for(
+                    self.backend.generate_grounded(
+                        system_prompt=PROMPT,
+                        question=payload["question"],
+                        evidence=payload["evidence"],
+                    ),
+                    self.timeout,
+                )
             if isinstance(raw, str):
                 encoded = raw.encode("utf-8")
                 if len(encoded) > MAX_RESPONSE: raise GroundingError("oversized")

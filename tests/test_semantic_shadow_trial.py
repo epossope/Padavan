@@ -111,11 +111,23 @@ class SemanticShadowTrialTests(unittest.TestCase):
             def __init__(self, owner):
                 self.owner = owner
             async def generate_structured(self, **kwargs):
-                return {"intent": "finance", "disposition": "read", "reads": [
-                    {"domain": "finance", "operation": "summary", "read_id": "finance"},
-                ], "actions": []}
+                payload = kwargs["input_payload"]
+                if "utterance" in payload:
+                    return {"intent": "finance", "disposition": "read", "reads": [
+                        {"domain": "finance", "operation": "summary", "read_id": "finance"},
+                    ], "actions": []}
+                evidence_id = payload["evidence"]["items"][0]["evidence_id"]
+                return {
+                    "claims": [{
+                        "text": "1250 RUB",
+                        "claim_type": "personal_fact",
+                        "evidence_ids": [evidence_id],
+                    }],
+                    "confidence": 1,
+                    "clarification": "",
+                }
             async def generate_grounded(self, **kwargs):
-                return {"claims": [{"text": "1250 RUB", "claim_type": "personal_fact", "evidence_ids": ["e1"]}], "confidence": 1}
+                raise AssertionError("structured grounding path should be used")
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             base = root / "fixture.db"

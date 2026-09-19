@@ -70,6 +70,16 @@ READ_FILTERS: dict[tuple[str, str], frozenset[str]] = {
     ("note", "list"): frozenset({"query", "date", "limit"}),
     ("note", "search"): frozenset({"query"}),
 }
+READ_ENTITY_REF_PAIRS = frozenset({
+    ("person", "resolve"),
+    ("person", "interactions_list"),
+    ("event", "list"),
+    ("event", "search"),
+})
+ACTION_ENTITY_REF_PAIRS = frozenset({
+    ("person", "upsert"),
+    ("event", "create"),
+})
 DESTRUCTIVE_OPERATIONS = frozenset({"delete", "cancel", "overwrite", "replace"})
 OWNER_KEYS = frozenset({"chat_id", "user_id", "owner_id"})
 CONTEXT_ID_KEYS = OWNER_KEYS | frozenset({"id", "person_id", "resolved_id"})
@@ -88,7 +98,7 @@ MAX_CLARIFICATION = 600
 
 PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only JSON matching the schema; never invent database IDs or owner identifiers.
 User facts need exact reads; exact current state outranks memory/conversation. Only explicit committed requests produce actions. Uncertainty or missing execution data is clarify. Create/update/delete/save/remind/spend is commit; user-state questions are read; general knowledge is answer.
-First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Delete/cancel/update requires event.search with read_id and an event action with action_id depending on that read_id. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
+First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Owner-only reads such as finance.summary never carry person entity_refs. Delete/cancel/update requires event.search with read_id and an event action with action_id depending on that read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
 
 # One model-visible contract, deliberately independent of user phrasing.
 OPERATION_CONTRACT = {
@@ -113,31 +123,39 @@ OPERATION_CONTRACT = {
 
 
 def _read_schema(domain: str, operation: str) -> dict[str, Any]:
+    pair = (domain, operation)
+    properties: dict[str, Any] = {
+        "domain": {"const": domain}, "operation": {"const": operation},
+        "read_id": {"type": "string"},
+        "filters": {"type": "object", "additionalProperties": False,
+                    "properties": {key: {} for key in sorted(READ_FILTERS[pair])}},
+    }
+    if pair in READ_ENTITY_REF_PAIRS:
+        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/entity"}}
     return {
-        "type": "object", "additionalProperties": False,
+        "type": "object",
+        "additionalProperties": False,
         "required": ["domain", "operation"],
-        "properties": {
-            "domain": {"const": domain}, "operation": {"const": operation},
-            "read_id": {"type": "string"},
-            "filters": {"type": "object", "additionalProperties": False,
-                        "properties": {key: {} for key in sorted(READ_FILTERS[(domain, operation)])}},
-            "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
-        },
+        "properties": properties,
     }
 
 
 def _action_schema(domain: str, operation: str) -> dict[str, Any]:
+    pair = (domain, operation)
+    properties: dict[str, Any] = {
+        "domain": {"const": domain}, "operation": {"const": operation},
+        "fields": {"type": "object"},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "action_id": {"type": "string"},
+    }
+    if pair in ACTION_ENTITY_REF_PAIRS:
+        properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/entity"}}
     return {
-        "type": "object", "additionalProperties": False,
+        "type": "object",
+        "additionalProperties": False,
         "required": ["domain", "operation"],
-        "properties": {
-            "domain": {"const": domain}, "operation": {"const": operation},
-            "fields": {"type": "object"},
-            "entity_refs": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
-            "depends_on": {"type": "array", "items": {"type": "string"}},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "action_id": {"type": "string"},
-        },
+        "properties": properties,
     }
 
 
@@ -151,7 +169,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "entities": {"type": "array", "items": {"$ref": "#/$defs/entity"}},
         "reads": {"type": "array", "items": {"$ref": "#/$defs/read"}},
         "actions": {"type": "array", "items": {"$ref": "#/$defs/action"}},
-        "clarification": {"type": "string"},
+        "clarification": {"type": ["string", "null"]},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
     "$defs": {
@@ -288,8 +306,11 @@ def _read(value: Any) -> ReadRequest:
     filters = _bounded_value(data.get("filters", {}))
     if not isinstance(filters, dict):
         raise _invalid("filters_type")
-    if set(filters) - READ_FILTERS[(domain, operation)]:
+    pair = (domain, operation)
+    if set(filters) - READ_FILTERS[pair]:
         raise _invalid("unsupported_read_filter")
+    if "entity_refs" in data and pair not in READ_ENTITY_REF_PAIRS:
+        raise _invalid("unsupported_entity_refs")
     return ReadRequest(
         domain=domain,
         operation=operation,
@@ -310,6 +331,9 @@ def _action(value: Any) -> ActionRequest:
     fields = _bounded_value(data.get("fields", {}))
     if not isinstance(fields, dict):
         raise _invalid("fields_type")
+    pair = (domain, operation)
+    if "entity_refs" in data and pair not in ACTION_ENTITY_REF_PAIRS:
+        raise _invalid("unsupported_entity_refs")
     dependencies = data.get("depends_on", [])
     if not isinstance(dependencies, list) or len(dependencies) > MAX_ACTIONS:
         raise _invalid("dependencies_type")
@@ -385,8 +409,9 @@ def parse_semantic_plan(payload: str | Mapping[str, Any]) -> SemanticPlan:
             while candidate in used:
                 index += 1; candidate = f"a{index}"
             item.action_id = candidate; used.add(candidate)
-    clarification = _string(
-        data.get("clarification", ""), label="clarification", maximum=MAX_CLARIFICATION, allow_empty=True
+    clarification_value = data.get("clarification", "")
+    clarification = "" if clarification_value is None else _string(
+        clarification_value, label="clarification", maximum=MAX_CLARIFICATION, allow_empty=True
     )
     if actions and disposition != "commit":
         raise _invalid("actions_without_commit")

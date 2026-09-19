@@ -130,6 +130,11 @@ NATURAL_LANGUAGE_CASES = {
         "read",
         reads=[read("finance", "summary", filters={"period": "7_days"})],
     ),
+    "Сколько я потратил сегодня?": plan(
+        "query_spending",
+        "read",
+        reads=[read("finance", "summary", filters={"period": "today"})],
+    ),
     "Напомни позвонить маме завтра в 12.": plan(
         "create_reminder",
         "commit",
@@ -139,7 +144,6 @@ NATURAL_LANGUAGE_CASES = {
                 "reminder",
                 "create",
                 fields={"title": "Позвонить маме", "local_datetime": "2026-09-18T12:00:00"},
-                entity_refs=[entity("person", "маме")],
             )
         ],
     ),
@@ -169,8 +173,6 @@ NATURAL_LANGUAGE_CASES = {
             action(
                 "event",
                 "delete",
-                fields={"semantic_target": "встреча с Иваном завтра"},
-                entity_refs=[entity("person", "Иван")],
                 action_id="delete_event", depends_on=["target"],
             )
         ],
@@ -231,6 +233,13 @@ class SemanticPlannerNaturalLanguageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.operation for item in results["Что мы с ним обсуждали?"].reads], ["resolve", "interactions_list"])
         self.assertEqual(results["Потратил 850 рублей на такси."].actions[0].domain, "transaction")
         self.assertEqual(results["Сколько ушло на такси за неделю?"].reads[0].domain, "finance")
+        self_finance = results["Сколько я потратил сегодня?"]
+        self.assertEqual(("finance", "summary", "today"), (
+            self_finance.reads[0].domain,
+            self_finance.reads[0].operation,
+            self_finance.reads[0].filters["period"],
+        ))
+        self.assertEqual([], self_finance.reads[0].entity_refs)
         self.assertEqual(results["Напомни позвонить маме завтра в 12."].actions[0].domain, "reminder")
         reminder = results["Напомни завтра в 9 позвонить"]
         self.assertEqual(("commit", "reminder", "create"), (reminder.disposition, reminder.actions[0].domain, reminder.actions[0].operation))
@@ -393,6 +402,53 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
             parse_semantic_plan(plan("events", "read", reads=[read("event", "list", filters={"participant": "Иван"})]))
         valid = parse_semantic_plan(plan("finance", "read", reads=[read("finance", "summary", filters={"period": "today", "date_from": "2026-09-17"})]))
         self.assertEqual("today", valid.reads[0].filters["period"])
+
+    def test_optional_null_clarification_is_normalized_but_clarify_requires_text(self):
+        for payload in (
+            plan("save", "commit", actions=[action("note", "create", fields={"text": "x"})], clarification=None),
+            plan("read", "read", reads=[read("finance", "summary", filters={"period": "today"})], clarification=None),
+            plan("answer", "answer", clarification=None),
+        ):
+            with self.subTest(disposition=payload["disposition"]):
+                self.assertEqual("", parse_semantic_plan(payload).clarification)
+        with self.assertRaisesRegex(ValueError, "missing_clarification"):
+            parse_semantic_plan(plan("clarify", "clarify", clarification=None))
+        for invalid in ([], {}, 1, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "clarification_type"):
+                parse_semantic_plan(plan("answer", "answer", clarification=invalid))
+
+    def test_entity_refs_are_scoped_to_operations_that_use_identity(self):
+        read_schemas = OUTPUT_SCHEMA["$defs"]["read"]["oneOf"]
+        finance = next(item for item in read_schemas if item["properties"]["domain"]["const"] == "finance")
+        event_list = next(item for item in read_schemas if item["properties"]["domain"]["const"] == "event" and item["properties"]["operation"]["const"] == "list")
+        self.assertNotIn("entity_refs", finance["properties"])
+        self.assertIn("entity_refs", event_list["properties"])
+
+        with self.assertRaisesRegex(ValueError, "unsupported_entity_refs"):
+            parse_semantic_plan(plan(
+                "finance", "read",
+                reads=[read("finance", "summary", filters={"period": "today"}, entity_refs=[entity("person", "Иван")])],
+            ))
+        event_plan = parse_semantic_plan(plan(
+            "events", "read",
+            reads=[read("event", "list", entity_refs=[entity("person", "Иван")])],
+        ))
+        self.assertEqual("Иван", event_plan.reads[0].entity_refs[0].mention)
+
+        with self.assertRaisesRegex(ValueError, "unsupported_entity_refs"):
+            parse_semantic_plan(plan(
+                "expense", "commit",
+                actions=[action("transaction", "create", fields={"amount": 1}, entity_refs=[entity("person", "Иван")])],
+            ))
+        reminder = parse_semantic_plan(plan(
+            "remind", "commit",
+            actions=[action("reminder", "create", fields={"title": "Позвонить", "local_datetime": "2026-09-18T09:00:00"})],
+        ))
+        self.assertEqual([], reminder.actions[0].entity_refs)
+
+    def test_explicit_russian_bare_hour_is_documented_as_exact_time(self):
+        self.assertIn('"в 9"=09:00', PLANNER_PROMPT)
+        self.assertIn('"в 15"=15:00', PLANNER_PROMPT)
 
 class SemanticPlannerTransportTests(unittest.TestCase):
     def test_missing_local_ids_are_normalized_and_fenced_json_is_accepted(self):
