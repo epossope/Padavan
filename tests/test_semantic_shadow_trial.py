@@ -17,6 +17,28 @@ def _semantic(*, zero_write=True, disposition="commit", operations=None, status=
 
 
 class SemanticShadowTrialTests(unittest.TestCase):
+    def test_trial_case_optional_contracts_are_keyword_safe_and_typed(self):
+        for case in trial.CASES:
+            with self.subTest(case=case.number):
+                self.assertIsInstance(case.required_operation, str)
+                self.assertIsInstance(case.required_operations_any, tuple)
+                self.assertTrue(all(isinstance(item, str) for item in case.required_operations_any))
+                self.assertIsInstance(case.exact_evidence, bool)
+                self.assertIsInstance(case.require_completed_read, bool)
+                self.assertIsInstance(case.destructive, bool)
+                self.assertIsInstance(case.general_knowledge, bool)
+                self.assertIsInstance(case.require_clarification, bool)
+                self.assertIsInstance(case.uses_referent, bool)
+
+        interaction = trial.CASES[2]
+        finance = trial.CASES[4]
+        self.assertEqual((), interaction.required_operations_any)
+        self.assertTrue(interaction.exact_evidence)
+        self.assertEqual("person.interactions_list", interaction.required_operation)
+        self.assertEqual((), finance.required_operations_any)
+        self.assertTrue(finance.exact_evidence)
+        self.assertEqual("finance.summary", finance.required_operation)
+
     def test_shared_trial_credentials_never_provision_managed_key(self):
         with patch.object(trial.bot, "OR_KEY", "shared-test-key"), \
              patch.object(trial.bot, "OR_MANAGEMENT_KEY", "management-test-key"), \

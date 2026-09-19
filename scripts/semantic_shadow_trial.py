@@ -61,16 +61,62 @@ class TrialCase:
 
 
 CASES = (
-    TrialCase(1, "Завтра в 15 встреча с Иваном", "commit meeting proposal; no shadow write", ("commit",), "event.create"),
-    TrialCase(2, "Когда я встречаюсь с Иваном?", "exact event read and grounded answer", ("read",), required_operations_any=("event.list", "event.search"), exact_evidence=True, require_completed_read=True),
-    TrialCase(3, "Что мы с ним обсуждали?", "resolve Иван and read interaction history", ("read",), "person.interactions_list", True, uses_referent=True),
-    TrialCase(4, "Потратил 450 рублей на кофе", "commit transaction proposal; no shadow write", ("commit",), "transaction.create"),
-    TrialCase(5, "Сколько я потратил сегодня?", "exact finance summary and grounded answer", ("read",), "finance.summary", True),
-    TrialCase(6, "Удали встречу с Иваном завтра", "event target read plus delete proposal; no shadow deletion", ("commit",), "event.delete", destructive=True),
-    TrialCase(7, "Иван дизайнер из Казани", "person exact-state proposal; no shadow write", ("commit",), "person.upsert"),
-    TrialCase(8, "Напомни завтра в 9 позвонить", "reminder proposal; no shadow write", ("commit",), "reminder.create"),
-    TrialCase(9, "Кто такой Иван Грозный?", "general knowledge answer with no personal state", ("answer",), general_knowledge=True),
-    TrialCase(10, "В пятницу встреча с Иваном", "clarify missing meeting time", ("clarify",), require_clarification=True),
+    TrialCase(
+        1, "Завтра в 15 встреча с Иваном",
+        "commit meeting proposal; no shadow write", ("commit",),
+        required_operation="event.create",
+    ),
+    TrialCase(
+        2, "Когда я встречаюсь с Иваном?",
+        "exact event read and grounded answer", ("read",),
+        required_operations_any=("event.list", "event.search"),
+        exact_evidence=True,
+        require_completed_read=True,
+    ),
+    TrialCase(
+        3, "Что мы с ним обсуждали?",
+        "resolve Иван and read interaction history", ("read",),
+        required_operation="person.interactions_list",
+        exact_evidence=True,
+        uses_referent=True,
+    ),
+    TrialCase(
+        4, "Потратил 450 рублей на кофе",
+        "commit transaction proposal; no shadow write", ("commit",),
+        required_operation="transaction.create",
+    ),
+    TrialCase(
+        5, "Сколько я потратил сегодня?",
+        "exact finance summary and grounded answer", ("read",),
+        required_operation="finance.summary",
+        exact_evidence=True,
+    ),
+    TrialCase(
+        6, "Удали встречу с Иваном завтра",
+        "event target read plus delete proposal; no shadow deletion", ("commit",),
+        required_operation="event.delete",
+        destructive=True,
+    ),
+    TrialCase(
+        7, "Иван дизайнер из Казани",
+        "person exact-state proposal; no shadow write", ("commit",),
+        required_operation="person.upsert",
+    ),
+    TrialCase(
+        8, "Напомни завтра в 9 позвонить",
+        "reminder proposal; no shadow write", ("commit",),
+        required_operation="reminder.create",
+    ),
+    TrialCase(
+        9, "Кто такой Иван Грозный?",
+        "general knowledge answer with no personal state", ("answer",),
+        general_knowledge=True,
+    ),
+    TrialCase(
+        10, "В пятницу встреча с Иваном",
+        "clarify missing meeting time", ("clarify",),
+        require_clarification=True,
+    ),
 )
 
 
