@@ -4918,6 +4918,45 @@ def person_plan_validator():
     return PlanValidator(person_entity_resolver(), observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric)
 
 
+_SEMANTIC_PRODUCTION_RUNTIMES = {}
+def get_semantic_production_runtime(chat_id):
+    """Create the distinct production runtime lazily; shadow remains separate."""
+    if chat_id not in _SEMANTIC_PRODUCTION_RUNTIMES:
+        from semantic_planner import SemanticPlanner
+        from plan_runtime import BotDomainServices, PlanExecutor
+        from grounded_response import EvidenceAssembler, GroundedResponder
+        from semantic_runtime import SemanticProductionRuntime
+        backend = _SemanticRuntimeBackend(chat_id)
+        services = BotDomainServices(__import__(__name__))
+        _SEMANTIC_PRODUCTION_RUNTIMES[chat_id] = SemanticProductionRuntime(
+            SemanticPlanner(backend, observer=DIAGNOSTICS.record), person_plan_validator(), services,
+            PlanExecutor(services, conn, observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric),
+            EvidenceAssembler(observer=DIAGNOSTICS.record),
+            GroundedResponder(backend, observer=DIAGNOSTICS.record),
+            observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric,
+        )
+    return _SEMANTIC_PRODUCTION_RUNTIMES[chat_id]
+
+
+def run_semantic_production_turn(chat_id, text, *, request_id, conversation_context=None):
+    """Synchronous bridge used by both Telegram and Mini App stream workers."""
+    from semantic_runtime import SemanticRuntimeResult, canary_owners, runtime_mode
+    mode = runtime_mode()
+    if mode == "off":
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="disabled")
+    if int(chat_id) not in canary_owners():
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="not_allowlisted")
+    try:
+        return asyncio.run(get_semantic_production_runtime(chat_id).handle_turn(
+            trusted_owner=chat_id, request_id=str(request_id), utterance=text,
+            now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
+            conversation_context=conversation_context or {"recent_entities": []},
+        ))
+    except Exception:
+        DIAGNOSTICS.record("semantic_runtime_fallback", runtime_mode=mode, failure_category="runtime_error")
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="runtime_error")
+
+
 def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None, legacy_trace=None, loop=None):
     """Channel-neutral fire-and-forget shadow hook; all failures are isolated."""
     try:
@@ -5169,14 +5208,31 @@ def _stream_agent_response_legacy(chat_id, text, cancel_event=None):
 
 
 def stream_agent_response(chat_id, text, cancel_event=None, *, request_id=None, shadow_loop=None):
-    """Run the unchanged legacy stream while mirroring it safely in shadow."""
+    """Attempt eligible semantic production before unchanged legacy streaming."""
+    cancel_event = cancel_event or threading.Event()
+    trusted_request_id = str(request_id or uuid.uuid4().hex)
+    if cancel_event.is_set():
+        yield {"type": "cancelled"}
+        return
+    semantic = run_semantic_production_turn(chat_id, text, request_id=trusted_request_id)
+    if semantic.handled:
+        record_user_request(chat_id, "chat")
+        canonical_user_message_id = add_message(chat_id, "user", text)
+        canonical_message_id = add_message(chat_id, "assistant", semantic.reply)
+        yield runtime_state_event("REQUESTING", text="Думаю…")
+        yield runtime_state_event("STREAMING")
+        yield {"type": "delta", "text": semantic.reply}
+        yield {"type": "speech_delta", "text": SpeechTextPolicy().build(semantic.reply)}
+        yield {"type": "done", "text": semantic.reply, "canonical_message_id": canonical_message_id,
+               "canonical_user_message_id": canonical_user_message_id}
+        return
     from semantic_orchestrator import LegacyExecutionTrace
     trace = LegacyExecutionTrace()
     previous = getattr(_LEGACY_SHADOW_TRACE, "trace", None)
     _LEGACY_SHADOW_TRACE.trace = trace
     # Default-off and fire-and-forget: this cannot delay or replace legacy SSE.
     schedule_semantic_shadow_turn(
-        chat_id, text, request_id=request_id, legacy_trace=trace, loop=shadow_loop,
+        chat_id, text, request_id=trusted_request_id, legacy_trace=trace, loop=shadow_loop,
     )
     try:
         yield from _stream_agent_response_legacy(chat_id, text, cancel_event)
