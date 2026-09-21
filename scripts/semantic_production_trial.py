@@ -90,7 +90,7 @@ def temp_database():
 
 
 def seed() -> None:
-    bot.person_upsert(SYNTHETIC_OWNER, "Иван", relationship="synthetic", home_city="Казань")
+    bot.person_upsert(SYNTHETIC_OWNER, "Иван", relationship="synthetic", home_city="", notes="")
     bot.add_expense(SYNTHETIC_OWNER, 100, "synthetic", "RUB", "test", spent_at=NOW.isoformat())
 
 
@@ -129,6 +129,7 @@ def run_case(case: TrialCase, runtime: SemanticProductionRuntime, *, allowlisted
     return {"number": case.number, "phrase": case.phrase, "mode": case.mode, "expected": case.expected,
             "status": result.status, "handled": result.handled, "operations": operations,
             "before": before, "after": after, "execution_status": execution_status(case.request_id),
+            "replayed": bool(result.execution and result.execution.status == "REPLAYED"),
             "latency_ms": round((time.perf_counter() - started) * 1000, 1), "reply_nonempty": bool(result.reply)}
 
 
@@ -144,11 +145,13 @@ def verify(entry: dict) -> tuple[str, str]:
     if expected == "expense":
         return ("PASS", "one expense") if status == "ACTION_RECEIPT" and after["expenses"] == before["expenses"] + 1 and entry["execution_status"] == "EXECUTED" else ("FAIL", "expense state")
     if expected == "expense_replay":
-        return ("PASS", "replayed once") if status == "ACTION_RECEIPT" and before == after and entry["execution_status"] == "EXECUTED" else ("FAIL", "replay state")
+        return ("PASS", "replayed once") if status == "ACTION_RECEIPT" and before == after and entry["replayed"] else ("FAIL", "replay state")
     if expected == "expense_second":
         return ("PASS", "intentional second expense") if status == "ACTION_RECEIPT" and after["expenses"] == before["expenses"] + 1 and entry["execution_status"] == "EXECUTED" else ("FAIL", "second expense")
     if expected == "person":
-        return ("PASS", "person exact state") if status == "ACTION_RECEIPT" and after["people"] >= before["people"] else ("FAIL", "person state")
+        with bot.conn() as connection:
+            people = connection.execute("SELECT home_city,notes FROM people WHERE chat_id=? AND name='Иван'", (SYNTHETIC_OWNER,)).fetchall()
+        return ("PASS", "person exact state") if status == "ACTION_RECEIPT" and len(people) == 1 and people[0]["home_city"] == "Казань" and "дизайнер" in str(people[0]["notes"] or "").lower() else ("FAIL", "person state")
     if expected == "meeting":
         return ("PASS", "event exact state") if status == "ACTION_RECEIPT" and after["events"] == before["events"] + 1 else ("FAIL", "meeting state")
     if expected == "meeting_read":

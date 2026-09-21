@@ -129,6 +129,17 @@ class SemanticProductionRuntime:
             self._emit("semantic_runtime_skipped", runtime_mode=mode, failure_category=reason)
             return self._result("FALLBACK_TO_LEGACY", failure_category=reason)
         self._emit("semantic_runtime_started", runtime_mode=mode)
+        existing = getattr(self.executor, "existing_execution", None)
+        try:
+            prior = await asyncio.to_thread(existing, trusted_owner, request_id) if existing else None
+        except Exception:
+            prior = ExecutionResult("REJECTED", request_id, failure_category="execution_store_error")
+        if prior is not None:
+            if prior.status == "REPLAYED":
+                step = prior.actions[0] if prior.actions else None
+                operation = f"{step.get('domain', '')}.{step.get('operation', '')}" if isinstance(step, dict) else f"{getattr(step, 'domain', '')}.{getattr(step, 'operation', '')}"
+                return self._result("ACTION_RECEIPT", handled=True, reply=RECEIPTS.get(operation, "Готово. Изменения сохранены."), disposition="commit", execution_started=True, execution=prior)
+            return self._result("FAILURE_AFTER_EXECUTION_STARTED", handled=True, reply=self._clarification(prior.failure_category), disposition="clarify", failure_category=prior.failure_category, execution_started=True, execution=prior)
         try:
             plan = await self.planner.plan(utterance, now=now, timezone=timezone,
                                            conversation_context=conversation_context or {}, memory_context=memory_context)

@@ -171,6 +171,10 @@ class PlanValidator:
                 allowed = {"name","relationship","birthday","age","home_city","current_location","projects","notes","aliases","groups","tags"}
                 if set(fields) - allowed: raise PlanValidationError("unsupported_person_field")
             refs = [resolve(r, r.mention.casefold().strip() in create_mentions) for r in item.entity_refs]
+            if item.domain == "person" and item.operation in {"upsert", "resolve_or_create"}:
+                targets = [ref for ref in refs if ref.type == "person" and str(ref.mention or "").strip()]
+                if len(targets) != 1 or len(refs) != 1:
+                    raise PlanValidationError("ambiguous_person_target" if len(targets) > 1 else "missing_person_target")
             if item.domain == "event" and item.operation == "create":
                 if fields.get("kind", "other") in {"meeting", "call", "appointment", "lesson"} and fields.get("local_date") and not fields.get("local_datetime") and not fields.get("all_day"):
                     raise PlanValidationError("missing_time")
@@ -207,7 +211,10 @@ class BotDomainServices:
     def write(self, owner: int, item: ValidatedAction, dependency_results: dict[str, dict[str, Any]], timezone_name: str) -> dict[str, Any]:
         fields = dict(item.fields); people = [r.resolved_id for r in item.entity_refs if r.type == "person" and r.resolved_id is not None]
         if item.domain == "person" and item.operation in {"upsert", "resolve_or_create"}:
-            name = fields.pop("name", item.entity_refs[0].mention if item.entity_refs else "")
+            name = next((str(ref.mention).strip() for ref in item.entity_refs if ref.type == "person" and str(ref.mention or "").strip()), "")
+            if not name:
+                raise PlanValidationError("missing_person_target")
+            fields.pop("name", None)
             return self.bot.person_upsert(owner, name, **fields)
         if item.domain == "event" and item.operation == "create":
             for dependency in item.depends_on:
@@ -246,15 +253,24 @@ class PlanExecutor:
         try:
             if self.observer: self.observer(event, **fields)
         except Exception: pass
+    def existing_execution(self, owner: int, request_id: str) -> ExecutionResult | None:
+        with self.connection_factory() as c:
+            row = c.execute("SELECT status,result_json FROM semantic_executions WHERE chat_id=? AND request_id=?", (owner, request_id)).fetchone()
+        if not row: return None
+        if row["status"] == "EXECUTED":
+            try:
+                result = ExecutionResult(**json.loads(row["result_json"])); result.status = "REPLAYED"; return result
+            except Exception: return ExecutionResult("REJECTED", request_id, failure_category="corrupt_execution_result")
+        return ExecutionResult("REJECTED", request_id, failure_category="request_running" if row["status"] == "RUNNING" else "request_not_replayable")
     def execute(self, plan: ValidatedPlan, *, timezone_name: str) -> ExecutionResult:
         started = time.perf_counter(); fingerprint = hashlib.sha256(repr(plan).encode()).hexdigest(); now = datetime.now(timezone.utc).isoformat()
         with self.connection_factory() as c:
             c.execute("BEGIN IMMEDIATE")
             prior = c.execute("SELECT plan_fingerprint,status,result_json FROM semantic_executions WHERE chat_id=? AND request_id=?", (plan.owner, plan.request_id)).fetchone()
-            if prior and prior["plan_fingerprint"] != fingerprint:
-                return ExecutionResult("REJECTED", plan.request_id, failure_category="idempotency_conflict")
             if prior and prior["status"] == "EXECUTED":
                 result = ExecutionResult(**json.loads(prior["result_json"])); result.status = "REPLAYED"; self._emit("semantic_execution_replayed"); return result
+            if prior and prior["plan_fingerprint"] != fingerprint:
+                return ExecutionResult("REJECTED", plan.request_id, failure_category="idempotency_conflict")
             if prior:
                 return ExecutionResult("REJECTED", plan.request_id, failure_category="request_not_replayable")
             claimed = c.execute("INSERT OR IGNORE INTO semantic_executions(chat_id,request_id,plan_fingerprint,status,result_json,created_at) VALUES(?,?,?,?,?,?)", (plan.owner, plan.request_id, fingerprint, "RUNNING", "", now))

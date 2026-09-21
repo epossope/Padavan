@@ -403,6 +403,12 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
         valid = parse_semantic_plan(plan("finance", "read", reads=[read("finance", "summary", filters={"period": "today", "date_from": "2026-09-17"})]))
         self.assertEqual("today", valid.reads[0].filters["period"])
 
+    def test_person_upsert_requires_one_person_target(self):
+        with self.assertRaisesRegex(ValueError, "missing_person_target"):
+            parse_semantic_plan(plan("person", "commit", actions=[action("person", "upsert", fields={"notes": "дизайнер"})]))
+        valid = parse_semantic_plan(plan("person", "commit", actions=[action("person", "upsert", entity_refs=[entity("person", "Иван")], fields={"notes": "дизайнер"})]))
+        self.assertEqual("Иван", valid.actions[0].entity_refs[0].mention)
+
     def test_optional_null_clarification_is_normalized_but_clarify_requires_text(self):
         for payload in (
             plan("save", "commit", actions=[action("note", "create", fields={"text": "x"})], clarification=None),

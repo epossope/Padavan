@@ -104,7 +104,7 @@ MAX_CLARIFICATION = 600
 
 PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only JSON matching the schema; never invent database IDs or owner identifiers.
 User facts need exact reads; exact current state outranks memory/conversation. Only explicit committed requests produce actions. Uncertainty or missing execution data is clarify. Create/update/delete/save/remind/spend is commit; user-state questions are read; general knowledge is answer.
-First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Entity refs are people only: type exactly "person"; a meeting is event domain, never entity type "meeting". Owner-only reads such as finance.summary never carry person entity_refs. Explicit delete/cancel/update is always commit: event.search is only the prerequisite lookup, then include the mutation action; never stop at read. The mutation action has no entity_refs; keep the person ref on event.search and depend_on its read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
+First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. A person.upsert has exactly one person entity_ref target; profile fields never replace that target. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Entity refs are people only: type exactly "person"; a meeting is event domain, never entity type "meeting". Owner-only reads such as finance.summary never carry person entity_refs. Explicit delete/cancel/update is always commit: event.search is only the prerequisite lookup, then include the mutation action; never stop at read. The mutation action has no entity_refs; keep the person ref on event.search and depend_on its read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
 
 # One model-visible contract, deliberately independent of user phrasing.
 OPERATION_CONTRACT = {
@@ -119,7 +119,7 @@ OPERATION_CONTRACT = {
         "note.list": {"filters": ["query", "date", "limit"]}, "note.search": {"filters": ["query"]},
     },
     "actions": {
-        "person.upsert": {"fields": ["name", "relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"], "unsupported_facts": "notes"},
+        "person.upsert": {"entity_refs": "exactly one person target", "fields": ["relationship", "birthday", "age", "home_city", "current_location", "projects", "notes", "aliases", "groups", "tags"], "unsupported_facts": "notes"},
         "event.create": {"required": ["title", "local_datetime OR local_date"], "optional": ["kind"], "person_via": "entity_refs(type=person only)"},
         "transaction.create": {"required": ["amount"], "optional": ["currency", "category", "description", "merchant", "kind", "spent_at"]},
         "reminder.create": {"required": ["title/text", "local_datetime"]}, "task.create": {}, "note.create": {},
@@ -159,10 +159,12 @@ def _action_schema(domain: str, operation: str) -> dict[str, Any]:
     }
     if pair in ACTION_ENTITY_REF_PAIRS:
         properties["entity_refs"] = {"type": "array", "items": {"$ref": "#/$defs/person_entity"}}
+        if pair == ("person", "upsert"):
+            properties["entity_refs"].update({"minItems": 1, "maxItems": 1})
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["domain", "operation"],
+        "required": ["domain", "operation"] + (["entity_refs"] if pair == ("person", "upsert") else []),
         "properties": properties,
     }
 
@@ -362,6 +364,12 @@ def _action(value: Any) -> ActionRequest:
     pair = (domain, operation)
     if "entity_refs" in data and pair not in ACTION_ENTITY_REF_PAIRS:
         raise _invalid("unsupported_entity_refs")
+    refs = _person_ref_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS) if pair in ACTION_ENTITY_REF_PAIRS else []
+    if pair == ("person", "upsert"):
+        if not refs:
+            raise _invalid("missing_person_target")
+        if len(refs) != 1:
+            raise _invalid("ambiguous_person_target")
     dependencies = data.get("depends_on", [])
     if not isinstance(dependencies, list) or len(dependencies) > MAX_ACTIONS:
         raise _invalid("dependencies_type")
@@ -369,8 +377,7 @@ def _action(value: Any) -> ActionRequest:
         domain=domain,
         operation=operation,
         fields=fields,
-        entity_refs=_person_ref_list(data.get("entity_refs", []), maximum=MAX_ENTITY_REFS)
-        if pair in ACTION_ENTITY_REF_PAIRS else [],
+        entity_refs=refs,
         depends_on=[_string(item, label="dependency") for item in dependencies],
         confidence=_confidence(data.get("confidence")),
         action_id=_string(data.get("action_id", ""), label="action_id", allow_empty=True),

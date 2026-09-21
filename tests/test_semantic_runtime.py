@@ -88,13 +88,14 @@ class SemanticRuntimeTests(unittest.TestCase):
             ("reminder", "create", {"title": "Позвонить", "local_datetime": "2026-09-22T09:00:00"}, "Готово. Напоминание создано."),
             ("transaction", "create", {"amount": 10, "currency": "RUB"}, "Готово. Расход сохранён."),
             ("event", "create", {"title": "Встреча", "local_datetime": "2026-09-22T15:00:00"}, "Готово. Встреча сохранена."),
-            ("person", "upsert", {"name": "Пётр"}, "Готово. Информация сохранена."),
+            ("person", "upsert", {}, "Готово. Информация сохранена."),
             ("note", "create", {"text": "Заметка"}, "Готово. Заметка сохранена."),
             ("task", "create", {"text": "Задача"}, "Готово. Задача создана."),
         ]
         for index, (domain, operation, fields, receipt) in enumerate(cases):
             with self.subTest(domain=domain):
-                plan = SemanticPlan("write", "commit", actions=[ActionRequest(domain, operation, fields=fields, action_id="a")])
+                refs = [EntityReference("person", "Пётр")] if domain == "person" else []
+                plan = SemanticPlan("write", "commit", actions=[ActionRequest(domain, operation, fields=fields, entity_refs=refs, action_id="a")])
                 runtime = self.runtime(plan); request = f"write-{index}"
                 first, replay = self.turn(runtime, request), self.turn(runtime, request)
                 self.assertEqual(("ACTION_RECEIPT", receipt), (first.status, first.reply))
@@ -161,6 +162,16 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.turn(reminder_runtime, "reminder-x"); self.turn(reminder_runtime, "reminder-x")
         with bot.conn() as connection:
             self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM reminders WHERE chat_id=?", (self.owner,)).fetchone()[0])
+
+    def test_completed_replay_skips_planner_even_if_new_plan_would_differ(self):
+        plan = SemanticPlan("expense", "commit", actions=[ActionRequest("transaction", "create", fields={"amount": 1, "currency": "RUB"}, action_id="a")])
+        runtime = self.runtime(plan)
+        self.turn(runtime, "replay-key")
+        class NeverPlanner:
+            async def plan(self, *args, **kwargs): raise AssertionError("planner must not run on replay")
+        runtime.planner = NeverPlanner()
+        replay = self.turn(runtime, "replay-key")
+        self.assertEqual(("ACTION_RECEIPT", "REPLAYED"), (replay.status, replay.execution.status))
 
     def test_channel_neutral_stream_stops_legacy_when_semantic_handles(self):
         handled = SemanticRuntimeResult("READ_ANSWER", handled=True, reply="Точный ответ.")

@@ -21,7 +21,7 @@ class SemanticProductionTrialTests(unittest.TestCase):
     def test_verify_expense_replay_and_new_turn_are_exact_state_based(self):
         base = {"expenses": 1, "people": 1, "events": 0, "reminders": 0, "semantic_executions": 1}
         original = {"expected": "expense", "status": "ACTION_RECEIPT", "before": base, "after": {**base, "expenses": 2, "semantic_executions": 2}, "execution_status": "EXECUTED"}
-        replay = {"expected": "expense_replay", "status": "ACTION_RECEIPT", "before": original["after"], "after": original["after"], "execution_status": "EXECUTED"}
+        replay = {"expected": "expense_replay", "status": "ACTION_RECEIPT", "before": original["after"], "after": original["after"], "execution_status": "EXECUTED", "replayed": True}
         new_turn = {"expected": "expense_second", "status": "ACTION_RECEIPT", "before": original["after"], "after": {**original["after"], "expenses": 3, "semantic_executions": 3}, "execution_status": "EXECUTED"}
         self.assertEqual("PASS", trial.verify(original)[0])
         self.assertEqual("PASS", trial.verify(replay)[0])
