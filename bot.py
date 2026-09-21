@@ -4953,8 +4953,42 @@ def run_semantic_production_turn(chat_id, text, *, request_id, conversation_cont
             conversation_context=conversation_context or {"recent_entities": []},
         ))
     except Exception:
+        claimed = semantic_execution_claimed(chat_id, str(request_id))
+        DIAGNOSTICS.record("semantic_runtime_bridge_failure", execution_claimed=claimed)
+        if claimed:
+            return SemanticRuntimeResult(
+                "FAILURE_AFTER_EXECUTION_STARTED", handled=True,
+                reply="Не удалось надёжно завершить действие. Проверь текущие данные перед повтором.",
+                disposition="clarify", failure_category="runtime_bridge_error", execution_started=True,
+            )
         DIAGNOSTICS.record("semantic_runtime_fallback", runtime_mode=mode, failure_category="runtime_error")
         return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="runtime_error")
+
+
+def semantic_execution_claimed(chat_id, request_id):
+    """Read the authoritative execution boundary without exposing its state."""
+    try:
+        with conn() as connection:
+            return connection.execute(
+                "SELECT 1 FROM semantic_executions WHERE chat_id=? AND request_id=? LIMIT 1",
+                (int(chat_id), str(request_id)),
+            ).fetchone() is not None
+    except Exception:
+        # If exact boundary state cannot be read, fail closed: allowing a
+        # legacy write would be less safe than showing a retry-safe failure.
+        return True
+
+
+def telegram_semantic_request_id(update):
+    """Derive a stable semantic idempotency key from trusted Telegram transport."""
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    message_id = getattr(getattr(update, "effective_message", None), "message_id", None)
+    if isinstance(chat_id, int) and isinstance(message_id, int):
+        return f"tg:{chat_id}:{message_id}"
+    update_id = getattr(update, "update_id", None)
+    if isinstance(update_id, int):
+        return f"tg-update:{update_id}"
+    return ""
 
 
 def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None, legacy_trace=None, loop=None):
@@ -5321,6 +5355,7 @@ async def stream_answer_to_telegram_draft(update, context, text):
     """Stream one ephemeral draft, then persist exactly one formatted final answer."""
     chat_id = update.effective_chat.id
     draft_id, cancelled = _new_draft_id(), threading.Event()
+    semantic_request_id = telegram_semantic_request_id(update) or f"tg-draft:{chat_id}:{draft_id}"
     register_active_draft(chat_id, draft_id, cancelled)
     queue, loop = asyncio.Queue(), asyncio.get_running_loop()
 
@@ -5328,7 +5363,7 @@ async def stream_answer_to_telegram_draft(update, context, text):
         try:
             stream = stream_agent_response
             if "request_id" in inspect.signature(stream).parameters:
-                events = stream(chat_id, text, cancelled, request_id=draft_id, shadow_loop=loop)
+                events = stream(chat_id, text, cancelled, request_id=semantic_request_id, shadow_loop=loop)
             else:  # Existing embedders/tests that retain the old stream shape.
                 events = stream(chat_id, text, cancelled)
             for event in events:
@@ -5653,6 +5688,7 @@ async def stream_answer_to_telegram(update, context, text):
     """Deliver normal private text through one mutable Telegram message."""
     chat_id = update.effective_chat.id
     request_id, cancelled = uuid.uuid4().hex, threading.Event()
+    semantic_request_id = telegram_semantic_request_id(update) or f"tg-delivery:{chat_id}:{request_id}"
     register_active_draft(chat_id, request_id, cancelled)
     queue, loop = asyncio.Queue(), asyncio.get_running_loop()
 
@@ -5660,7 +5696,7 @@ async def stream_answer_to_telegram(update, context, text):
         try:
             stream = stream_agent_response
             if "request_id" in inspect.signature(stream).parameters:
-                events = stream(chat_id, text, cancelled, request_id=request_id, shadow_loop=loop)
+                events = stream(chat_id, text, cancelled, request_id=semantic_request_id, shadow_loop=loop)
             else:  # Existing embedders/tests that retain the old stream shape.
                 events = stream(chat_id, text, cancelled)
             for event in events:

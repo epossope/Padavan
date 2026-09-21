@@ -1,8 +1,10 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import bot
@@ -126,6 +128,40 @@ class SemanticRuntimeTests(unittest.TestCase):
         result = self.turn(self.runtime(plan, executor=RaisingExecutor()))
         self.assertEqual(("FAILURE_AFTER_EXECUTION_STARTED", True, "unexpected_execution_error"), (result.status, result.execution_started, result.failure_category))
 
+    def test_bridge_fallback_stops_after_authoritative_execution_claim(self):
+        request = "bridge-request"
+        with patch.dict(os.environ, {"SEMANTIC_RUNTIME_MODE": "safe_write", "SEMANTIC_CANARY_USER_IDS": str(self.owner)}), \
+             patch.object(bot, "get_semantic_production_runtime", side_effect=RuntimeError("private failure")):
+            before = bot.run_semantic_production_turn(self.owner, "text", request_id=request)
+            self.assertEqual(("FALLBACK_TO_LEGACY", False), (before.status, before.handled))
+            with bot.conn() as connection:
+                connection.execute("INSERT INTO semantic_executions(chat_id,request_id,plan_fingerprint,status,result_json,created_at) VALUES(?,?,?,?,?,?)", (self.owner, request, "x", "RUNNING", "", "now"))
+            after = bot.run_semantic_production_turn(self.owner, "text", request_id=request)
+        self.assertEqual(("FAILURE_AFTER_EXECUTION_STARTED", True, True), (after.status, after.handled, after.execution_started))
+
+    def test_stable_telegram_transport_ids_ignore_text(self):
+        first = SimpleNamespace(effective_chat=SimpleNamespace(id=self.owner), effective_message=SimpleNamespace(message_id=11), update_id=101)
+        duplicate = SimpleNamespace(effective_chat=SimpleNamespace(id=self.owner), effective_message=SimpleNamespace(message_id=11), update_id=999)
+        next_message = SimpleNamespace(effective_chat=SimpleNamespace(id=self.owner), effective_message=SimpleNamespace(message_id=12), update_id=102)
+        self.assertEqual("tg:902:11", bot.telegram_semantic_request_id(first))
+        self.assertEqual(bot.telegram_semantic_request_id(first), bot.telegram_semantic_request_id(duplicate))
+        self.assertNotEqual(bot.telegram_semantic_request_id(first), bot.telegram_semantic_request_id(next_message))
+
+    def test_same_transport_request_replays_but_same_text_new_turn_writes_again(self):
+        fields = {"amount": 450, "currency": "RUB", "description": "coffee"}
+        plan = SemanticPlan("expense", "commit", actions=[ActionRequest("transaction", "create", fields=fields, action_id="a")])
+        runtime = self.runtime(plan)
+        self.assertEqual("ACTION_RECEIPT", self.turn(runtime, "transport-x").status)
+        self.assertEqual("REPLAYED", self.turn(runtime, "transport-x").execution.status)
+        self.assertEqual("ACTION_RECEIPT", self.turn(runtime, "transport-y").status)
+        with bot.conn() as connection:
+            self.assertEqual(2, connection.execute("SELECT COUNT(*) FROM expenses WHERE chat_id=?", (self.owner,)).fetchone()[0])
+        reminder = SemanticPlan("reminder", "commit", actions=[ActionRequest("reminder", "create", fields={"title": "call", "local_datetime": "2026-09-22T09:00:00"}, action_id="a")])
+        reminder_runtime = self.runtime(reminder)
+        self.turn(reminder_runtime, "reminder-x"); self.turn(reminder_runtime, "reminder-x")
+        with bot.conn() as connection:
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM reminders WHERE chat_id=?", (self.owner,)).fetchone()[0])
+
     def test_channel_neutral_stream_stops_legacy_when_semantic_handles(self):
         handled = SemanticRuntimeResult("READ_ANSWER", handled=True, reply="Точный ответ.")
         with patch.object(bot, "run_semantic_production_turn", return_value=handled), \
@@ -133,6 +169,14 @@ class SemanticRuntimeTests(unittest.TestCase):
              patch.object(bot, "record_user_request"), patch.object(bot, "add_message", side_effect=[1, 2]):
             events = list(bot.stream_agent_response(self.owner, "text", request_id="channel"))
         self.assertEqual("Точный ответ.", events[-1]["text"])
+
+    def test_rendering_exception_after_handled_execution_never_enters_legacy(self):
+        handled = SemanticRuntimeResult("ACTION_RECEIPT", handled=True, reply="Готово.", execution_started=True)
+        with patch.object(bot, "run_semantic_production_turn", return_value=handled), \
+             patch.object(bot, "_stream_agent_response_legacy", side_effect=AssertionError("legacy called")), \
+             patch.object(bot, "record_user_request"), patch.object(bot, "add_message", side_effect=RuntimeError("render failure")):
+            with self.assertRaisesRegex(RuntimeError, "render failure"):
+                list(bot.stream_agent_response(self.owner, "text", request_id="claimed"))
 
     def test_channel_neutral_stream_uses_legacy_once_on_fallback(self):
         fallback = SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="disabled")

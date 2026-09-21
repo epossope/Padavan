@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from miniapp_api import APP_BUILD_ID, MINIAPP_BUILD_ASSETS, miniapp_build_id, register_miniapp
+from miniapp_api import APP_BUILD_ID, MINIAPP_BUILD_ASSETS, miniapp_build_id, miniapp_semantic_request_id, register_miniapp
 
 
 class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -307,7 +307,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.core.set_app_setting.assert_called_once_with('miniapp_home_widgets:42', '[]')
 
     async def test_chat_stream_is_ndjson_and_preserves_deltas(self):
-        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет"})
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет", "request_id": "00000000-0000-4000-8000-000000000001"})
         self.assertEqual(response.status, 200)
         body = await response.text()
         events = [json.loads(line) for line in body.splitlines()]
@@ -321,6 +321,23 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
         status = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "conversation_job", "args": {"id": job_id}})
         self.assertEqual(status.status, 200)
         self.assertEqual((await status.json())["data"]["status"], "done")
+
+    async def test_chat_stream_uses_client_turn_token_not_job_id(self):
+        received = []
+        def stream(cid, text, cancelled, *, request_id, shadow_loop=None):
+            received.append(request_id)
+            yield {"type": "done", "text": "ok"}
+        self.core.stream_agent_response = stream
+        token = "00000000-0000-4000-8000-000000000010"
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "same", "request_id": token})
+        self.assertEqual(200, response.status); await response.text()
+        self.assertEqual(["mini:42:" + token], received)
+        self.assertEqual("mini:42:" + token, miniapp_semantic_request_id(42, token))
+        self.assertNotEqual(miniapp_semantic_request_id(42, token), miniapp_semantic_request_id(42, "00000000-0000-4000-8000-000000000011"))
+
+    async def test_chat_stream_rejects_bad_client_turn_token_before_stream(self):
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет", "request_id": "text-hash"})
+        self.assertEqual(400, response.status)
 
     async def test_realtime_beta_is_explicitly_opt_in(self):
         response = await self.client.post('/api/v1/miniapp', json={"init_data": "signed", "action": "set_experimental_realtime", "args": {"enabled": True}})
@@ -362,7 +379,7 @@ class MiniAppSecurityTests(unittest.IsolatedAsyncioTestCase):
             yield {"type": "done", "text": "Готово"}
 
         self.core.stream_agent_response = slow_stream
-        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет"})
+        response = await self.client.post('/api/v1/miniapp/chat-stream', json={"init_data": "signed", "text": "Привет", "request_id": "00000000-0000-4000-8000-000000000002"})
         self.assertEqual(response.status, 200)
         first_line = await response.content.readline()
         self.assertEqual(json.loads(first_line)["type"], "job")
