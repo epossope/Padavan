@@ -64,6 +64,18 @@ def canary_owners(environ: dict[str, str] | None = None) -> frozenset[int]:
     return frozenset(result)
 
 
+def semantic_owner_allowed(owner: int, environ: dict[str, str] | None = None) -> bool:
+    """Allow only configured trusted owners; a sole ``*`` enables global rollout."""
+    source = os.environ if environ is None else environ
+    configured = str(source.get("SEMANTIC_CANARY_USER_IDS", "")).strip()
+    if configured == "*":
+        return True
+    try:
+        return int(owner) in canary_owners(source)
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(slots=True)
 class SemanticRuntimeResult:
     status: str
@@ -80,11 +92,13 @@ class SemanticProductionRuntime:
 
     def __init__(self, planner, validator, services, executor, assembler, responder, *,
                  mode_getter: Callable[[], str] = runtime_mode,
-                 owners_getter: Callable[[], frozenset[int]] = canary_owners,
+                 owners_getter: Callable[[], frozenset[int]] | None = None,
+                 owner_allowed_getter: Callable[[int], bool] | None = None,
                  observer=None, metric_recorder=None):
         self.planner, self.validator, self.services = planner, validator, services
         self.executor, self.assembler, self.responder = executor, assembler, responder
         self.mode_getter, self.owners_getter = mode_getter, owners_getter
+        self.owner_allowed_getter = owner_allowed_getter or (None if owners_getter else semantic_owner_allowed)
         self.observer, self.metric = observer, metric_recorder
 
     def _emit(self, event: str, **fields: Any) -> None:
@@ -101,7 +115,8 @@ class SemanticProductionRuntime:
         mode = self.mode_getter()
         if mode == "off":
             return False, mode, "disabled"
-        if int(owner) not in self.owners_getter():
+        allowed = self.owner_allowed_getter(int(owner)) if self.owner_allowed_getter else int(owner) in self.owners_getter()
+        if not allowed:
             return False, mode, "not_allowlisted"
         return True, mode, ""
 

@@ -11,7 +11,8 @@ import bot
 from grounded_response import EvidenceAssembler
 from plan_runtime import BotDomainServices, PlanExecutor, PlanValidator
 from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticPlan
-from semantic_runtime import SemanticProductionRuntime, SemanticRuntimeResult, canary_owners, runtime_mode
+from semantic_runtime import (SemanticProductionRuntime, SemanticRuntimeResult,
+                              canary_owners, runtime_mode, semantic_owner_allowed)
 
 
 class Planner:
@@ -36,11 +37,11 @@ class SemanticRuntimeTests(unittest.TestCase):
 
     def tearDown(self): self.patch.stop(); self.temp.cleanup()
 
-    def runtime(self, plan, *, executor=None):
+    def runtime(self, plan, *, executor=None, owner_allowed_getter=None):
         return SemanticProductionRuntime(
             Planner(plan), PlanValidator(bot.person_entity_resolver()), self.services, executor or self.executor,
             EvidenceAssembler(), Responder(), mode_getter=lambda: self.mode,
-            owners_getter=lambda: self.allowed,
+            owners_getter=lambda: self.allowed, owner_allowed_getter=owner_allowed_getter,
         )
 
     def turn(self, runtime, request="request-1"):
@@ -61,8 +62,36 @@ class SemanticRuntimeTests(unittest.TestCase):
     def test_mode_and_allowlist_defaults_fail_closed(self):
         self.assertEqual("off", runtime_mode({}))
         self.assertEqual(frozenset(), canary_owners({}))
+        self.assertFalse(semantic_owner_allowed(1, {}))
         self.assertEqual("off", runtime_mode({"SEMANTIC_RUNTIME_MODE": "unexpected"}))
         self.assertEqual(frozenset({1, 2}), canary_owners({"SEMANTIC_CANARY_USER_IDS": "1, invalid, 2"}))
+
+    def test_global_rollout_wildcard_is_exact_and_malformed_values_fail_closed(self):
+        self.assertTrue(semantic_owner_allowed(1, {"SEMANTIC_CANARY_USER_IDS": "*"}))
+        self.assertTrue(semantic_owner_allowed(999_999, {"SEMANTIC_CANARY_USER_IDS": " * "}))
+        numeric = {"SEMANTIC_CANARY_USER_IDS": "1,2"}
+        self.assertTrue(semantic_owner_allowed(1, numeric))
+        self.assertTrue(semantic_owner_allowed(2, numeric))
+        self.assertFalse(semantic_owner_allowed(3, numeric))
+        for malformed in ("1,*", "*,2", "**", "all", "true"):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(semantic_owner_allowed(999_999, {"SEMANTIC_CANARY_USER_IDS": malformed}))
+        self.assertTrue(semantic_owner_allowed(1, {"SEMANTIC_CANARY_USER_IDS": "1,*"}))
+
+    def test_off_kill_switch_overrides_global_rollout(self):
+        plan = SemanticPlan("finance", "read", reads=[ReadRequest("finance", "summary", read_id="f")])
+        self.mode = "off"
+        runtime = self.runtime(plan, owner_allowed_getter=lambda owner: semantic_owner_allowed(owner, {"SEMANTIC_CANARY_USER_IDS": "*"}))
+        self.assertEqual("FALLBACK_TO_LEGACY", self.turn(runtime).status)
+        self.assertEqual(0, runtime.planner.calls)
+
+    def test_full_global_rollout_allows_existing_safe_action(self):
+        self.mode = "full"
+        plan = SemanticPlan("write", "commit", actions=[ActionRequest("task", "create", fields={"text": "global rollout"}, action_id="a")])
+        runtime = self.runtime(plan, owner_allowed_getter=lambda owner: semantic_owner_allowed(owner, {"SEMANTIC_CANARY_USER_IDS": "*"}))
+        self.assertEqual("ACTION_RECEIPT", self.turn(runtime, "global-full").status)
+        with bot.conn() as connection:
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM tasks WHERE chat_id=?", (self.owner,)).fetchone()[0])
 
     def test_allowlisted_read_is_exact_and_handled(self):
         self.mode = "read"

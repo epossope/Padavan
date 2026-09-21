@@ -48,6 +48,21 @@ For any semantic concern, set `SEMANTIC_RUNTIME_MODE=off`, clear
 remains the active path. This rollback does not delete legacy code, user data,
 or `semantic_executions` receipts.
 
+### Approved global semantic rollout
+
+For a reviewed rollout to every authenticated/trusted Telegram or signed Mini
+App owner, set exactly:
+
+```text
+SEMANTIC_RUNTIME_MODE=full
+SEMANTIC_CANARY_USER_IDS=*
+```
+
+`*` is global only when it is the entire trimmed value. Mixed values such as
+`1,*` or `*,2` do not enable everyone; only valid numeric IDs in those values
+remain allowlisted. `off` is always the global kill switch. Do not use this
+setting for anonymous or unauthenticated traffic.
+
 ## Восстановление существующей памяти
 
 Перед загрузкой базы остановите приложение. В разделе **Repository → Data**

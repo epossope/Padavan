@@ -4940,11 +4940,11 @@ def get_semantic_production_runtime(chat_id):
 
 def run_semantic_production_turn(chat_id, text, *, request_id, conversation_context=None):
     """Synchronous bridge used by both Telegram and Mini App stream workers."""
-    from semantic_runtime import SemanticRuntimeResult, canary_owners, runtime_mode
+    from semantic_runtime import SemanticRuntimeResult, runtime_mode, semantic_owner_allowed
     mode = runtime_mode()
     if mode == "off":
         return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="disabled")
-    if int(chat_id) not in canary_owners():
+    if not semantic_owner_allowed(chat_id):
         return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="not_allowlisted")
     try:
         return asyncio.run(get_semantic_production_runtime(chat_id).handle_turn(
