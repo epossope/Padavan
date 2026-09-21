@@ -178,6 +178,29 @@ def markdown(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def trial_summary(entries: list[dict], *, real_db_writes: int) -> dict[str, object]:
+    """Calculate acceptance/readiness only from accepted trial outcomes."""
+    def cases_pass(indices: tuple[int, ...]) -> bool:
+        return len(entries) > max(indices, default=-1) and all(entries[index]["verdict"] == "PASS" for index in indices)
+
+    failures = sum(item["verdict"] == "FAIL" for item in entries)
+    semantic_failures = sum(
+        item["verdict"] == "FAIL"
+        and item["status"] in {"FAILURE_AFTER_EXECUTION_STARTED", "PLANNER_FAILED"}
+        for item in entries
+    )
+    passed = sum(item["verdict"] == "PASS" for item in entries)
+    return {
+        "TOTAL": len(entries), "PASS": passed, "WARN": 0, "FAIL": failures,
+        "SEMANTIC_FAILURES": semantic_failures, "EXACT_STATE_PASS": f"{passed}/{len(entries)}",
+        "IDEMPOTENCY_PASS": "YES" if cases_pass((3, 5, 6)) else "NO",
+        "REAL_DB_WRITES": real_db_writes,
+        "CANARY_READ_READY": "YES" if failures == 0 and semantic_failures == 0 else "NO",
+        "CANARY_SAFE_WRITE_READY": "YES" if failures == 0 and semantic_failures == 0 else "NO",
+        "CANARY_FULL_READY": "YES" if failures == 0 and cases_pass((14, 15)) else "NO",
+    }
+
+
 def run_trial(*, runtime_factory=make_runtime) -> dict:
     ensure_live_model_is_configured()
     with temp_database() as database:
@@ -193,14 +216,7 @@ def run_trial(*, runtime_factory=make_runtime) -> dict:
             entry["verdict"], entry["check"] = verify(entry)
             entries.append(entry)
         real_db_writes = 0
-    failures = sum(item["verdict"] == "FAIL" for item in entries)
-    semantic_failures = sum(item["status"] in {"FAILURE_AFTER_EXECUTION_STARTED", "PLANNER_FAILED"} for item in entries)
-    summary = {"TOTAL": len(entries), "PASS": sum(item["verdict"] == "PASS" for item in entries), "WARN": 0, "FAIL": failures,
-               "SEMANTIC_FAILURES": semantic_failures, "EXACT_STATE_PASS": f"{sum(item['verdict'] == 'PASS' for item in entries)}/{len(entries)}",
-               "IDEMPOTENCY_PASS": "YES" if all(entries[index]["verdict"] == "PASS" for index in (3, 5, 6)) else "NO", "REAL_DB_WRITES": real_db_writes,
-               "CANARY_READ_READY": "YES" if failures == 0 and semantic_failures == 0 else "NO",
-               "CANARY_SAFE_WRITE_READY": "YES" if failures == 0 and semantic_failures == 0 else "NO",
-               "CANARY_FULL_READY": "YES" if failures == 0 and all(entries[index]["verdict"] == "PASS" for index in (14, 15)) else "NO"}
+    summary = trial_summary(entries, real_db_writes=real_db_writes)
     return {"trial": "local_synthetic_production", "db_mode": "TEMP", "synthetic_owner": True,
             "model_route": model_route, "cases": entries, "summary": summary}
 

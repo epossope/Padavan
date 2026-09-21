@@ -27,6 +27,28 @@ class SemanticProductionTrialTests(unittest.TestCase):
         self.assertEqual("PASS", trial.verify(replay)[0])
         self.assertEqual("PASS", trial.verify(new_turn)[0])
 
+    def test_expected_ambiguous_execution_failure_does_not_count_as_semantic_failure(self):
+        before = {"expenses": 1, "people": 1, "events": 3, "reminders": 0, "semantic_executions": 1}
+        entry = {"expected": "delete_many", "status": "FAILURE_AFTER_EXECUTION_STARTED", "before": before, "after": dict(before)}
+        entry["verdict"], entry["check"] = trial.verify(entry)
+        summary = trial.trial_summary([entry], real_db_writes=0)
+        self.assertEqual(("PASS", "ambiguous preserved"), (entry["verdict"], entry["check"]))
+        self.assertEqual(0, summary["SEMANTIC_FAILURES"])
+
+    def test_unexpected_execution_failure_counts_as_semantic_failure(self):
+        summary = trial.trial_summary(
+            [{"status": "FAILURE_AFTER_EXECUTION_STARTED", "verdict": "FAIL"}],
+            real_db_writes=0,
+        )
+        self.assertEqual(1, summary["SEMANTIC_FAILURES"])
+
+    def test_unexpected_planner_failure_counts_as_semantic_failure(self):
+        summary = trial.trial_summary(
+            [{"status": "PLANNER_FAILED", "verdict": "FAIL"}],
+            real_db_writes=0,
+        )
+        self.assertEqual(1, summary["SEMANTIC_FAILURES"])
+
     def test_report_is_compact_and_has_no_credentials(self):
         report = {"cases": [{"number": 1, "phrase": "synthetic", "mode": "off", "status": "FALLBACK_TO_LEGACY", "operations": [], "check": "ok", "verdict": "PASS", "latency_ms": 1.0}], "summary": {"TOTAL": 1, "REAL_DB_WRITES": 0}}
         with tempfile.TemporaryDirectory() as directory:
