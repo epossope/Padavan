@@ -3,6 +3,10 @@ name: Publish clean deploy branch
 on:
   push:
     branches: [master]
+  # A release candidate can be published from its reviewed source ref without
+  # merging it into master. This is deliberately manual; automatic publishing
+  # remains limited to master.
+  workflow_dispatch:
 
 permissions:
   contents: write

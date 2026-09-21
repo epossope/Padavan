@@ -12,6 +12,12 @@ RUNTIME_FILES = (
     "artifact_service.py", "bot.py", "diagnostics.py", "ingestion.py",
     "knowledge_store.py", "media_cache.py", "miniapp_api.py", "model_router.py",
     "retrieval.py", "streaming_runtime.py", "telegram_renderer.py", "url_enricher.py",
+    # Imported by bot.py now (entity resolver) or lazily by the unchanged
+    # default-off semantic/shadow paths.  They must be present even while the
+    # production semantic runtime is disabled.
+    "entity_resolver.py", "semantic_core.py", "semantic_planner.py",
+    "plan_runtime.py", "grounded_response.py", "semantic_orchestrator.py",
+    "semantic_runtime.py",
     "miniapp/index.html", "miniapp/tokens.js", "miniapp/ui.js", "miniapp/orb.js",
     "miniapp/app.js", "miniapp/screens.js", "miniapp/mobile.js", "miniapp/voice-conversation.js",
     "miniapp/style.css", "miniapp/mobile.css", "miniapp/refinement.css", "miniapp/design-match.css",

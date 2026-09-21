@@ -21,6 +21,33 @@
    существующая память, загрузите `noema_test.sqlite3` в раздел **Data**
    Amvera как `/data/noema_test.sqlite3` и перезапустите приложение.
 
+## Semantic-core release candidate (default-off)
+
+The deploy-tree manifest includes the semantic-core modules required by the
+existing `bot.py` imports and the default-off shadow path. The release does
+not enable semantic execution.
+
+1. In Amvera environment variables, set `SEMANTIC_RUNTIME_MODE=off` and leave
+   `SEMANTIC_CANARY_USER_IDS` empty. Do not use `safe_write` or `full`.
+2. To publish the reviewed `feature/semantic-core` source without merging it
+   into `master`, run **Publish clean deploy branch** manually in GitHub
+   Actions and select that branch/ref. The workflow builds the audited tree
+   and records the selected source SHA in the linear `deploy` history.
+3. Before switching Amvera, back up `/data/noema_test.sqlite3`. The process
+   runs `init_db()` before Telegram polling and HTTP startup; it creates the
+   `semantic_executions` table and its `(chat_id, request_id)` index if absent.
+4. Deploy the resulting `deploy` branch in Amvera. Verify `NOEMA STARTED`,
+   `DATA: /data`, normal legacy text reply, Mini App `/healthz`, and that the
+   database contains `semantic_executions`. No semantic canary action is part
+   of this release smoke check.
+
+### Rollback
+
+For any semantic concern, set `SEMANTIC_RUNTIME_MODE=off`, clear
+`SEMANTIC_CANARY_USER_IDS`, and restart the service. The regular legacy stream
+remains the active path. This rollback does not delete legacy code, user data,
+or `semantic_executions` receipts.
+
 ## Восстановление существующей памяти
 
 Перед загрузкой базы остановите приложение. В разделе **Repository → Data**

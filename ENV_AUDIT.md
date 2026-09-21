@@ -25,6 +25,7 @@ Amvera должна содержать только переменные из `U
 | `TELEGRAM_SEND_RETRIES`, `TELEGRAM_CONNECT_TIMEOUT`, `TELEGRAM_READ_TIMEOUT`, `TELEGRAM_WRITE_TIMEOUT`, `TELEGRAM_POOL_TIMEOUT`, `TELEGRAM_CONNECTION_POOL_SIZE` | Telegram HTTP reliability | Optional; defaults есть |
 | `REMINDER_TICK_SECONDS` | Reminder scheduler | Optional; clamped 15–30 sec |
 | `TELEMETRY_ENABLED`, `TELEMETRY_SERIES_LIMIT` | Bounded numeric telemetry | Optional; disabled by default |
+| `SEMANTIC_RUNTIME_MODE`, `SEMANTIC_CANARY_USER_IDS` | Guarded semantic production rollout | Keep `off` and empty in Amvera for this release; do not set `safe_write` or `full` |
 | `TIMEZONE`, `DEFAULT_CITY`, `MAX_FILE_MB`, `DATA_DIR`, `NOEMA_QUICK_PORT` | Runtime defaults, storage and HTTP listener | Optional; Amvera default uses `/data`, port `8080` |
 | `OPENROUTER_MANAGEMENT_API_KEY`, `USER_SECRETS_MASTER_KEY`, `NOEMA_USER_MONTHLY_LIMIT_USD` | Optional managed per-user OpenRouter keys | Set all needed values together, otherwise omit all |
 
