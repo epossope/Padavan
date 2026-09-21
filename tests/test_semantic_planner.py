@@ -409,6 +409,25 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
         valid = parse_semantic_plan(plan("person", "commit", actions=[action("person", "upsert", entity_refs=[entity("person", "Иван")], fields={"notes": "дизайнер"})]))
         self.assertEqual("Иван", valid.actions[0].entity_refs[0].mention)
 
+    def test_person_upsert_promotes_canonical_person_profile_attributes(self):
+        parsed = parse_semantic_plan(plan(
+            "remember_person", "commit",
+            entities=[entity("person", "Иван", attributes={"home_city": "Казань", "profession": "дизайнер"})],
+            actions=[action("person", "upsert", entity_refs=[entity("person", "Иван")], fields={})],
+        ))
+        self.assertEqual(
+            {"home_city": "Казань", "notes": "дизайнер"},
+            parsed.actions[0].fields,
+        )
+
+    def test_person_upsert_rejects_conflicting_canonical_profile_attributes(self):
+        with self.assertRaisesRegex(ValueError, "conflicting_person_field"):
+            parse_semantic_plan(plan(
+                "remember_person", "commit",
+                entities=[entity("person", "Иван", attributes={"home_city": "Казань"})],
+                actions=[action("person", "upsert", entity_refs=[entity("person", "Иван")], fields={"home_city": "Москва"})],
+            ))
+
     def test_optional_null_clarification_is_normalized_but_clarify_requires_text(self):
         for payload in (
             plan("save", "commit", actions=[action("note", "create", fields={"text": "x"})], clarification=None),

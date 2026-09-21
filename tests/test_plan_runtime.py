@@ -75,6 +75,19 @@ class PlanRuntimeTests(unittest.TestCase):
         self.assertEqual("EXECUTED", result.status)
         self.assertEqual(("дизайнер", "Казань"), (person["relationship"], person["home_city"]))
 
+    def test_person_profile_promoted_by_planner_persists_on_execution(self):
+        from semantic_planner import parse_semantic_plan
+        plan = parse_semantic_plan({
+            "intent": "remember_person", "disposition": "commit",
+            "entities": [{"type": "person", "mention": "Иван", "attributes": {"home_city": "Казань", "profession": "дизайнер"}}],
+            "actions": [{"domain": "person", "operation": "upsert", "entity_refs": [{"type": "person", "mention": "Иван"}], "fields": {}}],
+        })
+        result = self.executor.execute(self.validate(plan, request="profile-promotion"), timezone_name="Europe/Moscow")
+        person = bot.get_people(self.owner)["people"][0]
+        self.assertEqual("EXECUTED", result.status)
+        self.assertEqual("Казань", person["home_city"])
+        self.assertIn("дизайнер", person["notes"])
+
     def test_invalid_second_action_is_rejected_before_any_write(self):
         plan = SemanticPlan("bad", "commit", actions=[ActionRequest("transaction", "create", fields={}, action_id="bad")])
         with self.assertRaisesRegex(PlanValidationError, "invalid_transaction_amount"):

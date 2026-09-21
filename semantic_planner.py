@@ -88,6 +88,13 @@ ACTION_ENTITY_REF_PAIRS = frozenset({
 })
 DESTRUCTIVE_OPERATIONS = frozenset({"delete", "cancel", "overwrite", "replace"})
 OWNER_KEYS = frozenset({"chat_id", "user_id", "owner_id"})
+PERSON_PROFILE_FIELDS = frozenset({
+    "relationship", "birthday", "age", "home_city", "current_location",
+    "projects", "notes", "aliases", "groups", "tags",
+})
+# These are descriptive facts, not stable schema fields.  They are deliberately
+# folded into notes before the deterministic execution boundary.
+PERSON_NOTE_ALIASES = frozenset({"profession", "job", "occupation"})
 CONTEXT_ID_KEYS = OWNER_KEYS | frozenset({"id", "person_id", "resolved_id"})
 
 MAX_RESPONSE_BYTES = 64 * 1024
@@ -384,6 +391,51 @@ def _action(value: Any) -> ActionRequest:
     )
 
 
+def _same_person_mention(left: str, right: str) -> bool:
+    return " ".join(left.casefold().split()) == " ".join(right.casefold().split())
+
+
+def _merge_person_profile_value(fields: dict[str, Any], key: str, value: Any) -> None:
+    """Promote safe descriptive entity attributes into a person upsert.
+
+    Entity attributes are part of the model's canonical person representation,
+    while BotDomainServices executes only action fields.  Preserve that useful
+    representation without treating arbitrary attributes as executable input.
+    Conflicting structured values fail closed rather than choosing one.
+    """
+    if key in PERSON_NOTE_ALIASES:
+        key = "notes"
+    if key not in PERSON_PROFILE_FIELDS:
+        return
+    if key not in fields:
+        fields[key] = value
+        return
+    if fields[key] == value:
+        return
+    if key == "notes" and isinstance(fields[key], str) and isinstance(value, str):
+        prior, incoming = fields[key].strip(), value.strip()
+        if incoming and incoming.casefold() not in prior.casefold():
+            fields[key] = "; ".join(part for part in (prior, incoming) if part)
+        return
+    raise _invalid("conflicting_person_field")
+
+
+def _canonicalize_person_upsert_fields(entities: list[EntityReference], actions: list[ActionRequest]) -> None:
+    """Make a person target's safe canonical attributes executable fields."""
+    for action in actions:
+        if (action.domain, action.operation) != ("person", "upsert"):
+            continue
+        target = action.entity_refs[0]
+        sources = [target]
+        sources.extend(
+            entity for entity in entities
+            if entity.type == "person" and _same_person_mention(entity.mention, target.mention)
+        )
+        for source in sources:
+            for key, value in source.attributes.items():
+                _merge_person_profile_value(action.fields, key, value)
+
+
 def parse_semantic_plan(payload: str | Mapping[str, Any]) -> SemanticPlan:
     """Strictly parse untrusted structured model output into contracts."""
     if isinstance(payload, str):
@@ -426,6 +478,7 @@ def parse_semantic_plan(payload: str | Mapping[str, Any]) -> SemanticPlan:
     entities = _entity_list(data.get("entities", []), maximum=MAX_ENTITIES)
     reads = [_read(item) for item in data.get("reads", [])]
     actions = [_action(item) for item in data.get("actions", [])]
+    _canonicalize_person_upsert_fields(entities, actions)
     used: set[str] = set()
     for item in [*reads, *actions]:
         identifier = item.read_id if isinstance(item, ReadRequest) else item.action_id
