@@ -1,6 +1,7 @@
 """Same-origin Telegram Mini App API; all data is scoped to signed Telegram identity."""
 import asyncio
 import contextlib
+import inspect
 import hashlib
 import json
 import os
@@ -63,6 +64,18 @@ def miniapp_platform_from_user_agent(user_agent: str) -> str:
     if any(marker in value for marker in ("windows", "macintosh", "mac os x", "linux", "cros")):
         return "desktop"
     return "unknown"
+
+
+def miniapp_semantic_request_id(chat_id: int, client_request_id: object) -> str:
+    """Validate opaque client turn token and namespace it by trusted owner."""
+    raw = str(client_request_id or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("invalid_request_id") from None
+    if str(parsed) != raw.lower() or len(raw) != 36:
+        raise ValueError("invalid_request_id")
+    return f"mini:{int(chat_id)}:{parsed}"
 
 
 def register_miniapp(app, core):
@@ -989,6 +1002,10 @@ def register_miniapp(app, core):
         text = str(payload.get("text", "")).strip()
         if not text or len(text) > 12000:
             raise web.HTTPBadRequest(text="Некорректное сообщение")
+        try:
+            semantic_request_id = miniapp_semantic_request_id(user["id"], payload.get("request_id"))
+        except ValueError:
+            raise web.HTTPBadRequest(text="Некорректный идентификатор запроса") from None
         cid, job_id = user["id"], str(uuid.uuid4())
         response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no"})
         await response.prepare(request)
@@ -1006,7 +1023,14 @@ def register_miniapp(app, core):
             notify_after_disconnect = False
             try:
                 with job_locks.setdefault(cid, threading.Lock()):
-                    for event in core.stream_agent_response(cid, text, cancelled):
+                    stream = core.stream_agent_response
+                    # Canonical legacy shape remains: core.stream_agent_response(cid, text, cancelled)
+                    # Older test/dynamic adapters expose only that three-argument contract.
+                    if "request_id" in inspect.signature(stream).parameters:
+                        events = stream(cid, text, cancelled, request_id=semantic_request_id, shadow_loop=loop)
+                    else:
+                        events = stream(cid, text, cancelled)
+                    for event in events:
                         if subscribed.is_set():
                             loop.call_soon_threadsafe(queue.put_nowait, event)
                         if event.get("type") == "done":

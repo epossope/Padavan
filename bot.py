@@ -13,6 +13,8 @@ import hmac
 
 import html
 
+import inspect
+
 import json
 
 import logging
@@ -41,7 +43,7 @@ from datetime import datetime, timezone, timedelta
 
 from pathlib import Path
 
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from urllib.parse import urlparse
 
@@ -76,12 +78,18 @@ from model_router import ModelRouter
 from artifact_service import ArtifactService
 from telegram_renderer import TelegramRenderer
 from diagnostics import DiagnosticsJournal
+from entity_resolver import (EntityResolver, ResolutionStatus,
+                             normalize_person_identity, plausible_person_name)
 from streaming_runtime import (AdaptiveDraftThrottle, StreamAccumulator, ToolPackResolver,
                                SentenceChunker, SpeechTextPolicy, SpeechTextStream,
                                artifact_request_instruction, enforce_artifact_request,
                                assistant_reasoning_contract_violated,
                                iter_sse_json, sanitize_assistant_message,
                                sanitize_visible_content)
+
+# The visible stream executes in a worker thread.  This context contains only
+# the privacy-safe tool outcome trace shared with its background shadow task.
+_LEGACY_SHADOW_TRACE = threading.local()
 
 
 
@@ -415,6 +423,59 @@ TOOLS = [
     }},
 
     {"type":"function","function":{
+        "name":"event_create",
+        "description":"Создать внутреннее событие Noema. Для встречи с человеком сначала найди/создай профиль и передай его person_id в participant_ids. Это не внешний календарь.",
+        "parameters":{"type":"object","properties":{
+            "kind":{"type":"string","enum":["meeting","call","appointment","lesson","travel","personal","other"]},
+            "title":{"type":"string"},"starts_at":{"type":"string"},"ends_at":{"type":"string"},
+            "all_day":{"type":"boolean"},"timezone":{"type":"string"},"location":{"type":"string"},
+            "notes":{"type":"string"},"project_id":{"type":"string"},"source_turn_id":{"type":"integer"},
+            "participant_ids":{"type":"array","items":{"type":"integer"}}
+        },"required":["title","starts_at"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_update",
+        "description":"Изменить owner-scoped внутреннее событие по id.",
+        "parameters":{"type":"object","properties":{
+            "event_id":{"type":"integer"},"kind":{"type":"string"},"title":{"type":"string"},
+            "starts_at":{"type":"string"},"ends_at":{"type":"string"},"all_day":{"type":"boolean"},
+            "timezone":{"type":"string"},"location":{"type":"string"},"notes":{"type":"string"},
+            "status":{"type":"string"},"project_id":{"type":"string"},
+            "participant_ids":{"type":"array","items":{"type":"integer"}}
+        },"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_delete",
+        "description":"Удалить owner-scoped внутреннее событие по id. Используй только по явной просьбе.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_get",
+        "description":"Получить точное внутреннее событие текущего пользователя по id.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"}},"required":["event_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_list",
+        "description":"Получить точные внутренние события пользователя по периоду и статусу.",
+        "parameters":{"type":"object","properties":{"date_from":{"type":"string"},"date_to":{"type":"string"},"status":{"type":"string"},"person_id":{"type":"integer"},"limit":{"type":"integer"}}}
+    }},
+    {"type":"function","function":{
+        "name":"event_search",
+        "description":"Искать точные внутренние события по названию, заметкам, месту или участнику. Не отвечай об актуальной встрече по истории.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"},"date_from":{"type":"string"},"date_to":{"type":"string"},"person_id":{"type":"integer"},"limit":{"type":"integer"}}}
+    }},
+    {"type":"function","function":{
+        "name":"event_participant_add",
+        "description":"Привязать owner-scoped профиль человека к owner-scoped внутреннему событию.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"},"person_id":{"type":"integer"},"role":{"type":"string"}},"required":["event_id","person_id"]}
+    }},
+    {"type":"function","function":{
+        "name":"event_participant_remove",
+        "description":"Удалить связь участника с owner-scoped внутренним событием.",
+        "parameters":{"type":"object","properties":{"event_id":{"type":"integer"},"person_id":{"type":"integer"}},"required":["event_id","person_id"]}
+    }},
+
+    {"type":"function","function":{
 
         "name":"save_note",
 
@@ -448,7 +509,8 @@ TOOLS = [
 
             "projects":{"type":"string"},"notes":{"type":"string"},
             "groups":{"type":"array","items":{"type":"string"}},
-            "tags":{"type":"array","items":{"type":"string"}}
+            "tags":{"type":"array","items":{"type":"string"}},
+            "aliases":{"type":"array","items":{"type":"string"}}
 
         },"required":["name"]}
 
@@ -462,11 +524,11 @@ TOOLS = [
 
         "parameters":{"type":"object","properties":{
 
-            "name":{"type":"string"},"interaction":{"type":"string"},
+            "name":{"type":"string"},"person_id":{"type":"integer"},"interaction":{"type":"string"},
 
             "interaction_date":{"type":"string"},"interaction_type":{"type":"string"}
 
-        },"required":["name","interaction"]}
+        },"required":["interaction"]}
 
     }},
 
@@ -775,7 +837,7 @@ TOOLS = [
 
 
 
-WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","unlink_person_media","update_file_description","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create"}
+WRITE_TOOLS = {"set_timezone","set_reminder","save_note","save_behavior_rule","update_behavior_rule","delete_behavior_rule","add_task","person_upsert","person_interaction","link_person_media","unlink_person_media","update_file_description","delete_file","add_expense","add_income","update_last_expense","update_task","update_note","update_reminder","update_expense","update_person","delete_note","delete_expense","delete_task","delete_person","delete_interaction","delete_reminder","set_briefing_preferences","artifact_create","event_create","event_update","event_delete","event_participant_add","event_participant_remove"}
 
 # Files received from Telegram are handled by the ingestion pipeline, not by
 # model-callable filesystem tools. artifact_create is the sole generated-file
@@ -1817,6 +1879,27 @@ def ensure_column(c, table, column, sql_type):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
 
 
+def _migrate_legacy_interaction_person_ids(c):
+    """Backfill only unambiguous canonical owner/name matches; safe to rerun."""
+    people_by_owner = {}
+    for row in c.execute("SELECT id,chat_id,name FROM people ORDER BY id").fetchall():
+        owner = people_by_owner.setdefault(row["chat_id"], {})
+        owner.setdefault(normalize_person_identity(row["name"]), []).append(row["id"])
+    for row in c.execute(
+        """SELECT id,chat_id,person_name FROM interactions
+           WHERE person_id IS NULL AND identity_detached=0 ORDER BY id"""
+    ).fetchall():
+        normalized_name = normalize_person_identity(row["person_name"])
+        if not normalized_name:
+            continue
+        candidates = people_by_owner.get(row["chat_id"], {}).get(normalized_name, [])
+        if len(candidates) == 1:
+            c.execute(
+                "UPDATE interactions SET person_id=? WHERE id=? AND chat_id=? AND person_id IS NULL",
+                (candidates[0], row["id"], row["chat_id"]),
+            )
+
+
 
 def init_db():
 
@@ -1854,7 +1937,7 @@ def init_db():
             updated_at TEXT NOT NULL DEFAULT ''
         );
 
-        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,sent INTEGER DEFAULT 0,
+        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,text TEXT,remind_at_utc TEXT,event_id INTEGER,sent INTEGER DEFAULT 0,
             acknowledged INTEGER NOT NULL DEFAULT 0, followup_count INTEGER NOT NULL DEFAULT 0,
             next_followup_at TEXT NOT NULL DEFAULT '', last_sent_message_id INTEGER);
 
@@ -1878,12 +1961,51 @@ def init_db():
 
         );
 
+        CREATE TABLE IF NOT EXISTS person_aliases(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(chat_id, person_id, normalized_alias),
+            FOREIGN KEY(person_id) REFERENCES people(id)
+        );
+
         CREATE TABLE IF NOT EXISTS interactions(
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,person_name TEXT,interaction TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER,person_id INTEGER,
+            identity_detached INTEGER NOT NULL DEFAULT 0,person_name TEXT,interaction TEXT,
 
             interaction_date TEXT,interaction_type TEXT,created_at TEXT
 
+        );
+
+        CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'other',
+            title TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            ends_at TEXT,
+            all_day INTEGER NOT NULL DEFAULT 0,
+            timezone TEXT NOT NULL,
+            location TEXT,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'scheduled',
+            project_id TEXT,
+            source_turn_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS event_participants(
+            event_id INTEGER NOT NULL,
+            person_id INTEGER NOT NULL,
+            role TEXT,
+            PRIMARY KEY(event_id, person_id),
+            FOREIGN KEY(event_id) REFERENCES events(id),
+            FOREIGN KEY(person_id) REFERENCES people(id)
         );
 
         CREATE TABLE IF NOT EXISTS expenses(
@@ -1986,9 +2108,12 @@ def init_db():
             ("people","groups_json","TEXT NOT NULL DEFAULT '[]'"),("people","tags_json","TEXT NOT NULL DEFAULT '[]'"),
             ("files","description","TEXT NOT NULL DEFAULT ''"),
             ("interactions","interaction_type","TEXT"),("expenses","merchant","TEXT"),
+            ("interactions","person_id","INTEGER"),
+            ("interactions","identity_detached","INTEGER NOT NULL DEFAULT 0"),
             ("expenses","kind","TEXT NOT NULL DEFAULT 'expense'"),
             ("reminders","acknowledged","INTEGER NOT NULL DEFAULT 0"),("reminders","followup_count","INTEGER NOT NULL DEFAULT 0"),
             ("reminders","next_followup_at","TEXT NOT NULL DEFAULT ''"),("reminders","last_sent_message_id","INTEGER"),
+            ("reminders","event_id","INTEGER"),
             ("tasks","completed_at","TEXT NOT NULL DEFAULT ''"),
             ("quick_action_devices","encrypted_secret","TEXT NOT NULL DEFAULT ''"),
             ("app_settings","updated_by","INTEGER"),
@@ -2003,6 +2128,18 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_user_request_events_chat_created ON user_request_events(chat_id,created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_person ON person_media(chat_id,person_id,is_current)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_person_media_chat_file ON person_media(chat_id,file_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_owner_normalized ON person_aliases(chat_id,normalized_alias)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_person ON person_aliases(person_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_interactions_owner_person_date ON interactions(chat_id,person_id,interaction_date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_start ON events(chat_id,starts_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_owner_status ON events(chat_id,status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_event_participants_person ON event_participants(person_id,event_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS semantic_executions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,request_id TEXT NOT NULL,
+            plan_fingerprint TEXT NOT NULL,status TEXT NOT NULL,result_json TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,completed_at TEXT NOT NULL DEFAULT '',UNIQUE(chat_id,request_id))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_semantic_executions_owner_request ON semantic_executions(chat_id,request_id)")
+        _migrate_legacy_interaction_person_ids(c)
 
     KnowledgeStore(DB).init_schema()
 
@@ -3062,16 +3199,59 @@ def classify_person_groups(relationship="", projects="", notes="", groups=None):
     return found or ["Другое"]
 
 
-def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes="",groups=None,tags=None,avatar_file_id=None):
+def person_alias_add(chat_id, person_id, alias):
+    alias = " ".join(str(alias or "").split())[:160]
+    normalized = normalize_person_identity(alias)
+    if not normalized or not plausible_person_name(alias):
+        return {"ok": False, "tool": "person_alias_add", "error": "invalid_alias"}
+    try:
+        person_id = int(person_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "person_alias_add", "error": "invalid_id"}
+    with conn() as c:
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "person_alias_add", "error": "person_not_found"}
+        c.execute("""INSERT OR IGNORE INTO person_aliases(chat_id,person_id,alias,normalized_alias,created_at)
+                     VALUES(?,?,?,?,?)""",
+                  (chat_id, person_id, alias, normalized, datetime.now(timezone.utc).isoformat()))
+    return {"ok": True, "tool": "person_alias_add", "person_id": person_id, "alias": alias}
+
+
+def person_alias_remove(chat_id, person_id, alias):
+    normalized = normalize_person_identity(alias)
+    try:
+        person_id = int(person_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "tool": "person_alias_remove", "error": "invalid_id"}
+    with conn() as c:
+        cur = c.execute("""DELETE FROM person_aliases WHERE chat_id=? AND person_id=? AND normalized_alias=?
+                           AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+                        (chat_id, person_id, normalized, person_id, chat_id))
+    return {"ok": True, "tool": "person_alias_remove", "removed": cur.rowcount}
+
+
+def person_entity_resolver():
+    return EntityResolver(conn, person_upsert)
+
+
+def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city="",current_location="",projects="",notes="",groups=None,tags=None,avatar_file_id=None,aliases=None):
+
+    name = " ".join(str(name or "").split())[:160]
+    if not name:
+        return {"ok": False, "tool": "person_upsert", "error": "empty_name"}
 
     with conn() as c:
 
         # SQLite's built-in lower() is ASCII-oriented in common deployments.
         # Compare Unicode names in Python so Cyrillic case variants do not
         # create duplicate owner-scoped person profiles.
-        normalized_name = str(name or "").strip().casefold()
-        old = next((row for row in c.execute("SELECT * FROM people WHERE chat_id=?", (chat_id,)).fetchall()
-                    if str(row["name"] or "").strip().casefold() == normalized_name), None)
+        normalized_name = normalize_person_identity(name)
+        matches = [row for row in c.execute("SELECT * FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+                   if normalize_person_identity(row["name"]) == normalized_name]
+        if len(matches) > 1:
+            return {"ok": False, "tool": "person_upsert", "error": "ambiguous_identity"}
+        old = matches[0] if matches else None
 
         if old:
 
@@ -3108,6 +3288,7 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
              vals["avatar_file_id"],datetime.now(timezone.utc).isoformat(),old["id"]))
 
             pid=old["id"]
+            canonical_name = old["name"]
 
         else:
 
@@ -3120,26 +3301,65 @@ def person_upsert(chat_id,name,relationship="",birthday="",age=None,home_city=""
              json.dumps(inferred_groups,ensure_ascii=False),json.dumps(_person_list(tags),ensure_ascii=False),datetime.now(timezone.utc).isoformat()))
 
             pid=cur.lastrowid
+            canonical_name = name
 
-    return {"ok":True,"tool":"person_upsert","id":pid,"name":name}
+    for alias in _person_list(aliases):
+        person_alias_add(chat_id, pid, alias)
+    return {"ok":True,"tool":"person_upsert","id":pid,"name":canonical_name}
 
 
 
-def person_interaction(chat_id,name,interaction,interaction_date="",interaction_type="other"):
-
+def person_interaction(chat_id, name="", interaction="", interaction_date="",
+                       interaction_type="other", person_id=None):
+    interaction = str(interaction or "").strip()[:4000]
+    if not interaction:
+        return {"ok": False, "tool": "person_interaction", "error": "empty_interaction"}
     if not interaction_date:
+        interaction_date = datetime.now(TZ).date().isoformat()
 
-        interaction_date=datetime.now(TZ).date().isoformat()
-
-    person_upsert(chat_id,name)
+    if person_id is not None:
+        try:
+            person_id = int(person_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "tool": "person_interaction", "error": "invalid_person_id"}
+        with conn() as c:
+            person = c.execute("SELECT id,name FROM people WHERE id=? AND chat_id=?",
+                               (person_id, chat_id)).fetchone()
+        if not person:
+            return {"ok": False, "tool": "person_interaction", "error": "person_not_found"}
+        canonical_name = person["name"]
+    else:
+        if not str(name or "").strip():
+            return {"ok": False, "tool": "person_interaction", "error": "person_required"}
+        resolution = person_entity_resolver().resolve_person(chat_id, str(name), allow_create=True)
+        if resolution.status == ResolutionStatus.AMBIGUOUS:
+            return {"ok": False, "tool": "person_interaction", "error": "person_ambiguous",
+                    "candidates": [{"id": candidate.id, "name": candidate.name}
+                                   for candidate in resolution.candidates]}
+        if resolution.status not in {ResolutionStatus.RESOLVED, ResolutionStatus.CREATED}:
+            return {"ok": False, "tool": "person_interaction", "error": "person_not_found"}
+        person_id, canonical_name = resolution.resolved_id, resolution.canonical_name
 
     with conn() as c:
+        cur = c.execute(
+            """INSERT INTO interactions(chat_id,person_id,person_name,interaction,interaction_date,interaction_type,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (chat_id, person_id, canonical_name, interaction, str(interaction_date)[:32],
+             str(interaction_type or "other")[:80], datetime.now(timezone.utc).isoformat()),
+        )
+    return {"ok": True, "tool": "person_interaction", "id": cur.lastrowid,
+            "person_id": person_id, "name": canonical_name, "interaction": interaction}
 
-        cur=c.execute("""INSERT INTO interactions(chat_id,person_name,interaction,interaction_date,interaction_type,created_at)
 
-        VALUES(?,?,?,?,?,?)""",(chat_id,name,interaction,interaction_date,interaction_type or "other",datetime.now(timezone.utc).isoformat()))
-
-    return {"ok":True,"tool":"person_interaction","id":cur.lastrowid,"name":name,"interaction":interaction}
+def person_interactions_list(chat_id, person_id, limit=50):
+    """Stable owner-scoped interaction history; detached legacy rows never attach."""
+    try: person_id, limit = int(person_id), max(1, min(int(limit), 100))
+    except (TypeError, ValueError): return {"ok": False, "tool": "person_interactions_list", "error": "invalid_id"}
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone():
+            return {"ok": False, "tool": "person_interactions_list", "error": "person_not_found"}
+        rows = c.execute("SELECT id,person_id,interaction,interaction_date,interaction_type FROM interactions WHERE chat_id=? AND person_id=? AND identity_detached=0 ORDER BY id DESC LIMIT ?", (chat_id, person_id, limit)).fetchall()
+    return {"ok": True, "tool": "person_interactions_list", "items": [dict(row) for row in rows]}
 
 
 
@@ -3356,6 +3576,253 @@ def task_list(chat_id, scope="open", query="", limit=100):
     return {"ok": True, "tool": "task_list", "scope": scope, "date": today, "count": len(selected), "items": selected[:limit]}
 
 
+EVENT_KINDS = {"meeting", "call", "appointment", "lesson", "travel", "personal", "other"}
+EVENT_STATUSES = {"scheduled", "completed", "cancelled"}
+
+
+def _event_error(tool, code):
+    return {"ok": False, "tool": tool, "error": code}
+
+
+def _event_datetime(chat_id, value, timezone_name="", *, required=False):
+    value = str(value or "").strip()
+    if not value:
+        if required:
+            raise ValueError("missing_datetime")
+        return ""
+    zone_name = str(timezone_name or timezone_name_for(chat_id))
+    zone = ZoneInfo(zone_name)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _event_row(c, chat_id, event_id):
+    row = c.execute("SELECT * FROM events WHERE id=? AND chat_id=?", (int(event_id), chat_id)).fetchone()
+    if not row:
+        return None
+    event = dict(row)
+    event["all_day"] = bool(event["all_day"])
+    event["participants"] = [dict(item) for item in c.execute(
+        """SELECT p.id AS person_id,p.name,ep.role FROM event_participants ep
+           JOIN people p ON p.id=ep.person_id
+           WHERE ep.event_id=? AND p.chat_id=? ORDER BY p.name,p.id""",
+        (event["id"], chat_id),
+    ).fetchall()]
+    return event
+
+
+def event_participant_add(chat_id, event_id, person_id, role=""):
+    try:
+        event_id, person_id = int(event_id), int(person_id)
+    except (TypeError, ValueError):
+        return _event_error("event_participant_add", "invalid_id")
+    with conn() as c:
+        event = c.execute("SELECT id FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone()
+        person = c.execute("SELECT id FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)).fetchone()
+        if not event:
+            return _event_error("event_participant_add", "event_not_found")
+        if not person:
+            return _event_error("event_participant_add", "person_not_found")
+        c.execute("INSERT OR REPLACE INTO event_participants(event_id,person_id,role) VALUES(?,?,?)",
+                  (event_id, person_id, str(role or "")[:80]))
+    return {"ok": True, "tool": "event_participant_add", "event_id": event_id, "person_id": person_id}
+
+
+def event_participant_remove(chat_id, event_id, person_id):
+    try:
+        event_id, person_id = int(event_id), int(person_id)
+    except (TypeError, ValueError):
+        return _event_error("event_participant_remove", "invalid_id")
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone():
+            return _event_error("event_participant_remove", "event_not_found")
+        cur = c.execute(
+            """DELETE FROM event_participants WHERE event_id=? AND person_id=?
+               AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+            (event_id, person_id, person_id, chat_id),
+        )
+    return {"ok": True, "tool": "event_participant_remove", "removed": cur.rowcount}
+
+
+def event_create(chat_id, title, starts_at, kind="other", ends_at="", all_day=False,
+                 timezone="", location="", notes="", status="scheduled", project_id="",
+                 source_turn_id=None, participant_ids=None):
+    tool = "event_create"
+    title = str(title or "").strip()[:500]
+    kind, status = str(kind or "other"), str(status or "scheduled")
+    zone_name = str(timezone or timezone_name_for(chat_id))
+    if not title:
+        return _event_error(tool, "missing_title")
+    if kind not in EVENT_KINDS:
+        return _event_error(tool, "invalid_kind")
+    if status not in EVENT_STATUSES:
+        return _event_error(tool, "invalid_status")
+    try:
+        ZoneInfo(zone_name)
+        start_utc = _event_datetime(chat_id, starts_at, zone_name, required=True)
+        end_utc = _event_datetime(chat_id, ends_at, zone_name)
+        if end_utc and datetime.fromisoformat(end_utc) < datetime.fromisoformat(start_utc):
+            return _event_error(tool, "ends_before_start")
+        participants = list(dict.fromkeys(int(item) for item in (participant_ids or [])))
+        source_id = int(source_turn_id) if source_turn_id is not None else None
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error(tool, "invalid_datetime_or_participant")
+    now = datetime.now(ZoneInfo("UTC")).isoformat()
+    with conn() as c:
+        if source_id is not None and not c.execute(
+            "SELECT 1 FROM messages WHERE id=? AND chat_id=?", (source_id, chat_id)
+        ).fetchone():
+            return _event_error(tool, "source_turn_not_found")
+        if participants:
+            owned = {row["id"] for row in c.execute(
+                f"SELECT id FROM people WHERE chat_id=? AND id IN ({','.join('?' for _ in participants)})",
+                (chat_id, *participants),
+            ).fetchall()}
+            if owned != set(participants):
+                return _event_error(tool, "participant_not_found")
+        cur = c.execute(
+            """INSERT INTO events(chat_id,kind,title,starts_at,ends_at,all_day,timezone,location,notes,status,
+                                  project_id,source_turn_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (chat_id, kind, title, start_utc, end_utc or None, int(bool(all_day)), zone_name,
+             str(location or "")[:500] or None, str(notes or "")[:4000] or None, status,
+             str(project_id or "")[:200] or None, source_id,
+             now, now),
+        )
+        event_id = cur.lastrowid
+        for person_id in participants:
+            c.execute("INSERT INTO event_participants(event_id,person_id,role) VALUES(?,?,NULL)",
+                      (event_id, person_id))
+        event = _event_row(c, chat_id, event_id)
+    return {"ok": True, "tool": tool, "event": event, "id": event_id}
+
+
+def event_get(chat_id, event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return _event_error("event_get", "invalid_id")
+    with conn() as c:
+        event = _event_row(c, chat_id, event_id)
+    return ({"ok": True, "tool": "event_get", "event": event} if event else
+            _event_error("event_get", "not_found"))
+
+
+def event_list(chat_id, date_from="", date_to="", status="", person_id=None, limit=100):
+    try:
+        limit = max(1, min(int(limit or 100), 200))
+        person_id = int(person_id) if person_id is not None else None
+        start = _event_datetime(chat_id, date_from, required=False) if date_from else ""
+        end_value = str(date_to or "")
+        if end_value and len(end_value) == 10:
+            end_value += "T23:59:59.999999"
+        end = _event_datetime(chat_id, end_value, required=False) if end_value else ""
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error("event_list", "invalid_filter")
+    clauses, values = ["e.chat_id=?"], [chat_id]
+    if start:
+        clauses.append("e.starts_at>=?"); values.append(start)
+    if end:
+        clauses.append("e.starts_at<=?"); values.append(end)
+    if status:
+        if status not in EVENT_STATUSES:
+            return _event_error("event_list", "invalid_status")
+        clauses.append("e.status=?"); values.append(status)
+    if person_id is not None:
+        clauses.append("EXISTS(SELECT 1 FROM event_participants ep WHERE ep.event_id=e.id AND ep.person_id=?)")
+        values.append(person_id)
+    with conn() as c:
+        ids = [row["id"] for row in c.execute(
+            f"SELECT e.id FROM events e WHERE {' AND '.join(clauses)} ORDER BY e.starts_at,e.id LIMIT ?",
+            (*values, limit),
+        ).fetchall()]
+        events = [_event_row(c, chat_id, event_id) for event_id in ids]
+    return {"ok": True, "tool": "event_list", "count": len(events), "events": events}
+
+
+def event_search(chat_id, query="", date_from="", date_to="", person_id=None, limit=100):
+    result = event_list(chat_id, date_from, date_to, person_id=person_id, limit=limit)
+    if not result.get("ok"):
+        result["tool"] = "event_search"
+        return result
+    needle = str(query or "").strip().casefold()
+    events = result["events"]
+    if needle:
+        events = [event for event in events if needle in " ".join((
+            str(event.get("title") or ""), str(event.get("notes") or ""),
+            str(event.get("location") or ""),
+            " ".join(person.get("name", "") for person in event.get("participants", [])),
+        )).casefold()]
+    return {"ok": True, "tool": "event_search", "count": len(events), "events": events}
+
+
+def event_update(chat_id, event_id, **changes):
+    tool = "event_update"
+    current = event_get(chat_id, event_id)
+    if not current.get("ok"):
+        return _event_error(tool, "not_found")
+    event = current["event"]
+    allowed = {"kind", "title", "starts_at", "ends_at", "all_day", "timezone", "location",
+               "notes", "status", "project_id", "participant_ids"}
+    if any(key not in allowed for key in changes):
+        return _event_error(tool, "invalid_field")
+    merged = {key: event.get(key) for key in allowed if key != "participant_ids"}
+    merged.update(changes)
+    title = str(merged.get("title") or "").strip()[:500]
+    kind, status = str(merged.get("kind") or "other"), str(merged.get("status") or "scheduled")
+    zone_name = str(merged.get("timezone") or timezone_name_for(chat_id))
+    if not title or kind not in EVENT_KINDS or status not in EVENT_STATUSES:
+        return _event_error(tool, "invalid_value")
+    try:
+        ZoneInfo(zone_name)
+        starts_at = _event_datetime(chat_id, merged.get("starts_at"), zone_name, required=True)
+        ends_at = _event_datetime(chat_id, merged.get("ends_at"), zone_name)
+        if ends_at and datetime.fromisoformat(ends_at) < datetime.fromisoformat(starts_at):
+            return _event_error(tool, "ends_before_start")
+        participants = changes.get("participant_ids")
+        participants = None if participants is None else list(dict.fromkeys(int(item) for item in participants))
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        return _event_error(tool, "invalid_datetime_or_participant")
+    with conn() as c:
+        if participants is not None:
+            owned = {row["id"] for row in c.execute(
+                f"SELECT id FROM people WHERE chat_id=? AND id IN ({','.join('?' for _ in participants)})",
+                (chat_id, *participants),
+            ).fetchall()} if participants else set()
+            if owned != set(participants):
+                return _event_error(tool, "participant_not_found")
+        c.execute(
+            """UPDATE events SET kind=?,title=?,starts_at=?,ends_at=?,all_day=?,timezone=?,location=?,notes=?,
+                                 status=?,project_id=?,updated_at=? WHERE id=? AND chat_id=?""",
+            (kind, title, starts_at, ends_at or None, int(bool(merged.get("all_day"))), zone_name,
+             str(merged.get("location") or "")[:500] or None, str(merged.get("notes") or "")[:4000] or None,
+             status, str(merged.get("project_id") or "")[:200] or None, datetime.now(timezone.utc).isoformat(),
+             int(event_id), chat_id),
+        )
+        if participants is not None:
+            c.execute("DELETE FROM event_participants WHERE event_id=?", (int(event_id),))
+            for person_id in participants:
+                c.execute("INSERT INTO event_participants(event_id,person_id,role) VALUES(?,?,NULL)",
+                          (int(event_id), person_id))
+        updated = _event_row(c, chat_id, int(event_id))
+    return {"ok": True, "tool": tool, "event": updated, "id": int(event_id)}
+
+
+def event_delete(chat_id, event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return _event_error("event_delete", "invalid_id")
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM events WHERE id=? AND chat_id=?", (event_id, chat_id)).fetchone():
+            return _event_error("event_delete", "not_found")
+        c.execute("DELETE FROM event_participants WHERE event_id=?", (event_id,))
+        cur = c.execute("DELETE FROM events WHERE id=? AND chat_id=?", (event_id, chat_id))
+    return {"ok": True, "tool": "event_delete", "deleted": cur.rowcount}
+
+
 def get_plan_for_date(chat_id, day):
     """Return a calendar day without silently completing anything overdue."""
     selected = datetime.fromisoformat(day).date()
@@ -3393,7 +3860,9 @@ def get_plan_for_date(chat_id, day):
         if dt.date() == selected:
             reminders.append({"id": r["id"], "text": r["text"], "time": dt.strftime("%H:%M"),
                               "acknowledged": r["acknowledged"]})
-    return {"ok": True, "tool": "get_today_plan", "date": day, "tasks": tasks, "reminders": reminders}
+    events = event_list(chat_id, day, day, limit=200)
+    return {"ok": True, "tool": "get_today_plan", "date": day, "events": events.get("events", []),
+            "tasks": tasks, "reminders": reminders}
 
 
 def get_today_plan(chat_id):
@@ -3452,6 +3921,11 @@ def get_people(chat_id,query=""):
 
     with conn() as c:
 
+        owner_people = c.execute("SELECT id,name FROM people WHERE chat_id=?", (chat_id,)).fetchall()
+        normalized_people = {}
+        for person_row in owner_people:
+            normalized_people.setdefault(normalize_person_identity(person_row["name"]), []).append(person_row["id"])
+
         if query:
 
             p=f"%{query}%"
@@ -3474,11 +3948,23 @@ def get_people(chat_id,query=""):
             d["groups"] = classify_person_groups(d.get("relationship"), d.get("projects"), d.get("notes"), d.pop("groups_json", "[]"))
             d["tags"] = _person_list(d.pop("tags_json", "[]"))
 
-            ints=c.execute("""SELECT interaction,interaction_date,interaction_type FROM interactions
-
-            WHERE chat_id=? AND lower(person_name)=lower(?) ORDER BY id DESC LIMIT 8""",(chat_id,r["name"])).fetchall()
-
-            d["recent_interactions"]=[dict(x) for x in ints]
+            interaction_rows = c.execute(
+                """SELECT id,person_id,identity_detached,person_name,interaction,interaction_date,interaction_type
+                   FROM interactions WHERE chat_id=? AND (person_id=? OR person_id IS NULL)
+                   ORDER BY id DESC""", (chat_id, r["id"])
+            ).fetchall()
+            normalized_name = normalize_person_identity(r["name"])
+            safe_legacy_owner = normalized_people.get(normalized_name, []) == [r["id"]]
+            interactions = []
+            for item in interaction_rows:
+                if item["person_id"] == r["id"] or (
+                    item["person_id"] is None and not item["identity_detached"] and safe_legacy_owner and
+                    normalize_person_identity(item["person_name"]) == normalized_name
+                ):
+                    interactions.append(dict(item))
+                if len(interactions) >= 8:
+                    break
+            d["recent_interactions"] = interactions
 
             media_rows = c.execute("""SELECT pm.file_id,pm.relation_type,pm.is_current,
                 f.mime_type,f.created_at FROM person_media pm JOIN files f ON f.id=pm.file_id
@@ -3538,10 +4024,15 @@ def update_person(chat_id, person_id, name="", relationship="", birthday="", age
     except (TypeError, ValueError):
         return {"ok": False, "tool": "update_person", "error": "invalid_age"}
     with conn() as c:
-        existing = c.execute("SELECT age,home_city,current_location,groups_json,tags_json FROM people WHERE id=? AND chat_id=?",
+        existing = c.execute("SELECT id,age,home_city,current_location,groups_json,tags_json FROM people WHERE id=? AND chat_id=?",
                              (int(person_id), chat_id)).fetchone()
         if not existing:
             return {"ok": False, "tool": "update_person", "error": "not_found"}
+        normalized_name = normalize_person_identity(name)
+        duplicate = next((row for row in c.execute("SELECT id,name FROM people WHERE chat_id=? AND id<>?", (chat_id, int(person_id))).fetchall()
+                          if normalize_person_identity(row["name"]) == normalized_name), None)
+        if duplicate:
+            return {"ok": False, "tool": "update_person", "error": "duplicate_name"}
         normalized_groups = classify_person_groups(relationship, projects, notes, groups if groups is not None else existing["groups_json"])
         normalized_tags = _person_list(tags if tags is not None else existing["tags_json"])
         cur = c.execute("UPDATE people SET name=?,relationship=?,birthday=?,age=?,home_city=?,current_location=?,projects=?,notes=?,groups_json=?,tags_json=?,updated_at=? WHERE id=? AND chat_id=?",
@@ -3579,6 +4070,15 @@ def delete_task(chat_id,task_id):
 def delete_person(chat_id,person_id):
 
     with conn() as c:
+        # Preserve the historical interaction text/display snapshot while
+        # removing the live identity link, matching the pre-person_id product
+        # behavior where interactions outlived a deleted profile.
+        c.execute("UPDATE interactions SET person_id=NULL,identity_detached=1 WHERE chat_id=? AND person_id=?",
+                  (chat_id, person_id))
+        c.execute("DELETE FROM person_aliases WHERE chat_id=? AND person_id=?", (chat_id, person_id))
+        c.execute("""DELETE FROM event_participants WHERE person_id=?
+                     AND EXISTS(SELECT 1 FROM people WHERE id=? AND chat_id=?)""",
+                  (person_id, person_id, chat_id))
         c.execute("DELETE FROM person_media WHERE chat_id=? AND person_id=?", (chat_id, person_id))
         cur = c.execute("DELETE FROM people WHERE id=? AND chat_id=?", (person_id,chat_id))
     return {"ok":True,"tool":"delete_person","deleted":cur.rowcount}
@@ -3763,6 +4263,22 @@ def execute_tool(chat_id,name,args):
 
         "reminder_list":reminder_list,
 
+        "event_create":event_create,
+
+        "event_get":event_get,
+
+        "event_list":event_list,
+
+        "event_update":event_update,
+
+        "event_delete":event_delete,
+
+        "event_search":event_search,
+
+        "event_participant_add":event_participant_add,
+
+        "event_participant_remove":event_participant_remove,
+
         "set_briefing_preferences":set_briefing_preferences,
 
         "get_notes":get_notes,
@@ -3819,8 +4335,16 @@ def execute_tool(chat_id,name,args):
 
     kwargs={k:v for k,v in args.items() if k!="chat_id"}
     started = time.perf_counter()
+    trace = getattr(_LEGACY_SHADOW_TRACE, "trace", None)
     try:
-        return funcs[name](chat_id,**kwargs)
+        result = funcs[name](chat_id,**kwargs)
+        if trace is not None:
+            trace.record(name, bool(isinstance(result, dict) and result.get("ok")))
+        return result
+    except Exception:
+        if trace is not None:
+            trace.record(name, False)
+        raise
     finally:
         elapsed = (time.perf_counter() - started) * 1000
         record_runtime_metric("tool_execution_ms", elapsed)
@@ -4269,7 +4793,7 @@ def system_prompt(chat_id):
 
 
 
-def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, stream=False):
+def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, stream=False, response_format=None):
     """Build the single production-visible chat contract for every transport."""
     payload = {
         "model": model,
@@ -4286,14 +4810,16 @@ def build_chat_payload(model, messages, tools=None, tool_choice="auto", *, strea
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
+    if response_format is not None:
+        payload["response_format"] = response_format
     if provider := provider_preferences_for(model):
         payload["provider"] = provider
     return payload
 
 
-def request_chat(chat_id, model, messages, tools=None, tool_choice="auto"):
+def request_chat(chat_id, model, messages, tools=None, tool_choice="auto", *, response_format=None):
 
-    payload = build_chat_payload(model, messages, tools, tool_choice)
+    payload = build_chat_payload(model, messages, tools, tool_choice, response_format=response_format)
 
     key, source = api_key_for_chat(chat_id)
     response = requests.post(CHAT_URL,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
@@ -4309,6 +4835,176 @@ def request_chat_stream(chat_id, model, messages, tools=None, tool_choice="auto"
                              json=payload, timeout=(20, 180), stream=True)
     response.noema_key_source = source
     return response
+
+
+class _SemanticRuntimeBackend:
+    """App adapter: semantic core stays provider-neutral and uses normal routing."""
+    def __init__(self, chat_id): self.chat_id = chat_id
+    async def _generate(self, system_prompt, payload, *, response_format=None):
+        models = chat_model_candidates(self.chat_id)
+        if not models: raise RuntimeError("no_model")
+        def call():
+            last_error = None
+            for model in models:
+                recovered_key = False
+                for attempt in range(2):
+                    response = None
+                    try:
+                        response = request_chat(self.chat_id, model, [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ], tools=None, tool_choice="none", response_format=response_format)
+                        if response.ok:
+                            data = response.json()
+                            record_usage(self.chat_id, response_key_source(response, self.chat_id), model, data)
+                            return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                        record_usage(self.chat_id, response_key_source(response, self.chat_id), model, {})
+                        last_error = RuntimeError("provider_error")
+                        if not recovered_key and recover_missing_managed_key(self.chat_id, response):
+                            recovered_key = True
+                            continue
+                        if response.status_code in {429, 500, 501, 502, 503, 504} and attempt == 0:
+                            # This helper runs under asyncio.to_thread(); keep
+                            # retry backoff out of the application event loop.
+                            threading.Event().wait(1.2)
+                            continue
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        break
+                    finally:
+                        if response is not None:
+                            with contextlib.suppress(Exception):
+                                response.close()
+            raise RuntimeError("provider_error") from last_error
+        return await asyncio.to_thread(call)
+    async def generate_structured(self, *, system_prompt, input_payload, output_schema):
+        payload = {"input": input_payload, "schema": output_schema}
+        structured = {"type": "json_schema", "json_schema": {"name": "semantic_plan", "strict": True, "schema": output_schema}}
+        try:
+            return await self._generate(system_prompt, payload, response_format=structured)
+        except Exception:
+            return await self._generate(system_prompt, payload)
+    async def generate_grounded(self, *, system_prompt, question, evidence):
+        payload = {"question": question, "evidence": evidence}
+        structured = {"type": "json_schema", "json_schema": {"name": "grounded_response", "strict": True, "schema": __import__("grounded_response").GROUNDED_OUTPUT_SCHEMA}}
+        try:
+            return await self._generate(system_prompt, payload, response_format=structured)
+        except Exception:
+            return await self._generate(system_prompt, payload)
+
+
+_SEMANTIC_SHADOWS = {}
+def get_semantic_shadow_orchestrator(chat_id):
+    """Lazy default-off factory; never changes a legacy answer or tool path."""
+    if not bool_env("SEMANTIC_SHADOW_ENABLED", False): return None
+    if chat_id not in _SEMANTIC_SHADOWS:
+        from semantic_planner import SemanticPlanner
+        from plan_runtime import PlanValidator, BotDomainServices
+        from grounded_response import EvidenceAssembler, GroundedResponder
+        from semantic_orchestrator import SemanticShadowOrchestrator
+        backend = _SemanticRuntimeBackend(chat_id)
+        _SEMANTIC_SHADOWS[chat_id] = SemanticShadowOrchestrator(
+            SemanticPlanner(backend, observer=DIAGNOSTICS.record), person_plan_validator(),
+            BotDomainServices(__import__(__name__)), EvidenceAssembler(observer=DIAGNOSTICS.record),
+            GroundedResponder(backend, observer=DIAGNOSTICS.record), observer=DIAGNOSTICS.record,
+            metric_recorder=record_runtime_metric,
+        )
+    return _SEMANTIC_SHADOWS[chat_id]
+
+
+def person_plan_validator():
+    from plan_runtime import PlanValidator
+    return PlanValidator(person_entity_resolver(), observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric)
+
+
+_SEMANTIC_PRODUCTION_RUNTIMES = {}
+def get_semantic_production_runtime(chat_id):
+    """Create the distinct production runtime lazily; shadow remains separate."""
+    if chat_id not in _SEMANTIC_PRODUCTION_RUNTIMES:
+        from semantic_planner import SemanticPlanner
+        from plan_runtime import BotDomainServices, PlanExecutor
+        from grounded_response import EvidenceAssembler, GroundedResponder
+        from semantic_runtime import SemanticProductionRuntime
+        backend = _SemanticRuntimeBackend(chat_id)
+        services = BotDomainServices(__import__(__name__))
+        _SEMANTIC_PRODUCTION_RUNTIMES[chat_id] = SemanticProductionRuntime(
+            SemanticPlanner(backend, observer=DIAGNOSTICS.record), person_plan_validator(), services,
+            PlanExecutor(services, conn, observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric),
+            EvidenceAssembler(observer=DIAGNOSTICS.record),
+            GroundedResponder(backend, observer=DIAGNOSTICS.record),
+            observer=DIAGNOSTICS.record, metric_recorder=record_runtime_metric,
+        )
+    return _SEMANTIC_PRODUCTION_RUNTIMES[chat_id]
+
+
+def run_semantic_production_turn(chat_id, text, *, request_id, conversation_context=None):
+    """Synchronous bridge used by both Telegram and Mini App stream workers."""
+    from semantic_runtime import SemanticRuntimeResult, canary_owners, runtime_mode
+    mode = runtime_mode()
+    if mode == "off":
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="disabled")
+    if int(chat_id) not in canary_owners():
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="not_allowlisted")
+    try:
+        return asyncio.run(get_semantic_production_runtime(chat_id).handle_turn(
+            trusted_owner=chat_id, request_id=str(request_id), utterance=text,
+            now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
+            conversation_context=conversation_context or {"recent_entities": []},
+        ))
+    except Exception:
+        claimed = semantic_execution_claimed(chat_id, str(request_id))
+        DIAGNOSTICS.record("semantic_runtime_bridge_failure", execution_claimed=claimed)
+        if claimed:
+            return SemanticRuntimeResult(
+                "FAILURE_AFTER_EXECUTION_STARTED", handled=True,
+                reply="Не удалось надёжно завершить действие. Проверь текущие данные перед повтором.",
+                disposition="clarify", failure_category="runtime_bridge_error", execution_started=True,
+            )
+        DIAGNOSTICS.record("semantic_runtime_fallback", runtime_mode=mode, failure_category="runtime_error")
+        return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="runtime_error")
+
+
+def semantic_execution_claimed(chat_id, request_id):
+    """Read the authoritative execution boundary without exposing its state."""
+    try:
+        with conn() as connection:
+            return connection.execute(
+                "SELECT 1 FROM semantic_executions WHERE chat_id=? AND request_id=? LIMIT 1",
+                (int(chat_id), str(request_id)),
+            ).fetchone() is not None
+    except Exception:
+        # If exact boundary state cannot be read, fail closed: allowing a
+        # legacy write would be less safe than showing a retry-safe failure.
+        return True
+
+
+def telegram_semantic_request_id(update):
+    """Derive a stable semantic idempotency key from trusted Telegram transport."""
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    message_id = getattr(getattr(update, "effective_message", None), "message_id", None)
+    if isinstance(chat_id, int) and isinstance(message_id, int):
+        return f"tg:{chat_id}:{message_id}"
+    update_id = getattr(update, "update_id", None)
+    if isinstance(update_id, int):
+        return f"tg-update:{update_id}"
+    return ""
+
+
+def schedule_semantic_shadow_turn(chat_id, text, *, request_id=None, conversation_context=None, legacy_trace=None, loop=None):
+    """Channel-neutral fire-and-forget shadow hook; all failures are isolated."""
+    try:
+        orchestrator = get_semantic_shadow_orchestrator(chat_id)
+        if orchestrator is None: return None
+        kwargs = dict(trusted_owner=chat_id, request_id=str(request_id or uuid.uuid4().hex),
+            utterance=text, now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
+            conversation_context=conversation_context or {"recent_entities": []}, legacy_trace=legacy_trace)
+        if loop is not None:
+            async def schedule_on_main_loop(): return orchestrator.schedule(**kwargs)
+            return asyncio.run_coroutine_threadsafe(schedule_on_main_loop(), loop)
+        return orchestrator.schedule(**kwargs)
+    except Exception:
+        return None
 
 
 def _safe_model_metric_code(model):
@@ -4353,7 +5049,7 @@ def runtime_state_for_tool(name):
     return runtime_state_event(state, text=label, tool=name)
 
 
-def stream_agent_response(chat_id, text, cancel_event=None):
+def _stream_agent_response_legacy(chat_id, text, cancel_event=None):
     """One streaming core for text and voice; yields display-safe runtime events."""
     started = time.perf_counter()
     cancel_event = cancel_event or threading.Event()
@@ -4545,6 +5241,44 @@ def stream_agent_response(chat_id, text, cancel_event=None):
            "canonical_user_message_id": canonical_user_message_id}
 
 
+def stream_agent_response(chat_id, text, cancel_event=None, *, request_id=None, shadow_loop=None):
+    """Attempt eligible semantic production before unchanged legacy streaming."""
+    cancel_event = cancel_event or threading.Event()
+    trusted_request_id = str(request_id or uuid.uuid4().hex)
+    if cancel_event.is_set():
+        yield {"type": "cancelled"}
+        return
+    semantic = run_semantic_production_turn(chat_id, text, request_id=trusted_request_id)
+    if semantic.handled:
+        record_user_request(chat_id, "chat")
+        canonical_user_message_id = add_message(chat_id, "user", text)
+        canonical_message_id = add_message(chat_id, "assistant", semantic.reply)
+        yield runtime_state_event("REQUESTING", text="Думаю…")
+        yield runtime_state_event("STREAMING")
+        yield {"type": "delta", "text": semantic.reply}
+        yield {"type": "speech_delta", "text": SpeechTextPolicy().build(semantic.reply)}
+        yield {"type": "done", "text": semantic.reply, "canonical_message_id": canonical_message_id,
+               "canonical_user_message_id": canonical_user_message_id}
+        return
+    from semantic_orchestrator import LegacyExecutionTrace
+    trace = LegacyExecutionTrace()
+    previous = getattr(_LEGACY_SHADOW_TRACE, "trace", None)
+    _LEGACY_SHADOW_TRACE.trace = trace
+    # Default-off and fire-and-forget: this cannot delay or replace legacy SSE.
+    schedule_semantic_shadow_turn(
+        chat_id, text, request_id=trusted_request_id, legacy_trace=trace, loop=shadow_loop,
+    )
+    try:
+        yield from _stream_agent_response_legacy(chat_id, text, cancel_event)
+    finally:
+        trace.finalize()
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                del _LEGACY_SHADOW_TRACE.trace
+        else:
+            _LEGACY_SHADOW_TRACE.trace = previous
+
+
 def mint_mistral_realtime_session():
     """Mint a model-scoped, short-lived rt_* token without exposing the API key."""
     if not MISTRAL_API_KEY:
@@ -4621,12 +5355,18 @@ async def stream_answer_to_telegram_draft(update, context, text):
     """Stream one ephemeral draft, then persist exactly one formatted final answer."""
     chat_id = update.effective_chat.id
     draft_id, cancelled = _new_draft_id(), threading.Event()
+    semantic_request_id = telegram_semantic_request_id(update) or f"tg-draft:{chat_id}:{draft_id}"
     register_active_draft(chat_id, draft_id, cancelled)
     queue, loop = asyncio.Queue(), asyncio.get_running_loop()
 
     def produce():
         try:
-            for event in stream_agent_response(chat_id, text, cancelled):
+            stream = stream_agent_response
+            if "request_id" in inspect.signature(stream).parameters:
+                events = stream(chat_id, text, cancelled, request_id=semantic_request_id, shadow_loop=loop)
+            else:  # Existing embedders/tests that retain the old stream shape.
+                events = stream(chat_id, text, cancelled)
+            for event in events:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -4948,12 +5688,18 @@ async def stream_answer_to_telegram(update, context, text):
     """Deliver normal private text through one mutable Telegram message."""
     chat_id = update.effective_chat.id
     request_id, cancelled = uuid.uuid4().hex, threading.Event()
+    semantic_request_id = telegram_semantic_request_id(update) or f"tg-delivery:{chat_id}:{request_id}"
     register_active_draft(chat_id, request_id, cancelled)
     queue, loop = asyncio.Queue(), asyncio.get_running_loop()
 
     def produce():
         try:
-            for event in stream_agent_response(chat_id, text, cancelled):
+            stream = stream_agent_response
+            if "request_id" in inspect.signature(stream).parameters:
+                events = stream(chat_id, text, cancelled, request_id=semantic_request_id, shadow_loop=loop)
+            else:  # Existing embedders/tests that retain the old stream shape.
+                events = stream(chat_id, text, cancelled)
+            for event in events:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
