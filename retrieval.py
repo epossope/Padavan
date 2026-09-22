@@ -301,6 +301,13 @@ def retrieve(store: "KnowledgeSearch", chat_id: int, query: str,
             if latest:
                 for it in latest(chat_id, limit=20):
                     items[it["id"]] = it
+    elif include_recent_on_empty:
+        # Canonical broad retrieval (for example, "what have I saved?") has
+        # no narrow keyword.  Return only this owner's bounded recent items.
+        latest = getattr(store, "latest", None)
+        if latest:
+            for it in latest(chat_id, limit=20):
+                items[it["id"]] = it
     if entity:
         for it in store.search_by_entity(entity, chat_id=chat_id, limit=20):
             items[it["id"]] = it

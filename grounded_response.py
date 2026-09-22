@@ -30,7 +30,7 @@ def _safe(value: Any, depth=0):
     if value is None or isinstance(value, (bool, int, float)): return value
     if isinstance(value, str): return value[:MAX_TEXT]
     if isinstance(value, list): return [_safe(x, depth + 1) for x in value[:24]]
-    if isinstance(value, dict): return {str(k)[:80]: _safe(v, depth + 1) for k, v in list(value.items())[:24] if str(k).casefold() not in EXACT_KEYS | {"token", "secret"}}
+    if isinstance(value, dict): return {str(k)[:80]: _safe(v, depth + 1) for k, v in list(value.items())[:24] if not str(k).startswith("_") and str(k).casefold() not in EXACT_KEYS | {"token", "secret"}}
     return str(value)[:MAX_TEXT]
 
 class EvidenceAssembler:
@@ -45,13 +45,13 @@ class EvidenceAssembler:
         try:
             for step in execution_result.reads:
                 domain, result = step.domain, step.result; packet.checked_exact_domains.append(domain)
-                rows = result.get("events") or result.get("items") or result.get("transactions") or []
+                rows = result.get("events") or result.get("items") or result.get("results") or result.get("transactions") or []
                 if domain == "finance" and result.get("ok"):
                     packet.add(EvidenceItem("exact_current","finance_summary",None,_safe(result),confidence=1,domain="finance"))
                 elif not rows and result.get("ok"):
                     packet.exact_empty_domains.append(domain)
                 for row in rows[:MAX_ITEMS]:
-                    entity_type = "person_interaction" if domain == "person" and step.operation == "interactions_list" else ("transaction" if domain == "transaction" else domain.rstrip("s"))
+                    entity_type = "person_interaction" if domain == "person" and step.operation == "interactions_list" else ("person" if domain == "person" else ("knowledge" if domain == "knowledge" else ("transaction" if domain == "transaction" else domain.rstrip("s"))))
                     packet.add(EvidenceItem("exact_historical" if entity_type in {"transaction", "person_interaction"} else "exact_current",entity_type,row.get("id"),_safe(row),confidence=1,domain=domain))
                 if domain == "person" and result.get("person_id"):
                     packet.add(EvidenceItem("exact_current","person",result["person_id"],{"resolved": True},confidence=1,domain="person"))

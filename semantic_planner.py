@@ -50,7 +50,7 @@ ENTITY_TYPE_ALIASES = {
 }
 DISPOSITIONS = frozenset({"answer", "read", "commit", "clarify"})
 DOMAIN_OPERATIONS: dict[str, frozenset[str]] = {
-    "person": frozenset({"resolve", "resolve_or_create", "upsert", "interactions_list", "delete", "overwrite", "replace"}),
+    "person": frozenset({"resolve", "resolve_or_create", "upsert", "interactions_list", "list", "delete", "overwrite", "replace"}),
     "event": frozenset({"create", "get", "list", "search", "update", "delete", "cancel", "overwrite", "replace"}),
     "task": frozenset({"create", "get", "list", "search", "update", "delete", "overwrite", "replace"}),
     "reminder": frozenset({"create", "get", "list", "search", "update", "delete", "overwrite", "replace"}),
@@ -62,11 +62,13 @@ DOMAIN_OPERATIONS: dict[str, frozenset[str]] = {
     "file": frozenset({"create", "get", "list", "search", "update", "delete", "overwrite", "replace"}),
 }
 READ_OPERATIONS = frozenset({"resolve", "get", "list", "search", "summary", "interactions_list"})
-CANONICAL_READ_PAIRS = frozenset({("person","resolve"),("person","interactions_list"),("event","list"),("event","search"),("finance","summary"),("transaction","list"),("task","list"),("reminder","list"),("note","list"),("note","search")})
+CANONICAL_READ_PAIRS = frozenset({("person","resolve"),("person","interactions_list"),("person","list"),("knowledge","search"),("event","list"),("event","search"),("finance","summary"),("transaction","list"),("task","list"),("reminder","list"),("note","list"),("note","search")})
 CANONICAL_ACTION_PAIRS = frozenset({("person","upsert"),("event","create"),("event","update"),("event","delete"),("event","cancel"),("transaction","create"),("reminder","create"),("task","create"),("note","create")})
 READ_FILTERS: dict[tuple[str, str], frozenset[str]] = {
     ("person", "resolve"): frozenset(),
     ("person", "interactions_list"): frozenset({"limit"}),
+    ("person", "list"): frozenset({"query", "relationship", "limit"}),
+    ("knowledge", "search"): frozenset({"query", "project", "category", "entity", "date_from", "date_to", "limit"}),
     ("event", "list"): frozenset({"date_from", "date_to", "status", "limit"}),
     ("event", "search"): frozenset({"query", "date_from", "date_to", "limit"}),
     ("finance", "summary"): frozenset({"period", "date_from", "date_to"}),
@@ -109,14 +111,16 @@ MAX_VALUE_STRING = 1000
 MAX_CLARIFICATION = 600
 
 
-PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only JSON matching the schema; never invent database IDs or owner identifiers.
+PLANNER_PROMPT = """You are Noema's semantic planner. Understand intent; do not answer or execute. Return only schema JSON; never invent database IDs or owner identifiers.
 User facts need exact reads; exact current state outranks memory/conversation. Only explicit committed requests produce actions. Uncertainty or missing execution data is clarify. Create/update/delete/save/remind/spend is commit; user-state questions are read; general knowledge is answer.
-First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; discussion history uses person.interactions_list; meeting questions use event.list/search. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. A person.upsert has exactly one person entity_ref target; profile fields never replace that target. Unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has sufficient text/time: create reminder, do not ask who. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus a person reference, not person.upsert unless explicitly saving/new facts. Entity refs are people only: type exactly "person"; a meeting is event domain, never entity type "meeting". Owner-only reads such as finance.summary never carry person entity_refs. Explicit delete/cancel/update is always commit: event.search is only the prerequisite lookup, then include the mutation action; never stop at read. The mutation action has no entity_refs; keep the person ref on event.search and depend_on its read_id. Russian bare-hour time after "в" is exact local time: "в 9"=09:00, "в 15"=15:00, "в 15:30"=15:30; do not re-ask the time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
+First-person means trusted owner: never make a person reference/resolve. Spending uses finance.summary; named-person discussion history uses person.interactions_list; meeting questions use event.list/search. Aggregate owner-people requests (saved people, acquaintances, friends) use person.list, never resolve the aggregate label; use relationship="friend" for clear friend wording. Questions about user saved materials/data use knowledge.search; broad requests may have an empty query. General-world questions are answer, without personal reads unless requested. Keep pronouns ("с ним") as mentions for the trusted resolver; use an unambiguous named person in base form. person.upsert has one person entity_ref; unsupported person facts (profession) go in notes; unambiguous "из <город>" is home_city. "Напомни завтра в 9 позвонить" has enough text/time. A dated meeting/call/appointment/lesson without time must clarify, never all-day. A named-person meeting is event.create plus person ref, not person.upsert unless saving/new facts. Entity refs type exactly "person"; owner-only reads never have person refs. Delete/cancel/update is commit: event.search is prerequisite; never stop at read, mutation depends_on its read_id. Russian bare-hour "в 9"=09:00, "в 15"=15:00 is exact local time. Keep fuzzy time semantic; use supplied now/timezone. JSON only."""
 
 # One model-visible contract, deliberately independent of user phrasing.
 OPERATION_CONTRACT = {
     "reads": {
         "person.resolve": {"entity_refs": ["person"]}, "person.interactions_list": {"entity_refs": ["person"]},
+        "person.list": {"filters": ["query", "relationship", "limit"]},
+        "knowledge.search": {"filters": ["query", "project", "category", "entity", "date_from", "date_to", "limit"]},
         "event.list": {"filters": ["date_from", "date_to", "status", "limit"], "person_via": "entity_refs"},
         "event.search": {"filters": ["query", "date_from", "date_to", "limit"], "person_via": "entity_refs"},
         "finance.summary": {"period": ["today", "yesterday", "7_days", "current_month", "custom"], "filters": ["period", "date_from", "date_to"]},

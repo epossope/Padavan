@@ -17,7 +17,7 @@ from plan_runtime import ExecutionResult, ExecutionStep, PlanValidationError
 
 MODES = frozenset({"off", "read", "safe_write", "full"})
 READ_OPERATIONS = frozenset({
-    "person.resolve", "person.interactions_list", "event.list", "event.search",
+    "person.resolve", "person.interactions_list", "person.list", "knowledge.search", "event.list", "event.search",
     "finance.summary", "transaction.list", "task.list", "reminder.list",
     "note.list", "note.search",
 })

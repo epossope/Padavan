@@ -15,8 +15,8 @@ from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticP
 EXACT_ID_KEYS = frozenset({"id", "person_id", "event_id", "task_id", "reminder_id", "transaction_id", "note_id", "file_id", "project_id", "source_turn_id", "resolved_id"})
 WRITE_OPS = frozenset({"create", "upsert", "update", "delete", "cancel", "overwrite", "replace", "resolve_or_create"})
 DESTRUCTIVE = frozenset({"delete", "cancel", "overwrite", "replace", "update"})
-READ_OPERATIONS = {"person": {"resolve", "interactions_list"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
-READ_FILTERS = {("person", "resolve"): set(), ("person", "interactions_list"): {"limit"}, ("event", "list"): {"date_from", "date_to", "status", "limit"}, ("event", "search"): {"query", "date_from", "date_to", "limit"}, ("finance", "summary"): {"period", "date_from", "date_to"}, ("transaction", "list"): {"period", "date_from", "date_to", "kind", "query", "limit", "offset"}, ("task", "list"): {"scope", "query", "limit"}, ("reminder", "list"): {"scope", "date_from", "date_to", "query", "include_acknowledged", "limit"}, ("note", "list"): {"query", "date", "limit"}, ("note", "search"): {"query"}}
+READ_OPERATIONS = {"person": {"resolve", "interactions_list", "list"}, "knowledge": {"search"}, "event": {"list", "search"}, "finance": {"summary"}, "transaction": {"list"}, "task": {"list"}, "reminder": {"list"}, "note": {"list", "search"}}
+READ_FILTERS = {("person", "resolve"): set(), ("person", "interactions_list"): {"limit"}, ("person", "list"): {"query", "relationship", "limit"}, ("knowledge", "search"): {"query", "project", "category", "entity", "date_from", "date_to", "limit"}, ("event", "list"): {"date_from", "date_to", "status", "limit"}, ("event", "search"): {"query", "date_from", "date_to", "limit"}, ("finance", "summary"): {"period", "date_from", "date_to"}, ("transaction", "list"): {"period", "date_from", "date_to", "kind", "query", "limit", "offset"}, ("task", "list"): {"scope", "query", "limit"}, ("reminder", "list"): {"scope", "date_from", "date_to", "query", "include_acknowledged", "limit"}, ("note", "list"): {"query", "date", "limit"}, ("note", "search"): {"query"}}
 WRITE_OPERATIONS = {"person": {"upsert", "resolve_or_create"}, "event": {"create", "update", "delete", "cancel"}, "reminder": {"create"}, "transaction": {"create"}, "note": {"create"}, "task": {"create"}}
 
 
@@ -200,6 +200,8 @@ class BotDomainServices:
         if item.domain == "person" and item.operation == "interactions_list":
             if person is None: raise PlanValidationError("person_not_found")
             return self.bot.person_interactions_list(owner, person, **item.filters)
+        if item.domain == "person" and item.operation == "list": return self.bot.person_list(owner, **item.filters)
+        if item.domain == "knowledge" and item.operation == "search": return self.bot.knowledge_search_tool(owner, **item.filters)
         if item.domain == "event" and item.operation == "list": return self.bot.event_list(owner, person_id=person, **item.filters)
         if item.domain == "event" and item.operation == "search": return self.bot.event_search(owner, person_id=person, **item.filters)
         if item.domain == "finance": return self.bot.finance_summary(owner, **item.filters)
