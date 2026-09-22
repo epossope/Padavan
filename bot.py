@@ -1041,6 +1041,44 @@ def knowledge_search_tool(chat_id, query="", project=None, category=None, entity
     }
 
 
+def semantic_memory_context(chat_id, utterance, *, limit=4):
+    """Small provider-neutral, owner-scoped retrieval context for semantic planning.
+
+    This is deliberately non-authoritative context.  Exact semantic reads still
+    supply the evidence used for an answer.  A retrieval failure must never
+    prevent the turn from reaching the normal semantic/legacy boundaries.
+    """
+    previous = _LAST_RETRIEVAL.get(chat_id)
+    try:
+        result = knowledge_search_tool(chat_id, query=str(utterance or ""), limit=max(1, min(int(limit or 4), 4)))
+        candidates = list(result.get("results") or []) if result.get("ok") else []
+        prior = (previous or {}).get("item")
+        if prior and not candidates:
+            candidates = [prior]
+        context = []
+        for item in candidates[:4]:
+            if not isinstance(item, dict):
+                continue
+            context.append({
+                "domain": "knowledge",
+                "title": str(item.get("title") or "")[:240],
+                "summary": str(item.get("summary") or "")[:700],
+                "category": str(item.get("category") or "")[:80],
+                "project": str(item.get("project") or item.get("project_id") or "")[:120],
+                "entities": [str(entity.get("name") or "")[:120] for entity in (item.get("entities") or [])[:8]
+                             if isinstance(entity, dict)],
+            })
+        return context
+    except Exception:
+        return []
+    finally:
+        # Planning context must not replace legacy retrieval follow-up state.
+        if previous is None:
+            _LAST_RETRIEVAL.pop(chat_id, None)
+        else:
+            _LAST_RETRIEVAL[chat_id] = previous
+
+
 def knowledge_get_tool(chat_id, knowledge_id=None):
     if not knowledge_id:
         return {"ok": False, "tool": "knowledge_get", "error": "missing_knowledge_id"}
@@ -3977,6 +4015,43 @@ def get_people(chat_id,query=""):
     return {"ok":True,"tool":"get_people","people":out}
 
 
+def person_list(chat_id, query="", relationship="", limit=20):
+    """Canonical semantic people reader built on the existing owner-scoped state."""
+    try:
+        limit = max(1, min(int(limit or 20), 30))
+    except (TypeError, ValueError):
+        limit = 20
+    requested_relationship = str(relationship or "").strip().casefold()
+    friend_like = requested_relationship in {"friend", "friends", "друг", "друзья", "подруга"}
+    rows = get_people(chat_id, str(query or "")).get("people", [])
+    items = []
+    for row in rows:
+        relationship_text = str(row.get("relationship") or "")
+        groups = [str(value) for value in row.get("groups") or []]
+        relation_haystack = " ".join([relationship_text, *groups]).casefold()
+        if requested_relationship:
+            if friend_like:
+                if not any(token in relation_haystack for token in ("друг", "подруг", "friend")):
+                    continue
+            elif requested_relationship not in relation_haystack:
+                continue
+        # Keep model-visible exact state useful but never pass database IDs,
+        # local media paths, or raw interaction records through this adapter.
+        items.append({
+            "name": str(row.get("name") or "")[:160],
+            "relationship": relationship_text[:160],
+            "groups": groups[:12],
+            "projects": str(row.get("projects") or "")[:500],
+            "notes": str(row.get("notes") or "")[:700],
+            "home_city": str(row.get("home_city") or "")[:120],
+            "current_location": str(row.get("current_location") or "")[:120],
+            "tags": [str(value)[:80] for value in (row.get("tags") or [])[:12]],
+        })
+        if len(items) >= limit:
+            break
+    return {"ok": True, "tool": "person_list", "count": len(items), "items": items}
+
+
 
 def save_note(chat_id, text, title=""):
 
@@ -4919,6 +4994,7 @@ def person_plan_validator():
 
 
 _SEMANTIC_PRODUCTION_RUNTIMES = {}
+_SEMANTIC_RECENT_ENTITIES = {}
 def get_semantic_production_runtime(chat_id):
     """Create the distinct production runtime lazily; shadow remains separate."""
     if chat_id not in _SEMANTIC_PRODUCTION_RUNTIMES:
@@ -4938,6 +5014,44 @@ def get_semantic_production_runtime(chat_id):
     return _SEMANTIC_PRODUCTION_RUNTIMES[chat_id]
 
 
+def semantic_conversation_context(chat_id):
+    """Bounded per-owner conversation context, with trusted local follow-up refs.
+
+    ``recent_entities`` is retained only on the server for the owner-scoped
+    resolver.  The planner sanitizer removes it before provider input.
+    """
+    try:
+        messages = conversation_context(chat_id, recent_limit=8, summary_after=18, summary_chars=2500)
+    except Exception:
+        messages = []
+    recent = _SEMANTIC_RECENT_ENTITIES.get(int(chat_id), [])
+    safe_recent = []
+    for item in recent[-4:]:
+        if not isinstance(item, dict) or item.get("type") != "person":
+            continue
+        try:
+            safe_recent.append({"type": "person", "id": int(item.get("id"))})
+        except (TypeError, ValueError):
+            continue
+    return {"messages": messages[:9], "recent_entities": safe_recent}
+
+
+def _remember_semantic_entities(chat_id, semantic_result):
+    """Retain only trusted, owner-scoped resolver results for pronoun follow-ups."""
+    try:
+        execution = semantic_result.execution
+        ids = []
+        for step in getattr(execution, "reads", []) or []:
+            if getattr(step, "domain", "") == "person" and getattr(step, "operation", "") == "resolve":
+                value = getattr(step, "result", {}) or {}
+                if value.get("person_id") is not None:
+                    ids.append(int(value["person_id"]))
+        if ids:
+            _SEMANTIC_RECENT_ENTITIES[int(chat_id)] = [{"type": "person", "id": value} for value in dict.fromkeys(ids)]
+    except Exception:
+        pass
+
+
 def run_semantic_production_turn(chat_id, text, *, request_id, conversation_context=None):
     """Synchronous bridge used by both Telegram and Mini App stream workers."""
     from semantic_runtime import SemanticRuntimeResult, runtime_mode, semantic_owner_allowed
@@ -4947,11 +5061,14 @@ def run_semantic_production_turn(chat_id, text, *, request_id, conversation_cont
     if not semantic_owner_allowed(chat_id):
         return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="not_allowlisted")
     try:
-        return asyncio.run(get_semantic_production_runtime(chat_id).handle_turn(
+        context = conversation_context if conversation_context is not None else semantic_conversation_context(chat_id)
+        result = asyncio.run(get_semantic_production_runtime(chat_id).handle_turn(
             trusted_owner=chat_id, request_id=str(request_id), utterance=text,
             now=datetime.now(timezone_for(chat_id)), timezone=timezone_name_for(chat_id),
-            conversation_context=conversation_context or {"recent_entities": []},
+            conversation_context=context, memory_context=semantic_memory_context(chat_id, text),
         ))
+        _remember_semantic_entities(chat_id, result)
+        return result
     except Exception:
         claimed = semantic_execution_claimed(chat_id, str(request_id))
         DIAGNOSTICS.record("semantic_runtime_bridge_failure", execution_claimed=claimed)
@@ -5248,7 +5365,10 @@ def stream_agent_response(chat_id, text, cancel_event=None, *, request_id=None, 
     if cancel_event.is_set():
         yield {"type": "cancelled"}
         return
-    semantic = run_semantic_production_turn(chat_id, text, request_id=trusted_request_id)
+    semantic = run_semantic_production_turn(
+        chat_id, text, request_id=trusted_request_id,
+        conversation_context=semantic_conversation_context(chat_id),
+    )
     if semantic.handled:
         record_user_request(chat_id, "chat")
         canonical_user_message_id = add_message(chat_id, "user", text)

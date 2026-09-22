@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import bot
 from grounded_response import EvidenceAssembler
+from knowledge_store import KnowledgeItem, KnowledgeStore
 from plan_runtime import BotDomainServices, PlanExecutor, PlanValidator
 from semantic_core import ActionRequest, EntityReference, ReadRequest, SemanticPlan
 from semantic_runtime import (SemanticProductionRuntime, SemanticRuntimeResult,
@@ -30,12 +31,22 @@ class SemanticRuntimeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db = Path(self.temp.name) / "runtime.db"
         self.patch = patch.object(bot, "DB", self.db); self.patch.start(); bot.init_db()
+        self.original_pipeline = bot._pipeline
+        self.original_recent_entities = dict(bot._SEMANTIC_RECENT_ENTITIES)
+        self.original_last_retrieval = dict(bot._LAST_RETRIEVAL)
+        bot._pipeline = None
+        bot._SEMANTIC_RECENT_ENTITIES.clear()
+        bot._LAST_RETRIEVAL.clear()
         self.owner = 902
         self.mode = "safe_write"; self.allowed = frozenset({self.owner})
         self.services = BotDomainServices(bot)
         self.executor = PlanExecutor(self.services, bot.conn)
 
-    def tearDown(self): self.patch.stop(); self.temp.cleanup()
+    def tearDown(self):
+        bot._pipeline = self.original_pipeline
+        bot._SEMANTIC_RECENT_ENTITIES.clear(); bot._SEMANTIC_RECENT_ENTITIES.update(self.original_recent_entities)
+        bot._LAST_RETRIEVAL.clear(); bot._LAST_RETRIEVAL.update(self.original_last_retrieval)
+        self.patch.stop(); self.temp.cleanup()
 
     def runtime(self, plan, *, executor=None, owner_allowed_getter=None):
         return SemanticProductionRuntime(
@@ -111,6 +122,90 @@ class SemanticRuntimeTests(unittest.TestCase):
         bot.person_interaction(self.owner, interaction="Обсуждали", person_id=person["id"])
         plan = SemanticPlan("person", "read", reads=[ReadRequest("person", "interactions_list", read_id="p", entity_refs=[EntityReference("person", "Иван")])])
         self.assertEqual("READ_ANSWER", self.turn(self.runtime(plan)).status)
+
+    def test_people_aggregate_uses_owner_scoped_person_list_without_resolve(self):
+        bot.person_upsert(self.owner, "Анна", relationship="друг")
+        bot.person_upsert(self.owner, "Игорь", relationship="коллега")
+        bot.person_upsert(self.owner + 1, "Чужая", relationship="друг")
+        plan = SemanticPlan("people", "read", reads=[ReadRequest("person", "list", read_id="people", filters={"relationship": "friend"})])
+        runtime = self.runtime(plan)
+        self.assertEqual("READ_ANSWER", self.turn(runtime).status)
+        validated = runtime.validator.validate(self.owner, plan, conversation_context={}, now=datetime.now(), timezone="Europe/Moscow", request_id="people-direct")
+        item = runtime.services.read(self.owner, validated.reads[0])
+        self.assertEqual(["Анна"], [row["name"] for row in item["items"]])
+        self.assertNotIn("person_id", item["items"][0])
+
+    def test_knowledge_search_is_owner_scoped_and_grounded(self):
+        store = KnowledgeStore(bot.DB)
+        store.insert_item(KnowledgeItem(chat_id=self.owner, title="Noema", summary="Сохранённый материал Noema", searchable_text="Noema semantic", content_hash="owner-noema"))
+        store.insert_item(KnowledgeItem(chat_id=self.owner + 1, title="Чужой Noema", summary="private", searchable_text="Noema", content_hash="other-noema"))
+        plan = SemanticPlan("knowledge", "read", reads=[ReadRequest("knowledge", "search", read_id="knowledge", filters={"query": "Noema"})])
+
+        class CapturingResponder(Responder):
+            async def respond(inner_self, question, evidence):
+                inner_self.evidence = evidence
+                return await super().respond(question, evidence)
+
+        runtime = self.runtime(plan); runtime.responder = CapturingResponder()
+        self.assertEqual("READ_ANSWER", self.turn(runtime).status)
+        exact = [item for item in runtime.responder.evidence.items if item.source == "exact_current" and item.domain == "knowledge"]
+        self.assertEqual(["Noema"], [item.fields["title"] for item in exact])
+        self.assertEqual(["Noema"], [item["title"] for item in bot.knowledge_search_tool(self.owner, query="")["results"]])
+
+    def test_memory_context_is_bounded_owner_scoped_and_has_no_database_ids(self):
+        store = KnowledgeStore(bot.DB)
+        for index in range(6):
+            store.insert_item(KnowledgeItem(chat_id=self.owner, title=f"Noema {index}", summary="saved", searchable_text="Noema", content_hash=f"memory-{index}"))
+        store.insert_item(KnowledgeItem(chat_id=self.owner + 1, title="Чужое", summary="private", searchable_text="Noema", content_hash="memory-other"))
+        context = bot.semantic_memory_context(self.owner, "Что сохранено про Noema?", limit=10)
+        self.assertEqual(4, len(context))
+        self.assertTrue(all(item["domain"] == "knowledge" for item in context))
+        self.assertNotIn("Чужое", str(context))
+        self.assertNotIn("id", str(context).casefold())
+
+    def test_empty_knowledge_search_remains_honest_exact_empty(self):
+        self.mode = "read"
+        plan = SemanticPlan("knowledge", "read", reads=[ReadRequest("knowledge", "search", read_id="knowledge", filters={"query": "nothing"})])
+
+        class NoDataResponder:
+            async def respond(self, question, evidence):
+                self.evidence = evidence
+                return type("Response", (), {"status": "OK", "render": lambda self: "В текущих данных ничего не найдено."})()
+
+        runtime = self.runtime(plan); runtime.responder = NoDataResponder()
+        result = self.turn(runtime)
+        self.assertEqual("READ_ANSWER", result.status)
+        self.assertIn("knowledge", runtime.responder.evidence.exact_empty_domains)
+
+    def test_bridge_passes_bounded_memory_and_conversation_context(self):
+        captured = {}
+        class CaptureRuntime:
+            async def handle_turn(self, **kwargs):
+                captured.update(kwargs)
+                return SemanticRuntimeResult("FALLBACK_TO_LEGACY", failure_category="test")
+        with patch.dict(os.environ, {"SEMANTIC_RUNTIME_MODE": "read", "SEMANTIC_CANARY_USER_IDS": str(self.owner)}), \
+             patch.object(bot, "get_semantic_production_runtime", return_value=CaptureRuntime()), \
+             patch.object(bot, "conversation_context", return_value=[{"role": "user", "content": "old"}] * 12), \
+             patch.object(bot, "semantic_memory_context", return_value=[{"domain": "knowledge", "summary": "saved"}]):
+            bot.run_semantic_production_turn(self.owner, "Что сохранено?", request_id="bridge-context")
+        self.assertEqual([{"domain": "knowledge", "summary": "saved"}], captured["memory_context"])
+        self.assertEqual(9, len(captured["conversation_context"]["messages"]))
+        self.assertEqual([], captured["conversation_context"]["recent_entities"])
+
+    def test_pronoun_follow_up_resolves_only_trusted_recent_person(self):
+        person = bot.person_upsert(self.owner, "Анна")
+        bot.person_interaction(self.owner, interaction="Обсуждали Noema", person_id=person["id"])
+        bot._SEMANTIC_RECENT_ENTITIES[self.owner] = [{"type": "person", "id": person["id"]}]
+        plan = SemanticPlan("person", "read", reads=[ReadRequest(
+            "person", "interactions_list", read_id="follow", entity_refs=[EntityReference("person", "с ней")]
+        )])
+        runtime = self.runtime(plan)
+        result = asyncio.run(runtime.handle_turn(
+            trusted_owner=self.owner, request_id="pronoun", utterance="А что ты про неё знаешь?",
+            now=datetime.now(), timezone="Europe/Moscow", conversation_context=bot.semantic_conversation_context(self.owner),
+            memory_context=[],
+        ))
+        self.assertEqual("READ_ANSWER", result.status)
 
     def test_safe_writes_and_replay_are_deterministic(self):
         cases = [

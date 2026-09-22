@@ -505,6 +505,22 @@ class SemanticPlannerValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("never stop at read", PLANNER_PROMPT)
         self.assertIn('type exactly "person"', PLANNER_PROMPT)
 
+    def test_people_aggregate_and_saved_material_reads_are_canonical(self):
+        people = parse_semantic_plan(plan(
+            "people", "read", reads=[{"domain": "person", "operation": "list", "filters": {"relationship": "friend"}}],
+        ))
+        self.assertEqual(("person", "list", {"relationship": "friend"}),
+                         (people.reads[0].domain, people.reads[0].operation, people.reads[0].filters))
+        self.assertEqual([], people.reads[0].entity_refs)
+        saved = parse_semantic_plan(plan(
+            "knowledge", "read", reads=[{"domain": "knowledge", "operation": "search", "filters": {"query": "Noema", "limit": 4}}],
+        ))
+        self.assertEqual(("knowledge", "search"), (saved.reads[0].domain, saved.reads[0].operation))
+        with self.assertRaisesRegex(ValueError, "unsupported_read_filter"):
+            parse_semantic_plan(plan(
+                "people", "read", reads=[{"domain": "person", "operation": "list", "filters": {"person_id": 1}}],
+            ))
+
 class SemanticPlannerTransportTests(unittest.TestCase):
     def test_missing_local_ids_are_normalized_and_fenced_json_is_accepted(self):
         parsed = parse_semantic_plan("```json\n{\"intent\":\"meeting\",\"disposition\":\"commit\",\"reads\":[{\"domain\":\"event\",\"operation\":\"search\"}],\"actions\":[{\"domain\":\"event\",\"operation\":\"create\",\"fields\":{\"title\":\"x\",\"local_datetime\":\"2026-09-20T15:00:00\"}}]}\n```")

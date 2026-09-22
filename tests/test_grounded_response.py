@@ -69,6 +69,22 @@ class GroundingTests(unittest.TestCase):
         failed=EvidenceAssembler().build(None,ExecutionResult("FAILED","r",deleted_entities=[{"domain":"event","id":52}]))
         self.assertFalse(failed.items)
 
+    def test_person_list_and_knowledge_search_are_exact_and_outrank_memory(self):
+        result = ExecutionResult("EXECUTED", "r", reads=[
+            ExecutionStep("people", "read", "EXECUTED", {"ok": True, "items": [{"name": "Анна", "relationship": "друг"}]}, "person", "list"),
+            ExecutionStep("knowledge", "read", "EXECUTED", {"ok": True, "results": [{"id": 3, "title": "Noema", "summary": "точный материал"}]}, "knowledge", "search"),
+        ])
+        packet = EvidenceAssembler().build(None, result, semantic_memory=[
+            {"domain": "person", "summary": "устаревшее"},
+            {"domain": "knowledge", "summary": "конфликт"},
+        ])
+        visible = asyncio.run(_packet_items(packet))
+        self.assertEqual({"person", "knowledge"}, {item["domain"] for item in visible})
+        self.assertFalse([item for item in visible if item["source"] == "semantic_memory"])
+        knowledge = next(item for item in visible if item["domain"] == "knowledge")
+        self.assertEqual("knowledge", knowledge["entity_type"])
+        self.assertNotIn("3", str(knowledge))
+
     def test_oversized_mapping_fails_closed(self):
         packet=EvidenceAssembler().build(None,ExecutionResult("EXECUTED","r",reads=[ExecutionStep("f","read","EXECUTED",{"ok":True,"total":0},"finance","summary")]))
         response=asyncio.run(GroundedResponder(FakeBackend({"claims":[],"clarification":"x"*70000})).respond("x",packet))
